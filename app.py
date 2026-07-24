@@ -1578,13 +1578,6 @@ def _consultar_vigencia_antioquia(vigencia, session, token_cuestionario,
         },
         timeout=60
     )
-    # --- DIAGNOSTICO TEMPORAL: ver la respuesta completa para saber que
-    # datos ya tenemos disponibles para el PDF de la declaracion. Quitar
-    # despues de confirmar.
-    print(f"\n=== DIAGNOSTICO crearDeclaracionImpuestoAnt (vigencia {vigencia}) ===")
-    print(json.dumps(r5.json(), indent=2, ensure_ascii=False))
-    print("=== FIN DIAGNOSTICO ===\n", flush=True)
-
     return r5.json()
 
 
@@ -1633,13 +1626,16 @@ def _antioquia_descargar_pdf_liquidacion(session, formulario_liquidacion):
     return base64.b64decode(archivo_b64)
 
 
-def antioquia_generar_pdf_declaracion(placa, identificacion, tipo_documento_abrev,
-                                       formulario_liquidacion, modelo, municipio_transito,
-                                       apellidos_propietario):
+def antioquia_generar_pdf_declaracion(placa, identificacion, tipo_documento_abrev, vigencia,
+                                       modelo, municipio_transito, apellidos_propietario,
+                                       celular="3000000000", email="consulta@consulta.com",
+                                       direccion="CRA", municipio="MEDELLIN",
+                                       municipio_cod=5001000, departamento_cod=5):
     """Flujo completo para obtener el PDF de la declaracion sugerida (el que
-    se lleva al banco): crea una sesion nueva igual que el resto del
-    sistema, acepta las 3 casillas, y descarga el PDF ya generado.
-    Devuelve los bytes del PDF."""
+    se lleva al banco), TODO dentro de la misma sesion (el numero de
+    liquidacion que genera el sitio solo es valido dentro de la sesion que
+    lo creo, no se puede reutilizar en una sesion nueva). Devuelve los
+    bytes del PDF."""
     tipo_documento_id = ANTIOQUIA_TIPO_DOC_MAP.get(tipo_documento_abrev.upper(), "1")
     tipo_doc_info = ANTIOQUIA_TIPOS_DOCUMENTO.get(tipo_documento_id, ANTIOQUIA_TIPOS_DOCUMENTO["1"])
     doc_abreviatura = tipo_doc_info["abreviatura"]
@@ -1648,14 +1644,28 @@ def antioquia_generar_pdf_declaracion(placa, identificacion, tipo_documento_abre
     if tipo_documento_id == "2":
         identificacion = str(identificacion) + str(_calcular_digito_nit(identificacion))
 
-    session, _token, _data3 = _sesion_antioquia(
+    # 1. Nueva sesion (igual que cualquier consulta normal)
+    session, token_cuestionario, _data3 = _sesion_antioquia(
         placa, identificacion, tipo_documento_id,
         modelo, municipio_transito, apellidos_propietario
     )
 
+    # 2. Crear la declaracion sugerida para la vigencia pedida (misma sesion)
+    data_vig = _consultar_vigencia_antioquia(
+        vigencia, session, token_cuestionario,
+        placa, identificacion, tipo_documento_id,
+        doc_abreviatura, doc_nombre,
+        celular, email, direccion, municipio, municipio_cod, departamento_cod
+    )
+    formulario_liquidacion = data_vig.get("formularioLiquidacion")
+    if not formulario_liquidacion:
+        raise Exception(f"No se pudo generar la declaracion: {json.dumps(data_vig, ensure_ascii=False)[:300]}")
+
+    # 3. Aceptar las 3 casillas (misma sesion)
     _antioquia_aceptar_terminos_liquidacion(session, identificacion, tipo_documento_id,
                                               doc_abreviatura, doc_nombre)
 
+    # 4. Descargar el PDF ya generado (misma sesion)
     return _antioquia_descargar_pdf_liquidacion(session, formulario_liquidacion)
 
 
@@ -2516,23 +2526,23 @@ def guardar_vehiculo_ocr():
 
 @app.route("/generar-pdf-declaracion", methods=["GET"])
 def generar_pdf_declaracion_endpoint():
-    """PRUEBA: descarga el PDF de la declaracion sugerida (pago en banco)
-    para una placa/vigencia que YA tenga una liquidacion generada (con
-    formularioLiquidacion conocido)."""
+    """PRUEBA: genera y descarga el PDF de la declaracion sugerida (pago en
+    banco), todo en una sola sesion continua (crear declaracion -> aceptar
+    terminos -> descargar PDF)."""
     placa = request.args.get("placa", "").upper().strip()
     identificacion = request.args.get("identificacion", "").strip()
     tipo_documento = request.args.get("tipo_documento", "CC").strip()
-    formulario_liquidacion = request.args.get("formulario_liquidacion", "").strip()
+    vigencia = request.args.get("vigencia", "").strip()
     modelo = request.args.get("modelo", "").strip()
     municipio_transito = request.args.get("municipio_transito", "").strip()
     apellidos_propietario = request.args.get("apellidos_propietario", "").strip()
 
-    if not all([placa, identificacion, formulario_liquidacion, modelo, municipio_transito, apellidos_propietario]):
-        return jsonify({"error": "Faltan parametros: placa, identificacion, formulario_liquidacion, modelo, municipio_transito, apellidos_propietario"}), 400
+    if not all([placa, identificacion, vigencia, modelo, municipio_transito, apellidos_propietario]):
+        return jsonify({"error": "Faltan parametros: placa, identificacion, vigencia, modelo, municipio_transito, apellidos_propietario"}), 400
 
     try:
         pdf_bytes = antioquia_generar_pdf_declaracion(
-            placa, identificacion, tipo_documento, formulario_liquidacion,
+            placa, identificacion, tipo_documento, vigencia,
             modelo, municipio_transito, apellidos_propietario
         )
         ruta_local = f"/tmp/declaracion_{placa}_{uuid.uuid4().hex[:8]}.pdf"
