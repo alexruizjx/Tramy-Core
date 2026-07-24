@@ -1673,7 +1673,9 @@ def antioquia_generar_pdf_declaracion(placa, identificacion, tipo_documento_abre
     print("  → Terminos aceptados sin error (no lanzo excepcion)", flush=True)
 
     # 4. Descargar el PDF ya generado (misma sesion)
-    return _antioquia_descargar_pdf_liquidacion(session, formulario_liquidacion)
+    # El sitio espera este valor como NUMERO en el JSON, no como texto
+    # entre comillas -- por eso se convierte antes de enviarlo.
+    return _antioquia_descargar_pdf_liquidacion(session, int(formulario_liquidacion))
 
 
 def consultar_antioquia(page, placa, identificacion, tipo_documento_abrev,
