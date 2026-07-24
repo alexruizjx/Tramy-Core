@@ -1661,9 +1661,16 @@ def antioquia_generar_pdf_declaracion(placa, identificacion, tipo_documento_abre
     if not formulario_liquidacion:
         raise Exception(f"No se pudo generar la declaracion: {json.dumps(data_vig, ensure_ascii=False)[:300]}")
 
+    # --- DIAGNOSTICO TEMPORAL ---
+    print(f"\n=== DIAGNOSTICO PDF declaracion ===")
+    print(f"formulario_liquidacion obtenido: {formulario_liquidacion!r} (tipo: {type(formulario_liquidacion).__name__})")
+    print(f"documento enviado a aceptar terminos: {_antioquia_construir_documento(tipo_documento_id, doc_abreviatura, doc_nombre)}")
+    print("=== FIN DIAGNOSTICO ===\n", flush=True)
+
     # 3. Aceptar las 3 casillas (misma sesion)
     _antioquia_aceptar_terminos_liquidacion(session, identificacion, tipo_documento_id,
                                               doc_abreviatura, doc_nombre)
+    print("  → Terminos aceptados sin error (no lanzo excepcion)", flush=True)
 
     # 4. Descargar el PDF ya generado (misma sesion)
     return _antioquia_descargar_pdf_liquidacion(session, formulario_liquidacion)
