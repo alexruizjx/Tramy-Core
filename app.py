@@ -1588,6 +1588,77 @@ def _consultar_vigencia_antioquia(vigencia, session, token_cuestionario,
     return r5.json()
 
 
+def _antioquia_construir_documento(tipo_documento_id, doc_abreviatura, doc_nombre):
+    """Arma el objeto 'documento' que pide el endpoint de aceptacion de
+    terminos, con la misma forma que se ve en el request real capturado."""
+    es_nit = (str(tipo_documento_id) == "2")
+    return {
+        "idDocumentoIdentidad": int(tipo_documento_id),
+        "tipoPersona": "J" if es_nit else "N",
+        "abreviatura": doc_abreviatura,
+        "nombreDocumento": doc_nombre,
+    }
+
+
+def _antioquia_aceptar_terminos_liquidacion(session, identificacion, tipo_documento_id,
+                                              doc_abreviatura, doc_nombre):
+    """Acepta las 3 casillas (tratamiento de datos, terminos y condiciones,
+    firma digital) que en el sitio real hay que marcar antes de que se
+    habilite el boton de imprimir/descargar la declaracion sugerida."""
+    body = {
+        "numeroDocumento": str(identificacion),
+        "documento": _antioquia_construir_documento(tipo_documento_id, doc_abreviatura, doc_nombre),
+    }
+    r = session.post(
+        f"{ANTIOQUIA_API}/AceptacionTerminoCondiciones/insertAceptaTerminosLiquidacion",
+        json=body, timeout=60
+    )
+    if r.status_code not in (200, 204):
+        raise Exception(f"Error aceptando terminos de liquidacion: {r.status_code} {r.text[:300]}")
+
+
+def _antioquia_descargar_pdf_liquidacion(session, formulario_liquidacion):
+    """Pide el PDF de la declaracion sugerida ya generada. El servidor lo
+    devuelve codificado en base64 dentro de un campo 'archivo'."""
+    r = session.post(
+        f"{ANTIOQUIA_API}/LiquidacionAntioquia/gestionarImprimirLiquidacion",
+        json=formulario_liquidacion, timeout=60
+    )
+    if r.status_code != 200:
+        raise Exception(f"Error descargando PDF de liquidacion: {r.status_code} {r.text[:300]}")
+    data = r.json()
+    archivo_b64 = data.get("archivo")
+    if not archivo_b64:
+        raise Exception(f"La respuesta no trajo el campo 'archivo': {json.dumps(data)[:300]}")
+    return base64.b64decode(archivo_b64)
+
+
+def antioquia_generar_pdf_declaracion(placa, identificacion, tipo_documento_abrev,
+                                       formulario_liquidacion, modelo, municipio_transito,
+                                       apellidos_propietario):
+    """Flujo completo para obtener el PDF de la declaracion sugerida (el que
+    se lleva al banco): crea una sesion nueva igual que el resto del
+    sistema, acepta las 3 casillas, y descarga el PDF ya generado.
+    Devuelve los bytes del PDF."""
+    tipo_documento_id = ANTIOQUIA_TIPO_DOC_MAP.get(tipo_documento_abrev.upper(), "1")
+    tipo_doc_info = ANTIOQUIA_TIPOS_DOCUMENTO.get(tipo_documento_id, ANTIOQUIA_TIPOS_DOCUMENTO["1"])
+    doc_abreviatura = tipo_doc_info["abreviatura"]
+    doc_nombre = tipo_doc_info["nombre"]
+
+    if tipo_documento_id == "2":
+        identificacion = str(identificacion) + str(_calcular_digito_nit(identificacion))
+
+    session, _token, _data3 = _sesion_antioquia(
+        placa, identificacion, tipo_documento_id,
+        modelo, municipio_transito, apellidos_propietario
+    )
+
+    _antioquia_aceptar_terminos_liquidacion(session, identificacion, tipo_documento_id,
+                                              doc_abreviatura, doc_nombre)
+
+    return _antioquia_descargar_pdf_liquidacion(session, formulario_liquidacion)
+
+
 def consultar_antioquia(page, placa, identificacion, tipo_documento_abrev,
                         modelo, municipio_transito, apellidos_propietario,
                         celular="3000000000", email="consulta@consulta.com",
@@ -2440,6 +2511,39 @@ def guardar_vehiculo_ocr():
         return jsonify({"ok": True})
     except Exception as e:
         print(f"Error guardando vehiculo OCR: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/generar-pdf-declaracion", methods=["GET"])
+def generar_pdf_declaracion_endpoint():
+    """PRUEBA: descarga el PDF de la declaracion sugerida (pago en banco)
+    para una placa/vigencia que YA tenga una liquidacion generada (con
+    formularioLiquidacion conocido)."""
+    placa = request.args.get("placa", "").upper().strip()
+    identificacion = request.args.get("identificacion", "").strip()
+    tipo_documento = request.args.get("tipo_documento", "CC").strip()
+    formulario_liquidacion = request.args.get("formulario_liquidacion", "").strip()
+    modelo = request.args.get("modelo", "").strip()
+    municipio_transito = request.args.get("municipio_transito", "").strip()
+    apellidos_propietario = request.args.get("apellidos_propietario", "").strip()
+
+    if not all([placa, identificacion, formulario_liquidacion, modelo, municipio_transito, apellidos_propietario]):
+        return jsonify({"error": "Faltan parametros: placa, identificacion, formulario_liquidacion, modelo, municipio_transito, apellidos_propietario"}), 400
+
+    try:
+        pdf_bytes = antioquia_generar_pdf_declaracion(
+            placa, identificacion, tipo_documento, formulario_liquidacion,
+            modelo, municipio_transito, apellidos_propietario
+        )
+        ruta_local = f"/tmp/declaracion_{placa}_{uuid.uuid4().hex[:8]}.pdf"
+        with open(ruta_local, "wb") as f:
+            f.write(pdf_bytes)
+        url = subir_a_r2(ruta_local, f"declaraciones/{placa}_{uuid.uuid4().hex[:8]}.pdf")
+        os.remove(ruta_local)
+        return jsonify({"ok": True, "url": url})
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc(), flush=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
