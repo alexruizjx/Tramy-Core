@@ -42,14 +42,19 @@ def _r2_client():
         region_name="auto",
     )
 
-def subir_a_r2(ruta_local, nombre_archivo_remoto, content_type="application/pdf"):
+def subir_a_r2(ruta_local, nombre_archivo_remoto, content_type="application/pdf", nombre_descarga=None):
     """Sube un archivo a R2 y devuelve la URL publica de descarga.
     El bucket debe tener acceso publico de lectura habilitado (o un dominio
-    personalizado conectado) para que la URL funcione directo en el navegador."""
+    personalizado conectado) para que la URL funcione directo en el navegador.
+    Si se da 'nombre_descarga', el navegador sugiere ese nombre al guardar
+    el archivo (no el nombre interno/tecnico usado en la URL)."""
     cliente = _r2_client()
+    extra_args = {"ContentType": content_type}
+    if nombre_descarga:
+        extra_args["ContentDisposition"] = f'inline; filename="{nombre_descarga}"'
     cliente.upload_file(
         ruta_local, R2_BUCKET_NAME, nombre_archivo_remoto,
-        ExtraArgs={"ContentType": content_type}
+        ExtraArgs=extra_args
     )
     return f"{R2_PUBLIC_BASE_URL}/{nombre_archivo_remoto}"
 
@@ -1661,16 +1666,9 @@ def antioquia_generar_pdf_declaracion(placa, identificacion, tipo_documento_abre
     if not formulario_liquidacion:
         raise Exception(f"No se pudo generar la declaracion: {json.dumps(data_vig, ensure_ascii=False)[:300]}")
 
-    # --- DIAGNOSTICO TEMPORAL ---
-    print(f"\n=== DIAGNOSTICO PDF declaracion ===")
-    print(f"formulario_liquidacion obtenido: {formulario_liquidacion!r} (tipo: {type(formulario_liquidacion).__name__})")
-    print(f"documento enviado a aceptar terminos: {_antioquia_construir_documento(tipo_documento_id, doc_abreviatura, doc_nombre)}")
-    print("=== FIN DIAGNOSTICO ===\n", flush=True)
-
     # 3. Aceptar las 3 casillas (misma sesion)
     _antioquia_aceptar_terminos_liquidacion(session, identificacion, tipo_documento_id,
                                               doc_abreviatura, doc_nombre)
-    print("  → Terminos aceptados sin error (no lanzo excepcion)", flush=True)
 
     # 4. Descargar el PDF ya generado (misma sesion)
     # El sitio espera este valor como NUMERO en el JSON, no como texto
@@ -2554,10 +2552,15 @@ def generar_pdf_declaracion_endpoint():
             placa, identificacion, tipo_documento, vigencia,
             modelo, municipio_transito, apellidos_propietario
         )
-        ruta_local = f"/tmp/declaracion_{placa}_{uuid.uuid4().hex[:8]}.pdf"
+        id_unico = uuid.uuid4().hex[:8]
+        nombre_descarga = f"Declaracion_{placa}_{vigencia}.pdf"
+        ruta_local = f"/tmp/declaracion_{placa}_{id_unico}.pdf"
         with open(ruta_local, "wb") as f:
             f.write(pdf_bytes)
-        url = subir_a_r2(ruta_local, f"declaraciones/{placa}_{uuid.uuid4().hex[:8]}.pdf")
+        # El nombre interno en R2 lleva un id unico (para no chocar entre
+        # consultas), pero el nombre que ve/descarga el usuario es limpio.
+        url = subir_a_r2(ruta_local, f"declaraciones/{placa}_{vigencia}_{id_unico}.pdf",
+                          nombre_descarga=nombre_descarga)
         os.remove(ruta_local)
         return jsonify({"ok": True, "url": url})
     except Exception as e:
