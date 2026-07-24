@@ -1578,6 +1578,13 @@ def _consultar_vigencia_antioquia(vigencia, session, token_cuestionario,
         },
         timeout=60
     )
+    # --- DIAGNOSTICO TEMPORAL: ver la respuesta completa para saber que
+    # datos ya tenemos disponibles para el PDF de la declaracion. Quitar
+    # despues de confirmar.
+    print(f"\n=== DIAGNOSTICO crearDeclaracionImpuestoAnt (vigencia {vigencia}) ===")
+    print(json.dumps(r5.json(), indent=2, ensure_ascii=False))
+    print("=== FIN DIAGNOSTICO ===\n", flush=True)
+
     return r5.json()
 
 
