@@ -1744,13 +1744,15 @@ def antioquia_generar_todas_declaraciones(placa, identificacion, tipo_documento_
     for vigencia in vigencias:
         url_cache = _cache_declaracion_buscar(placa, vigencia)
         if url_cache:
-            if job_id:
-                job_actualizar(job_id, f"Vigencia {vigencia}: usando declaración ya generada hoy...")
             resultados.append({"vigencia": vigencia, "ok": True, "url": url_cache})
+            if job_id:
+                job_actualizar(job_id, f"Vigencia {vigencia}: usando declaración ya generada hoy...",
+                                datos_parciales=resultados)
             continue
 
         if job_id:
-            job_actualizar(job_id, f"Generando declaración de la vigencia {vigencia}...")
+            job_actualizar(job_id, f"Generando declaración de la vigencia {vigencia}...",
+                            datos_parciales=resultados)
         try:
             pdf_bytes = antioquia_generar_pdf_declaracion(
                 placa, identificacion, tipo_documento_abrev, vigencia,
@@ -1770,6 +1772,9 @@ def antioquia_generar_todas_declaraciones(placa, identificacion, tipo_documento_
         except Exception as e:
             print(f"Error generando declaracion vigencia {vigencia} para {placa}: {e}", flush=True)
             resultados.append({"vigencia": vigencia, "ok": False, "error": str(e)})
+
+        if job_id:
+            job_actualizar(job_id, f"Vigencia {vigencia} lista.", datos_parciales=resultados)
 
     return resultados
 
@@ -2679,11 +2684,14 @@ def combinar_pdfs_endpoint():
 
 @app.route("/generar-pdf-declaracion", methods=["GET"])
 def generar_pdf_declaracion_endpoint():
-    """Genera y descarga el/los PDF(s) de la declaracion sugerida (pago en
-    banco). Acepta una o varias vigencias separadas por coma (ej.
-    vigencia=2024,2025,2026). Cada vigencia se procesa por separado y
-    devuelve su propio enlace -- si alguna falla, las demas igual se
-    entregan (no dependen unas de otras)."""
+    """Genera el/los PDF(s) de la declaracion sugerida (pago en banco) EN
+    SEGUNDO PLANO -- con varias vigencias (cada una con sus propios
+    captchas) el proceso puede tardar varios minutos, y una sola peticion
+    tan larga corre el riesgo de que el navegador (o algun proxy en el
+    camino) la corte con 'Failed to fetch' aunque el servidor siga
+    trabajando bien. Por eso, igual que la consulta de impuestos, esto
+    responde de inmediato con un job_id para consultar el avance en
+    /consultar/estado."""
     placa = request.args.get("placa", "").upper().strip()
     identificacion = request.args.get("identificacion", "").strip()
     tipo_documento = request.args.get("tipo_documento", "CC").strip()
@@ -2696,13 +2704,24 @@ def generar_pdf_declaracion_endpoint():
         return jsonify({"error": "Faltan parametros: placa, identificacion, vigencia, modelo, municipio_transito, apellidos_propietario"}), 400
 
     vigencias = [v.strip() for v in vigencias_raw.split(",") if v.strip()]
+    job_id = str(uuid.uuid4())
+    job_actualizar(job_id, "Iniciando...", "procesando")
 
-    resultados = antioquia_generar_todas_declaraciones(
-        placa, identificacion, tipo_documento, vigencias,
-        modelo, municipio_transito, apellidos_propietario
-    )
-    todas_ok = all(r["ok"] for r in resultados)
-    return jsonify({"ok": todas_ok, "resultados": resultados})
+    def ejecutar_declaraciones():
+        try:
+            resultados = antioquia_generar_todas_declaraciones(
+                placa, identificacion, tipo_documento, vigencias,
+                modelo, municipio_transito, apellidos_propietario,
+                job_id=job_id
+            )
+            job_terminar(job_id, {"resultados": resultados})
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc(), flush=True)
+            job_error(job_id, str(e))
+
+    threading.Thread(target=ejecutar_declaraciones, daemon=True).start()
+    return jsonify({"job_id": job_id, "estado": "procesando"})
 
 
 @app.route("/generar-fun", methods=["POST"])
