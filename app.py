@@ -2508,6 +2508,34 @@ def consultar_runt_vehiculo_endpoint():
     if not placa or not cedula:
         return jsonify({"error": "Debes proporcionar placa y cedula."}), 400
 
+    # Limite: no se puede forzar una nueva consulta al RUNT para la misma
+    # placa si ya se hizo una en los ultimos 3 dias -- en ese caso hay que
+    # usar el dato ya guardado en cache (vehiculo-runt-guardado).
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT leido_en FROM vehiculos WHERE placa = %s AND fuente = 'RUNT'
+        """, (placa,))
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        if row and row[0]:
+            transcurrido = datetime.now() - row[0]
+            if transcurrido < timedelta(days=3):
+                faltan = timedelta(days=3) - transcurrido
+                horas_faltantes = int(faltan.total_seconds() // 3600)
+                return jsonify({
+                    "error": f"Esta placa ya se consultó en el RUNT hace menos de 3 días. "
+                             f"Debes usar el dato ya guardado; podrás forzar una nueva consulta "
+                             f"en aproximadamente {horas_faltantes} horas.",
+                    "limite_activo": True,
+                    "horas_restantes": horas_faltantes
+                }), 429
+    except Exception as e:
+        print(f"Error verificando limite de consulta RUNT: {e}", flush=True)
+        # Si falla la verificacion, se deja continuar (no se bloquea por un
+        # problema tecnico ajeno al limite en si).
+
     job_id = str(uuid.uuid4())[:12]
     job_actualizar(job_id, "Iniciando consulta RUNT...", "procesando")
 
