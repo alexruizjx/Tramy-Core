@@ -8,3 +8,4 @@ pytesseract
 Pillow
 boto3
 openpyxl
+pypdf
