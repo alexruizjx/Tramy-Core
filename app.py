@@ -11,7 +11,7 @@ import requests
 import threading
 import boto3
 from botocore.config import Config
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 from flask_cors import CORS
@@ -1676,6 +1676,103 @@ def antioquia_generar_pdf_declaracion(placa, identificacion, tipo_documento_abre
     return _antioquia_descargar_pdf_liquidacion(session, int(formulario_liquidacion))
 
 
+def _antioquia_calcular_validez_pdf(vigencia):
+    """La declaracion sugerida de una vigencia VENCIDA solo sirve el mismo
+    dia en que se genero (los intereses suben a diario). La de la vigencia
+    ACTUAL (el año en curso) es distinta: sirve durante toda la ventana de
+    pronto pago -- del 1 de enero al 30 de abril, o del 1 de mayo al 31 de
+    julio -- y desde el 1 de agosto en adelante se comporta igual que una
+    vigencia vencida (valida solo el mismo dia)."""
+    hoy = datetime.now().date()
+    anio_actual = hoy.year
+
+    if int(vigencia) == anio_actual:
+        if hoy.month <= 4:
+            return date(anio_actual, 4, 30)
+        elif hoy.month <= 7:
+            return date(anio_actual, 7, 31)
+    return hoy  # vigencias vencidas, o vigencia actual desde agosto en adelante
+
+
+def _cache_declaracion_buscar(placa, vigencia):
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT url FROM cache_declaraciones_antioquia
+            WHERE placa = %s AND vigencia = %s AND valido_hasta >= CURRENT_DATE
+        """, (placa.upper(), int(vigencia)))
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        print(f"Error buscando cache de declaracion: {e}")
+        return None
+
+
+def _cache_declaracion_guardar(placa, vigencia, url):
+    try:
+        valido_hasta = _antioquia_calcular_validez_pdf(vigencia)
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO cache_declaraciones_antioquia (placa, vigencia, url, valido_hasta)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (placa, vigencia) DO UPDATE SET url = EXCLUDED.url,
+                valido_hasta = EXCLUDED.valido_hasta, creado_en = NOW()
+        """, (placa.upper(), int(vigencia), url, valido_hasta))
+        conn.commit()
+        cur.close(); conn.close()
+    except Exception as e:
+        print(f"Error guardando cache de declaracion: {e}")
+
+
+def antioquia_generar_todas_declaraciones(placa, identificacion, tipo_documento_abrev, vigencias,
+                                           modelo, municipio_transito, apellidos_propietario,
+                                           celular="3000000000", email="consulta@consulta.com",
+                                           direccion="CRA", municipio="MEDELLIN",
+                                           municipio_cod=5001000, departamento_cod=5, job_id=None):
+    """Genera (o reutiliza del cache, si sigue vigente) el PDF de cada
+    vigencia adeudada. Cada vigencia es INDEPENDIENTE: si una falla (a
+    veces la Gobernacion tiene problemas puntuales con alguna), las demas
+    igual se entregan, y solo habria que reintentar la que fallo.
+    Devuelve una lista de dicts: {vigencia, ok, url, error}."""
+    placa = placa.upper()
+    resultados = []
+
+    for vigencia in vigencias:
+        url_cache = _cache_declaracion_buscar(placa, vigencia)
+        if url_cache:
+            if job_id:
+                job_actualizar(job_id, f"Vigencia {vigencia}: usando declaración ya generada hoy...")
+            resultados.append({"vigencia": vigencia, "ok": True, "url": url_cache})
+            continue
+
+        if job_id:
+            job_actualizar(job_id, f"Generando declaración de la vigencia {vigencia}...")
+        try:
+            pdf_bytes = antioquia_generar_pdf_declaracion(
+                placa, identificacion, tipo_documento_abrev, vigencia,
+                modelo, municipio_transito, apellidos_propietario,
+                celular, email, direccion, municipio, municipio_cod, departamento_cod
+            )
+            id_unico = uuid.uuid4().hex[:8]
+            ruta = f"/tmp/decl_{placa}_{vigencia}_{id_unico}.pdf"
+            with open(ruta, "wb") as f:
+                f.write(pdf_bytes)
+
+            url = subir_a_r2(ruta, f"declaraciones/{placa}_{vigencia}_{id_unico}.pdf",
+                              nombre_descarga=f"Declaracion_{placa}_{vigencia}.pdf")
+            os.remove(ruta)
+            _cache_declaracion_guardar(placa, vigencia, url)
+            resultados.append({"vigencia": vigencia, "ok": True, "url": url})
+        except Exception as e:
+            print(f"Error generando declaracion vigencia {vigencia} para {placa}: {e}", flush=True)
+            resultados.append({"vigencia": vigencia, "ok": False, "error": str(e)})
+
+    return resultados
+
+
 def consultar_antioquia(page, placa, identificacion, tipo_documento_abrev,
                         modelo, municipio_transito, apellidos_propietario,
                         celular="3000000000", email="consulta@consulta.com",
@@ -2533,40 +2630,30 @@ def guardar_vehiculo_ocr():
 
 @app.route("/generar-pdf-declaracion", methods=["GET"])
 def generar_pdf_declaracion_endpoint():
-    """PRUEBA: genera y descarga el PDF de la declaracion sugerida (pago en
-    banco), todo en una sola sesion continua (crear declaracion -> aceptar
-    terminos -> descargar PDF)."""
+    """Genera y descarga el/los PDF(s) de la declaracion sugerida (pago en
+    banco). Acepta una o varias vigencias separadas por coma (ej.
+    vigencia=2024,2025,2026). Cada vigencia se procesa por separado y
+    devuelve su propio enlace -- si alguna falla, las demas igual se
+    entregan (no dependen unas de otras)."""
     placa = request.args.get("placa", "").upper().strip()
     identificacion = request.args.get("identificacion", "").strip()
     tipo_documento = request.args.get("tipo_documento", "CC").strip()
-    vigencia = request.args.get("vigencia", "").strip()
+    vigencias_raw = request.args.get("vigencia", "").strip()
     modelo = request.args.get("modelo", "").strip()
     municipio_transito = request.args.get("municipio_transito", "").strip()
     apellidos_propietario = request.args.get("apellidos_propietario", "").strip()
 
-    if not all([placa, identificacion, vigencia, modelo, municipio_transito, apellidos_propietario]):
+    if not all([placa, identificacion, vigencias_raw, modelo, municipio_transito, apellidos_propietario]):
         return jsonify({"error": "Faltan parametros: placa, identificacion, vigencia, modelo, municipio_transito, apellidos_propietario"}), 400
 
-    try:
-        pdf_bytes = antioquia_generar_pdf_declaracion(
-            placa, identificacion, tipo_documento, vigencia,
-            modelo, municipio_transito, apellidos_propietario
-        )
-        id_unico = uuid.uuid4().hex[:8]
-        nombre_descarga = f"Declaracion_{placa}_{vigencia}.pdf"
-        ruta_local = f"/tmp/declaracion_{placa}_{id_unico}.pdf"
-        with open(ruta_local, "wb") as f:
-            f.write(pdf_bytes)
-        # El nombre interno en R2 lleva un id unico (para no chocar entre
-        # consultas), pero el nombre que ve/descarga el usuario es limpio.
-        url = subir_a_r2(ruta_local, f"declaraciones/{placa}_{vigencia}_{id_unico}.pdf",
-                          nombre_descarga=nombre_descarga)
-        os.remove(ruta_local)
-        return jsonify({"ok": True, "url": url})
-    except Exception as e:
-        import traceback
-        print(traceback.format_exc(), flush=True)
-        return jsonify({"ok": False, "error": str(e)}), 500
+    vigencias = [v.strip() for v in vigencias_raw.split(",") if v.strip()]
+
+    resultados = antioquia_generar_todas_declaraciones(
+        placa, identificacion, tipo_documento, vigencias,
+        modelo, municipio_transito, apellidos_propietario
+    )
+    todas_ok = all(r["ok"] for r in resultados)
+    return jsonify({"ok": todas_ok, "resultados": resultados})
 
 
 @app.route("/generar-fun", methods=["POST"])
