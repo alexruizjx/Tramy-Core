@@ -14,6 +14,7 @@ from botocore.config import Config
 from datetime import datetime, timedelta, date
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
+from pypdf import PdfWriter
 from flask_cors import CORS
 
 app = Flask(__name__)  # v54.1
@@ -2625,6 +2626,54 @@ def guardar_vehiculo_ocr():
         return jsonify({"ok": True})
     except Exception as e:
         print(f"Error guardando vehiculo OCR: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/combinar-pdfs", methods=["POST"])
+def combinar_pdfs_endpoint():
+    """Toma varias URLs de PDFs YA generados (ej. de /generar-pdf-declaracion)
+    y las une en un solo PDF de varias paginas -- pensado para el boton
+    'Combinar PDFs' en el frontend, una vez ya se generaron los individuales.
+    No vuelve a consultar nada ni gasta captchas, solo descarga y pega."""
+    datos = request.get_json(silent=True) or {}
+    urls = datos.get("urls", [])
+    placa = (datos.get("placa") or "declaraciones").upper().strip()
+
+    if not urls or len(urls) < 2:
+        return jsonify({"error": "Se necesitan al menos 2 URLs para combinar"}), 400
+
+    rutas_temp = []
+    try:
+        writer = PdfWriter()
+        for i, url in enumerate(urls):
+            resp = requests.get(url, timeout=30)
+            if resp.status_code != 200:
+                raise Exception(f"No se pudo descargar {url}")
+            ruta = f"/tmp/combinar_{i}_{uuid.uuid4().hex[:6]}.pdf"
+            with open(ruta, "wb") as f:
+                f.write(resp.content)
+            rutas_temp.append(ruta)
+            writer.append(ruta)
+
+        id_unico = uuid.uuid4().hex[:8]
+        ruta_combinado = f"/tmp/combinado_{placa}_{id_unico}.pdf"
+        with open(ruta_combinado, "wb") as f:
+            writer.write(f)
+        writer.close()
+
+        url_final = subir_a_r2(ruta_combinado, f"declaraciones/combinado_{placa}_{id_unico}.pdf",
+                                nombre_descarga=f"Declaracion_{placa}_combinado.pdf")
+        os.remove(ruta_combinado)
+        for ruta in rutas_temp:
+            os.remove(ruta)
+
+        return jsonify({"ok": True, "url": url_final})
+    except Exception as e:
+        for ruta in rutas_temp:
+            if os.path.exists(ruta):
+                os.remove(ruta)
+        import traceback
+        print(traceback.format_exc(), flush=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
