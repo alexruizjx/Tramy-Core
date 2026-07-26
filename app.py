@@ -1717,27 +1717,7 @@ def antioquia_generar_pdf_declaracion(placa, identificacion, tipo_documento_abre
     # 4. Descargar el PDF ya generado (misma sesion)
     # El sitio espera este valor como NUMERO en el JSON, no como texto
     # entre comillas -- por eso se convierte antes de enviarlo.
-    pdf_bytes = _antioquia_descargar_pdf_liquidacion(session, int(formulario_liquidacion))
-
-    # DIAGNOSTICO TEMPORAL -- para validar que la extraccion de caja y
-    # traccion funcione bien con el PDF real. Quitar despues.
-    try:
-        import io as _io
-        from pypdf import PdfReader as _PdfReader
-        _reader = _PdfReader(_io.BytesIO(pdf_bytes))
-        _texto = ""
-        for _pagina in _reader.pages:
-            _texto += (_pagina.extract_text() or "") + "\n"
-        print("=== DIAGNOSTICO texto extraido del PDF (primeros 2000 caracteres) ===", flush=True)
-        print(_texto[:2000], flush=True)
-        print("=== FIN DIAGNOSTICO texto ===", flush=True)
-        print("=== DIAGNOSTICO resultado _extraer_caja_traccion_declaracion ===", flush=True)
-        print(_extraer_caja_traccion_declaracion(pdf_bytes), flush=True)
-        print("=== FIN DIAGNOSTICO resultado ===", flush=True)
-    except Exception as _e:
-        print(f"Error en diagnostico de caja/traccion: {_e}", flush=True)
-
-    return pdf_bytes
+    return _antioquia_descargar_pdf_liquidacion(session, int(formulario_liquidacion))
 
 
 def _antioquia_calcular_validez_pdf(vigencia):
