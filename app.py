@@ -1732,17 +1732,22 @@ def antioquia_generar_todas_declaraciones(placa, identificacion, tipo_documento_
                                            modelo, municipio_transito, apellidos_propietario,
                                            celular="3000000000", email="consulta@consulta.com",
                                            direccion="CRA", municipio="MEDELLIN",
-                                           municipio_cod=5001000, departamento_cod=5, job_id=None):
+                                           municipio_cod=5001000, departamento_cod=5, job_id=None,
+                                           ignorar_cache=False):
     """Genera (o reutiliza del cache, si sigue vigente) el PDF de cada
     vigencia adeudada. Cada vigencia es INDEPENDIENTE: si una falla (a
     veces la Gobernacion tiene problemas puntuales con alguna), las demas
     igual se entregan, y solo habria que reintentar la que fallo.
+    Si 'ignorar_cache' es True (ej. porque se dieron datos reales del
+    cliente para el PDF final), se ignora cualquier PDF ya cacheado y se
+    genera uno nuevo -- para no entregar por error una version vieja con
+    datos de relleno.
     Devuelve una lista de dicts: {vigencia, ok, url, error}."""
     placa = placa.upper()
     resultados = []
 
     for vigencia in vigencias:
-        url_cache = _cache_declaracion_buscar(placa, vigencia)
+        url_cache = None if ignorar_cache else _cache_declaracion_buscar(placa, vigencia)
         if url_cache:
             resultados.append({"vigencia": vigencia, "ok": True, "url": url_cache})
             if job_id:
@@ -2727,6 +2732,18 @@ def generar_pdf_declaracion_endpoint():
     modelo = request.args.get("modelo", "").strip()
     municipio_transito = request.args.get("municipio_transito", "").strip()
     apellidos_propietario = request.args.get("apellidos_propietario", "").strip()
+    # Opcionales -- para que el PDF quede diligenciado con los datos reales
+    # del cliente que va a pagar, en vez de los datos de relleno. Si no se
+    # envian, se usan los valores por defecto de siempre.
+    celular_raw = request.args.get("celular", "").strip()
+    email_raw = request.args.get("email", "").strip()
+    direccion_raw = request.args.get("direccion", "").strip()
+    celular = celular_raw or "3000000000"
+    email = email_raw or "consulta@consulta.com"
+    direccion = direccion_raw or "CRA"
+    # Si se dieron datos reales, no se reutiliza un PDF cacheado (podria
+    # tener los datos de relleno de una consulta anterior).
+    tiene_datos_reales = bool(celular_raw or email_raw or direccion_raw)
 
     if not all([placa, identificacion, vigencias_raw, modelo, municipio_transito, apellidos_propietario]):
         return jsonify({"error": "Faltan parametros: placa, identificacion, vigencia, modelo, municipio_transito, apellidos_propietario"}), 400
@@ -2740,6 +2757,8 @@ def generar_pdf_declaracion_endpoint():
             resultados = antioquia_generar_todas_declaraciones(
                 placa, identificacion, tipo_documento, vigencias,
                 modelo, municipio_transito, apellidos_propietario,
+                celular=celular, email=email, direccion=direccion,
+                ignorar_cache=tiene_datos_reales,
                 job_id=job_id
             )
             job_terminar(job_id, {"resultados": resultados})
