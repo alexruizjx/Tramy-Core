@@ -2738,12 +2738,20 @@ def generar_pdf_declaracion_endpoint():
     celular_raw = request.args.get("celular", "").strip()
     email_raw = request.args.get("email", "").strip()
     direccion_raw = request.args.get("direccion", "").strip()
+    municipio_raw = request.args.get("municipio", "").strip()
+    municipio_cod_raw = request.args.get("municipio_cod", "").strip()
+    departamento_cod_raw = request.args.get("departamento_cod", "").strip()
+
     celular = celular_raw or "3000000000"
     email = email_raw or "consulta@consulta.com"
     direccion = direccion_raw or "CRA"
+    municipio_residencia = municipio_raw or "MEDELLIN"
+    municipio_cod = int(municipio_cod_raw) if municipio_cod_raw.isdigit() else 5001000
+    departamento_cod = int(departamento_cod_raw) if departamento_cod_raw.isdigit() else 5
+
     # Si se dieron datos reales, no se reutiliza un PDF cacheado (podria
     # tener los datos de relleno de una consulta anterior).
-    tiene_datos_reales = bool(celular_raw or email_raw or direccion_raw)
+    tiene_datos_reales = bool(celular_raw or email_raw or direccion_raw or municipio_raw)
 
     if not all([placa, identificacion, vigencias_raw, modelo, municipio_transito, apellidos_propietario]):
         return jsonify({"error": "Faltan parametros: placa, identificacion, vigencia, modelo, municipio_transito, apellidos_propietario"}), 400
@@ -2758,6 +2766,8 @@ def generar_pdf_declaracion_endpoint():
                 placa, identificacion, tipo_documento, vigencias,
                 modelo, municipio_transito, apellidos_propietario,
                 celular=celular, email=email, direccion=direccion,
+                municipio=municipio_residencia, municipio_cod=municipio_cod,
+                departamento_cod=departamento_cod,
                 ignorar_cache=tiene_datos_reales,
                 job_id=job_id
             )
