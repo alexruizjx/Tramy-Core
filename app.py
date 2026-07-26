@@ -1584,6 +1584,11 @@ def _consultar_vigencia_antioquia(vigencia, session, token_cuestionario,
         },
         timeout=60
     )
+    # DIAGNOSTICO TEMPORAL -- para encontrar los nombres exactos de los
+    # campos de Caja y Traccion en la respuesta real. Quitar despues.
+    print("=== DIAGNOSTICO crearDeclaracionImpuestoAnt ===", flush=True)
+    print(r5.json(), flush=True)
+    print("=== FIN DIAGNOSTICO ===", flush=True)
     return r5.json()
 
 
