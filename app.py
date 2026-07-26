@@ -1584,11 +1584,6 @@ def _consultar_vigencia_antioquia(vigencia, session, token_cuestionario,
         },
         timeout=60
     )
-    # DIAGNOSTICO TEMPORAL -- para encontrar los nombres exactos de los
-    # campos de Caja y Traccion en la respuesta real. Quitar despues.
-    print("=== DIAGNOSTICO crearDeclaracionImpuestoAnt ===", flush=True)
-    print(r5.json(), flush=True)
-    print("=== FIN DIAGNOSTICO ===", flush=True)
     return r5.json()
 
 
@@ -1637,6 +1632,31 @@ def _antioquia_descargar_pdf_liquidacion(session, formulario_liquidacion):
     return base64.b64decode(archivo_b64)
 
 
+def _extraer_caja_traccion_declaracion(pdf_bytes):
+    """Extrae 'Caja' (transmision) y 'Traccion' directamente del texto del
+    PDF de la Declaracion Sugerida -- la Gobernacion los incluye ahi
+    aunque no vengan en la respuesta JSON de la consulta (crearDeclaracion
+    ImpuestoAnt), asi que en vez de perseguirlos por la API los leemos del
+    mismo documento que ya generamos. Si no los encuentra (formato distinto,
+    o el vehiculo no tiene esos datos), se devuelven vacios -- el
+    instructivo oficial permite dejarlos en blanco de todas formas."""
+    try:
+        import io, re
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        texto = ""
+        for pagina in reader.pages:
+            texto += (pagina.extract_text() or "") + "\n"
+        texto_norm = texto.upper().replace("Ó", "O").replace("Í", "I").replace("Ó", "O")
+
+        match = re.search(r'TRACCI[O]?N\s+([A-Z0-9]+)\s+D\.?\s*22\s+([A-Z0-9]+)', texto_norm)
+        if match:
+            return {"traccion": match.group(1), "caja": match.group(2)}
+    except Exception as e:
+        print(f"No se pudo extraer caja/traccion del PDF de declaracion: {e}", flush=True)
+    return {"traccion": "", "caja": ""}
+
+
 def antioquia_generar_pdf_declaracion(placa, identificacion, tipo_documento_abrev, vigencia,
                                        modelo, municipio_transito, apellidos_propietario,
                                        celular="3000000000", email="consulta@consulta.com",
@@ -1679,7 +1699,27 @@ def antioquia_generar_pdf_declaracion(placa, identificacion, tipo_documento_abre
     # 4. Descargar el PDF ya generado (misma sesion)
     # El sitio espera este valor como NUMERO en el JSON, no como texto
     # entre comillas -- por eso se convierte antes de enviarlo.
-    return _antioquia_descargar_pdf_liquidacion(session, int(formulario_liquidacion))
+    pdf_bytes = _antioquia_descargar_pdf_liquidacion(session, int(formulario_liquidacion))
+
+    # DIAGNOSTICO TEMPORAL -- para validar que la extraccion de caja y
+    # traccion funcione bien con el PDF real. Quitar despues.
+    try:
+        import io as _io
+        from pypdf import PdfReader as _PdfReader
+        _reader = _PdfReader(_io.BytesIO(pdf_bytes))
+        _texto = ""
+        for _pagina in _reader.pages:
+            _texto += (_pagina.extract_text() or "") + "\n"
+        print("=== DIAGNOSTICO texto extraido del PDF (primeros 2000 caracteres) ===", flush=True)
+        print(_texto[:2000], flush=True)
+        print("=== FIN DIAGNOSTICO texto ===", flush=True)
+        print("=== DIAGNOSTICO resultado _extraer_caja_traccion_declaracion ===", flush=True)
+        print(_extraer_caja_traccion_declaracion(pdf_bytes), flush=True)
+        print("=== FIN DIAGNOSTICO resultado ===", flush=True)
+    except Exception as _e:
+        print(f"Error en diagnostico de caja/traccion: {_e}", flush=True)
+
+    return pdf_bytes
 
 
 def _antioquia_calcular_validez_pdf(vigencia):
