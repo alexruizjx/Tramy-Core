@@ -1637,9 +1637,18 @@ def _extraer_caja_traccion_declaracion(pdf_bytes):
     PDF de la Declaracion Sugerida -- la Gobernacion los incluye ahi
     aunque no vengan en la respuesta JSON de la consulta (crearDeclaracion
     ImpuestoAnt), asi que en vez de perseguirlos por la API los leemos del
-    mismo documento que ya generamos. Si no los encuentra (formato distinto,
-    o el vehiculo no tiene esos datos), se devuelven vacios -- el
-    instructivo oficial permite dejarlos en blanco de todas formas."""
+    mismo documento que ya generamos.
+
+    IMPORTANTE: el orden en que aparecen las etiquetas D.21/D.22 varia
+    segun la plantilla (a veces "D.21 CAJA ... D.22 TRACCION", otras veces
+    al reves, y hasta el nombre de la etiqueta cambia). Por eso, en vez de
+    depender de la posicion, se buscan directamente los VALORES conocidos
+    (MT/AT/CVT para caja, 4X2/4X4 para traccion) dentro de una ventana de
+    texto alrededor de esas etiquetas.
+
+    Si no los encuentra (formato distinto, o el vehiculo no tiene esos
+    datos), se devuelven vacios -- el instructivo oficial permite dejarlos
+    en blanco de todas formas."""
     try:
         import io, re
         from pypdf import PdfReader
@@ -1647,11 +1656,20 @@ def _extraer_caja_traccion_declaracion(pdf_bytes):
         texto = ""
         for pagina in reader.pages:
             texto += (pagina.extract_text() or "") + "\n"
-        texto_norm = texto.upper().replace("Ó", "O").replace("Í", "I").replace("Ó", "O")
+        texto_norm = texto.upper()
 
-        match = re.search(r'TRACCI[O]?N\s+([A-Z0-9]+)\s+D\.?\s*22\s+([A-Z0-9]+)', texto_norm)
-        if match:
-            return {"traccion": match.group(1), "caja": match.group(2)}
+        idx21 = texto_norm.find("D.21")
+        idx22 = texto_norm.find("D.22")
+        indices = [i for i in (idx21, idx22) if i != -1]
+        ventana = texto_norm[max(0, min(indices) - 60): min(indices) + 100] if indices else texto_norm
+
+        match_traccion = re.search(r'\b(4X[24])', ventana)
+        match_caja = re.search(r'\b(MT|AT|CVT|TM|TA)\b', ventana)
+
+        return {
+            "traccion": match_traccion.group(1) if match_traccion else "",
+            "caja": match_caja.group(1) if match_caja else ""
+        }
     except Exception as e:
         print(f"No se pudo extraer caja/traccion del PDF de declaracion: {e}", flush=True)
     return {"traccion": "", "caja": ""}
