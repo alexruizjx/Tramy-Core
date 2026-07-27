@@ -275,6 +275,61 @@ def envigado_revisar_citas_disponibles(dias_adelante=14):
     return resultados
 
 
+ENVIGADO_TURNOS_API = "https://gacomponentes.envigado.gov.co/backga/back-ga/turnos/findAtencionesMonitor"
+
+# Bandera simple en memoria para saber si ya hay una sesion de monitoreo
+# corriendo (evita que se disparen varias sesiones encimadas por error).
+_envigado_monitoreo_estado = {"activo": False, "inicio": None, "fin_esperado": None}
+
+
+def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_monitor=1):
+    """Revisa el "monitor de turnos" de Envigado cada pocos segundos,
+    durante 'duracion_segundos' (2 horas por defecto). Cada vez que
+    aparece un idGestionAtencion que no habiamos visto, lo guarda con la
+    hora en que Tramy lo detecto (la plataforma no entrega un timestamp
+    exacto propio del llamado -- el campo 'fechaInicial' viene vacio)."""
+    fin = time.time() + duracion_segundos
+    ids_vistos = set()
+    hoy_str = datetime.now().strftime("%d/%m/%Y")
+
+    while time.time() < fin:
+        try:
+            params = {
+                "idMonitor": id_monitor,
+                "cantidadTurnos": 10,
+                "fechaInicio": f"{hoy_str} 00:00:00",
+                "fechaFin": f"{hoy_str} 23:59:59",
+                "_": str(int(time.time() * 1000)),
+            }
+            r = requests.get(ENVIGADO_TURNOS_API, params=params, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list) and data:
+                conn = get_db_conn()
+                cur = conn.cursor()
+                for item in data:
+                    idg = item.get("idGestionAtencion")
+                    if idg is None or idg in ids_vistos:
+                        continue
+                    ids_vistos.add(idg)
+                    cur.execute("""
+                        INSERT INTO envigado_turnos_llamados
+                            (id_gestion_atencion, nro_atencion, nombre_usuario, nombre_taquilla,
+                             nombre_servicio, id_estado, detectado_en)
+                        VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (id_gestion_atencion) DO NOTHING
+                    """, (idg, item.get("nroAtencion"), item.get("nombreUsuario"),
+                          item.get("nombreTaquilla"), item.get("nombreServicio"),
+                          item.get("idEstadoGestionAtencion")))
+                conn.commit()
+                cur.close(); conn.close()
+        except Exception as e:
+            print(f"Error en monitoreo de turnos Envigado: {e}", flush=True)
+        time.sleep(intervalo_segundos)
+
+    _envigado_monitoreo_estado["activo"] = False
+
+
 def cache_antioquia_guardar_paz_salvo(placa, avaluo, estado_veh):
     """Guarda en caché que la placa está a paz y salvo hasta fin de año."""
     try:
@@ -3466,6 +3521,79 @@ def envigado_citas_ultimo_resultado_endpoint():
             for f in filas
         ]
         return jsonify({"ok": True, "hay_citas": len(disponibles) > 0, "disponibles": disponibles})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/envigado-turnos-iniciar-monitoreo", methods=["GET"])
+def envigado_turnos_iniciar_monitoreo_endpoint():
+    """Arranca una sesion de monitoreo de ~2 horas (por defecto) que
+    revisa el monitor de turnos de Envigado cada pocos segundos y va
+    guardando cada llamado nuevo que aparezca. Corre en el servidor, no
+    depende de que el navegador siga abierto."""
+    if _envigado_monitoreo_estado["activo"]:
+        return jsonify({
+            "ok": False,
+            "error": "Ya hay una sesión de monitoreo corriendo.",
+            "fin_esperado": _envigado_monitoreo_estado["fin_esperado"]
+        }), 409
+
+    duracion_minutos = request.args.get("minutos", "120")
+    duracion_minutos = int(duracion_minutos) if duracion_minutos.isdigit() else 120
+    duracion_segundos = duracion_minutos * 60
+
+    _envigado_monitoreo_estado["activo"] = True
+    _envigado_monitoreo_estado["inicio"] = datetime.now().isoformat()
+    _envigado_monitoreo_estado["fin_esperado"] = (datetime.now() + timedelta(seconds=duracion_segundos)).isoformat()
+
+    threading.Thread(
+        target=_envigado_polling_turnos,
+        kwargs={"duracion_segundos": duracion_segundos},
+        daemon=True
+    ).start()
+
+    return jsonify({
+        "ok": True,
+        "mensaje": f"Monitoreo iniciado por {duracion_minutos} minutos.",
+        "fin_esperado": _envigado_monitoreo_estado["fin_esperado"]
+    })
+
+
+@app.route("/envigado-turnos-estado-monitoreo", methods=["GET"])
+def envigado_turnos_estado_monitoreo_endpoint():
+    """Indica si hay una sesion de monitoreo activa en este momento."""
+    return jsonify({
+        "ok": True,
+        "activo": _envigado_monitoreo_estado["activo"],
+        "inicio": _envigado_monitoreo_estado["inicio"],
+        "fin_esperado": _envigado_monitoreo_estado["fin_esperado"],
+    })
+
+
+@app.route("/envigado-turnos-capturados", methods=["GET"])
+def envigado_turnos_capturados_endpoint():
+    """Devuelve los turnos capturados, mas recientes primero. Por defecto
+    solo los de hoy."""
+    limite = request.args.get("limite", "100")
+    limite = int(limite) if limite.isdigit() else 100
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT nro_atencion, nombre_usuario, nombre_taquilla, nombre_servicio, detectado_en
+            FROM envigado_turnos_llamados
+            WHERE detectado_en::date = CURRENT_DATE
+            ORDER BY detectado_en DESC
+            LIMIT %s
+        """, (limite,))
+        filas = cur.fetchall()
+        cur.close(); conn.close()
+        turnos = [
+            {"nro_atencion": f[0], "nombre_usuario": f[1], "taquilla": f[2],
+             "servicio": f[3], "detectado_en": f[4].isoformat()}
+            for f in filas
+        ]
+        return jsonify({"ok": True, "turnos": turnos})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
