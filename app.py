@@ -1202,26 +1202,32 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     # tabla y se rompe si borramos filas despues).
     edc["AE76"] = _moneda_pys(estado_veh.get("avaluoComercial", 0))
 
-    # Eliminar las filas vacias sobrantes de ambas tablas (no todas las
-    # placas tienen 30 declaraciones ni observaciones) -- se hace de
-    # abajo hacia arriba para no desfasar las posiciones ya escritas.
+    # Ocultar las filas vacias sobrantes de ambas tablas (no todas las
+    # placas tienen 30 declaraciones ni observaciones). Se OCULTAN en vez
+    # de borrarlas (LibreOffice no imprime filas ocultas) porque borrar
+    # filas con openpyxl en una hoja con tantas celdas fusionadas como
+    # esta corrompe las fusiones y daña el diseno.
+    def _ocultar_filas(hoja, desde, hasta):
+        for r in range(desde, hasta + 1):
+            hoja.row_dimensions[r].hidden = True
+
     FILA_OBS_INICIO, FILA_OBS_FIN = 53, 72
     max_obs = max(len(procesos), len(bloqueos), len(novedades))
     if max_obs == 0:
-        edc.delete_rows(FILA_OBS_INICIO, FILA_OBS_FIN - FILA_OBS_INICIO + 1)
+        _ocultar_filas(edc, FILA_OBS_INICIO, FILA_OBS_FIN)
     else:
         ultima_fila_obs_usada = FILA_OBS_INICIO + max_obs - 1
         if ultima_fila_obs_usada < FILA_OBS_FIN:
-            edc.delete_rows(ultima_fila_obs_usada + 1, FILA_OBS_FIN - ultima_fila_obs_usada)
+            _ocultar_filas(edc, ultima_fila_obs_usada + 1, FILA_OBS_FIN)
 
     FILA_DECL_INICIO, FILA_DECL_FIN = 16, 46
     filas_declaraciones = len(declaraciones)
     if filas_declaraciones == 0:
-        edc.delete_rows(FILA_DECL_INICIO, FILA_DECL_FIN - FILA_DECL_INICIO + 1)
+        _ocultar_filas(edc, FILA_DECL_INICIO, FILA_DECL_FIN)
     else:
         ultima_fila_decl_usada = FILA_DECL_INICIO + filas_declaraciones - 1
         if ultima_fila_decl_usada < FILA_DECL_FIN:
-            edc.delete_rows(ultima_fila_decl_usada + 1, FILA_DECL_FIN - ultima_fila_decl_usada)
+            _ocultar_filas(edc, ultima_fila_decl_usada + 1, FILA_DECL_FIN)
 
     hojas_a_conservar = {"PYS", "ESTADO DE CUENTA"}
     for nombre in list(wb.sheetnames):
