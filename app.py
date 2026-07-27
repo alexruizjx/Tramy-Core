@@ -213,6 +213,68 @@ def cache_antioquia_eliminar_vigencia(placa, anio):
         print(f"Error cache eliminar vigencia: {e}")
 
 
+ENVIGADO_CITAS_SEDES = {
+    "Vegas (El Colombiano)": 1,
+    "City Plaza": 3,
+}
+ENVIGADO_CITAS_ID_SERVICIO = "90"
+ENVIGADO_CITAS_API = "https://movilidad.envigado.gov.co/backavit/avit/citas/getHorasDisponibles"
+
+
+def envigado_consultar_horas_disponibles(id_subsede, fecha_dia):
+    """Consulta si hay horarios disponibles en una sede/fecha especifica
+    del sistema de citas de Envigado (plataforma Quipux). Devuelve la
+    cantidad de horarios encontrados (0 si no hay nada disponible)."""
+    payload = {
+        "idServicios": ENVIGADO_CITAS_ID_SERVICIO,
+        "idSubsede": id_subsede,
+        "cantidadTramites": 1,
+        "tiempoAtencion": 1,
+        "tiempoAtencionTotal": 9,
+        "cantidadLimiteLibracion": "15",
+        "fechaDia": fecha_dia,
+        "isIncluirHorariosCancelados": "N",
+        "nroDocumento": "71632131313",
+        "tipoDocumento": "2",
+    }
+    try:
+        r = requests.post(ENVIGADO_CITAS_API, json=payload, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        total_horarios = sum(len(grupo.get("horarios", [])) for grupo in data) if isinstance(data, list) else 0
+        return total_horarios
+    except Exception as e:
+        print(f"Error consultando citas Envigado (subsede {id_subsede}, {fecha_dia}): {e}", flush=True)
+        return None  # None = error de consulta, distinto de 0 = sin citas
+
+
+def envigado_revisar_citas_disponibles(dias_adelante=14):
+    """Revisa las DOS sedes de Envigado para los proximos N dias, y guarda
+    el resultado en la base de datos. Devuelve una lista de resultados:
+    {sede, fecha, cantidad_horarios}."""
+    resultados = []
+    hoy = datetime.now()
+    conn = get_db_conn()
+    cur = conn.cursor()
+    for sede, id_subsede in ENVIGADO_CITAS_SEDES.items():
+        for i in range(dias_adelante):
+            fecha = hoy + timedelta(days=i)
+            fecha_str = fecha.strftime("%d/%m/%Y")
+            cantidad = envigado_consultar_horas_disponibles(id_subsede, fecha_str)
+            if cantidad is None:
+                continue
+            resultados.append({"sede": sede, "fecha": fecha_str, "cantidad_horarios": cantidad})
+            cur.execute("""
+                INSERT INTO envigado_citas_disponibles (sede, id_subsede, fecha_dia, cantidad_horarios, verificado_en)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (sede, fecha_dia) DO UPDATE SET
+                    cantidad_horarios=EXCLUDED.cantidad_horarios, verificado_en=NOW()
+            """, (sede, id_subsede, fecha_str, cantidad))
+    conn.commit()
+    cur.close(); conn.close()
+    return resultados
+
+
 def cache_antioquia_guardar_paz_salvo(placa, avaluo, estado_veh):
     """Guarda en caché que la placa está a paz y salvo hasta fin de año."""
     try:
@@ -3358,6 +3420,53 @@ def generar_fun_endpoint():
     except Exception as e:
         import traceback
         print(traceback.format_exc(), flush=True)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/envigado-citas-disponibles", methods=["GET"])
+def envigado_citas_disponibles_endpoint():
+    """Revisa en vivo las dos sedes de Envigado (Vegas y City Plaza) para
+    los proximos dias, y devuelve solo las fechas que SI tienen horarios
+    disponibles."""
+    dias = request.args.get("dias", "14")
+    dias = int(dias) if dias.isdigit() else 14
+    try:
+        resultados = envigado_revisar_citas_disponibles(dias_adelante=dias)
+        con_citas = [r for r in resultados if r["cantidad_horarios"] > 0]
+        return jsonify({
+            "ok": True,
+            "hay_citas": len(con_citas) > 0,
+            "disponibles": con_citas,
+            "verificado_en": datetime.now().isoformat()
+        })
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc(), flush=True)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/envigado-citas-ultimo-resultado", methods=["GET"])
+def envigado_citas_ultimo_resultado_endpoint():
+    """Devuelve el ultimo resultado GUARDADO (sin volver a consultar la
+    API en vivo) -- para el aviso rapido que se muestra al entrar a
+    Liquidacion, sin tener que esperar una consulta en vivo cada vez."""
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT sede, fecha_dia, cantidad_horarios, verificado_en
+            FROM envigado_citas_disponibles
+            WHERE cantidad_horarios > 0
+            ORDER BY verificado_en DESC
+        """)
+        filas = cur.fetchall()
+        cur.close(); conn.close()
+        disponibles = [
+            {"sede": f[0], "fecha": f[1], "cantidad_horarios": f[2], "verificado_en": f[3].isoformat()}
+            for f in filas
+        ]
+        return jsonify({"ok": True, "hay_citas": len(disponibles) > 0, "disponibles": disponibles})
+    except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
