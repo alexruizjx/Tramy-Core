@@ -1192,6 +1192,19 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     if procesos or bloqueos or novedades:
         edc["A74"] = ""
 
+    # Columna "VIGENCIAS ADEUDADAS" (A53:A72) siempre se deja en blanco --
+    # este documento solo se genera cuando el vehiculo esta a paz y salvo,
+    # nunca hay vigencias adeudadas que mostrar aqui. Se sobrescribe
+    # directo porque la formula original (=IF(AND(...),"")) no tiene rama
+    # para cuando la condicion es falsa, y en ese caso Excel/LibreOffice
+    # muestra el texto literal "FALSE" en vez de dejarlo vacio.
+    for r in range(53, 73):
+        edc.cell(row=r, column=1, value="")
+
+    # Borde suelto (resto de la plantilla) que cortaba visualmente el
+    # texto "Tipos de declaraciones..." justo en la palabra "Corrección".
+    edc["O47"].border = Border()
+
     # Certificado No. -- se usa el numero real que entrega la Gobernacion
     # en esta consulta puntual (cambia cada vez que se consulta).
     edc["AG5"] = estado_veh.get("numeroCertificadoSap", "")
