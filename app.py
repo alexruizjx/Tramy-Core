@@ -2667,12 +2667,15 @@ def consultar_antioquia_vigencias():
             estado_veh          = data3.get("estadoCuenta", {})
             vigencias_adeudadas = data3.get("listaVigenciasAdeudas", [])
             avaluo              = estado_veh.get("avaluoComercial", 0) or 0
-            # DIAGNOSTICO TEMPORAL -- para ver todos los campos disponibles
-            # en estadoCuenta cuando el vehiculo esta a paz y salvo. Quitar
-            # despues.
-            print("=== DIAGNOSTICO estado_veh completo (endpoint real) ===", flush=True)
-            print(estado_veh, flush=True)
-            print("=== FIN DIAGNOSTICO estado_veh (endpoint real) ===", flush=True)
+            # DIAGNOSTICO TEMPORAL -- para ver TODAS las llaves de nivel
+            # superior de data3 (no solo estadoCuenta), por si hay un
+            # historial de declaraciones en otra parte de la respuesta.
+            # Quitar despues.
+            print("=== DIAGNOSTICO llaves de data3 ===", flush=True)
+            print(list(data3.keys()), flush=True)
+            print("=== DIAGNOSTICO data3 completo ===", flush=True)
+            print(data3, flush=True)
+            print("=== FIN DIAGNOSTICO data3 ===", flush=True)
             resultado['vigencias']  = vigencias_adeudadas
             resultado['avaluo']     = avaluo
             resultado['estado_veh'] = estado_veh
