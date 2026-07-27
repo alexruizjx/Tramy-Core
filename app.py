@@ -729,13 +729,15 @@ def guardar_vehiculo_runt(datos):
 import unicodedata
 import subprocess
 import shutil
-from openpyxl.styles import PatternFill, Alignment
+from openpyxl.styles import PatternFill, Alignment, Border, Side
 import openpyxl as _openpyxl
+import copy
 
 # --- Generador de FUN (Formulario Unico Nacional) ---
 # La plantilla debe subirse al repositorio junto a app.py, con este mismo
 # nombre exacto ("AppJX.xlsm"), en el mismo directorio.
 FUN_PLANTILLA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "AppJX.xlsm")
+DECLARACION_MANUAL_PLANTILLA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DECLARACION_MANUAL_DE_IMPUESTOS_DEPARTAMENTALES.xlsx")
 
 VERDE_MARCA = PatternFill(start_color="92D050", end_color="92D050", fill_type="solid")
 
@@ -908,6 +910,149 @@ def generar_fun(datos, ruta_salida_pdf):
     generado = os.path.join(os.path.dirname(ruta_salida_pdf), f"_fun_{id_temp}.pdf")
     shutil.move(generado, ruta_salida_pdf)
     os.remove(ruta_xlsm_temp)
+
+
+def _moneda(valor):
+    """Formatea un valor numerico como texto de moneda '$ X,XXX,XXX' para
+    la declaracion manual."""
+    try:
+        return "$ {:,.0f}".format(float(valor))
+    except (TypeError, ValueError):
+        return valor
+
+
+def generar_declaracion_manual_pdf(datos, ruta_salida_pdf):
+    """Genera la Declaracion Manual (formulario FO-M8-P6-008) diligenciada,
+    a partir de la plantilla Excel real (hojas CONTRIBUYENTE y ENTIDAD
+    RECAUDADORA). 'datos' es un dict con todos los campos ya resueltos:
+    datos del vehiculo, del propietario, y la liquidacion privada."""
+    wb = _openpyxl.load_workbook(DECLARACION_MANUAL_PLANTILLA)
+
+    for nombre_hoja in wb.sheetnames:
+        ws = wb[nombre_hoja]
+
+        # A. Periodo
+        ws["H12"] = datos.get("vigencia", "")
+
+        # C. Declarante
+        ws["D15"] = datos.get("nombre_completo", "")
+        ws["D18"] = datos.get("apellidos", "")
+        ws["AZ18"] = datos.get("celular", "")
+        ws["CA18"] = datos.get("telefono", "")
+        ws["CO18"] = datos.get("email", "")
+        ws["D21"] = datos.get("direccion", "")
+        ws["BE21"] = datos.get("municipio_residencia", "")
+        ws["CI21"] = datos.get("departamento_residencia", "ANTIOQUIA")
+        ws["CR15"] = datos.get("numero_documento", "")
+        tipo_doc = (datos.get("tipo_documento") or "").upper()
+        casillas_tipo_doc = {"CC": "BM15", "NIT": "BV15", "TI": "CC15", "CE": "CH15", "OTRO": "CN15"}
+        if tipo_doc in casillas_tipo_doc:
+            ws[casillas_tipo_doc[tipo_doc]] = "X"
+
+        # D. Vehiculo
+        ws["D24"] = datos.get("placa", "")
+        ws["Z24"] = datos.get("marca", "")
+        ws["BB24"] = datos.get("linea", "")
+        ws["CP24"] = datos.get("modelo", "")
+        ws["D27"] = datos.get("clase", "")
+        ws["AJ27"] = datos.get("carroceria", "")
+        # D7 GRUPO se deja en blanco (instructivo oficial)
+        ws["BZ27"] = datos.get("puertas", "")
+        ws["CL27"] = datos.get("cilindraje", "")
+        ws["D30"] = datos.get("capacidad_carga", "")
+        ws["AJ30"] = datos.get("capacidad_pasajeros", "")
+        ws["BP30"] = datos.get("municipio_matricula", "")
+        ws["CL30"] = datos.get("departamento_matricula", "ANTIOQUIA")
+
+        if datos.get("blindado"):
+            ws["S33"] = "X"
+        if datos.get("importado"):
+            ws["AN33"] = "X"
+
+        ws["CI35"] = datos.get("caja", "")
+        ws["CY35"] = datos.get("traccion", "")
+
+        # E. Liquidacion privada -- con formato de moneda
+        ws["AF38"] = _moneda(datos.get("avaluo", 0))
+        ws["AF40"] = _moneda(datos.get("impuesto", 0))
+        ws["AF41"] = _moneda(datos.get("sanciones", 0))
+        ws["AF42"] = _moneda(datos.get("descuentos", 0))
+        ws["AF43"] = _moneda(datos.get("total_cargo_5", 0))
+        ws["CJ37"] = _moneda(datos.get("total_cargo_6", 0))
+        ws["CJ38"] = _moneda(datos.get("intereses_mora", 0))
+        ws["CJ39"] = _moneda(datos.get("pagos_anteriores", 0))
+        ws["CJ40"] = _moneda(datos.get("descuento_interes", 0))
+        ws["CJ41"] = _moneda(datos.get("saldo_favor", 0))
+        ws["CJ42"] = _moneda(datos.get("total_pagar", 0))
+
+        # G. Declarante -- se deja en blanco a proposito. Se firma y se
+        # diligencia a lapicero de forma manual, no se prellena.
+
+        # Configuracion de pagina: una sola pagina por hoja, vertical.
+        ws.print_area = "B3:DI82"
+        ws.page_setup.orientation = "portrait"
+        ws.page_setup.paperSize = ws.PAPERSIZE_LETTER
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 1
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.print_options.gridLines = False
+        ws.sheet_view.showGridLines = False
+
+        # Limpiar bordes sueltos (restos de la plantilla) que generaban
+        # lineas verticales gruesas sin pertenecer a ninguna casilla real.
+        sin_borde = Border()
+        for coord in ["I7", "K7", "G35", "H35", "M49", "B50", "B64", "B66", "J66", "L66", "N66", "V66"]:
+            ws[coord].border = sin_borde
+
+        # D50 (G.2 Nombres y Apellidos) SI es la celda real de esa casilla
+        # (no un borde suelto) -- se le restaura el contorno completo.
+        borde_fino = Side(style="thin")
+        ws["D50"].border = Border(top=borde_fino, bottom=borde_fino, left=borde_fino, right=borde_fino)
+
+        # F40 ("VEHICULOS AUTOMOTORES") y F38 ("DEL VEHICULO") tenian
+        # alineacion vertical sin fijar -- al agrandar sus filas el texto
+        # se hundia y se veia separado de la linea de arriba.
+        celda_f40 = ws["F40"]
+        celda_f40.value = "VEHICULOS AUTOMOTORES"
+        celda_f40.alignment = Alignment(vertical="top", horizontal=celda_f40.alignment.horizontal)
+        celda_f38 = ws["F38"]
+        celda_f38.alignment = Alignment(vertical="top", horizontal=celda_f38.alignment.horizontal)
+
+        ws.row_dimensions[38].height = 14
+        ws.row_dimensions[40].height = 14
+        ws.row_dimensions[28].height = 13.5
+        ws.row_dimensions[29].height = 1.5
+        ws.row_dimensions[27].height = 16.5
+
+        # Los numeros de renglon (1 al 5) mostraban "###" en el PDF sin
+        # importar el ancho de columna -- convertirlos de numero a TEXTO
+        # elimina el problema de raiz (el "###" solo le pasa a numeros).
+        ws["D37"] = "1"
+        ws["D39"] = "2"
+        ws["D41"] = "3"
+        ws["D42"] = "4"
+        ws["D43"] = "5"
+
+        # Ademas usan un color de TEMA que LibreOffice a veces interpreta
+        # mal al convertir (texto invisible) -- se fija a negro explicito.
+        for coord in ["D37", "D39", "D41", "D42", "D43"]:
+            celda = ws[coord]
+            nueva_fuente = copy.copy(celda.font)
+            nueva_fuente.color = "FF000000"
+            celda.font = nueva_fuente
+
+    id_temp = str(uuid.uuid4())[:8]
+    ruta_xlsx_temp = f"/tmp/_decl_manual_{id_temp}.xlsx"
+    wb.save(ruta_xlsx_temp)
+
+    subprocess.run([
+        "soffice", "--headless", "--convert-to", "pdf",
+        "--outdir", os.path.dirname(ruta_salida_pdf), ruta_xlsx_temp
+    ], check=True, timeout=90)
+
+    generado = os.path.join(os.path.dirname(ruta_salida_pdf), f"_decl_manual_{id_temp}.pdf")
+    shutil.move(generado, ruta_salida_pdf)
+    os.remove(ruta_xlsx_temp)
 
 
 def bloquear_recursos(page):
@@ -1683,8 +1828,11 @@ def antioquia_generar_pdf_declaracion(placa, identificacion, tipo_documento_abre
     """Flujo completo para obtener el PDF de la declaracion sugerida (el que
     se lleva al banco), TODO dentro de la misma sesion (el numero de
     liquidacion que genera el sitio solo es valido dentro de la sesion que
-    lo creo, no se puede reutilizar en una sesion nueva). Devuelve los
-    bytes del PDF."""
+    lo creo, no se puede reutilizar en una sesion nueva).
+    Devuelve una tupla (pdf_bytes, data_vig) -- data_vig es la respuesta
+    cruda de la liquidacion (avaluo, impuesto, sanciones, intereses, etc.),
+    util para reutilizar esos mismos datos en la declaracion manual sin
+    tener que volver a consultar."""
     tipo_documento_id = ANTIOQUIA_TIPO_DOC_MAP.get(tipo_documento_abrev.upper(), "1")
     tipo_doc_info = ANTIOQUIA_TIPOS_DOCUMENTO.get(tipo_documento_id, ANTIOQUIA_TIPOS_DOCUMENTO["1"])
     doc_abreviatura = tipo_doc_info["abreviatura"]
@@ -1717,7 +1865,8 @@ def antioquia_generar_pdf_declaracion(placa, identificacion, tipo_documento_abre
     # 4. Descargar el PDF ya generado (misma sesion)
     # El sitio espera este valor como NUMERO en el JSON, no como texto
     # entre comillas -- por eso se convierte antes de enviarlo.
-    return _antioquia_descargar_pdf_liquidacion(session, int(formulario_liquidacion))
+    pdf_bytes = _antioquia_descargar_pdf_liquidacion(session, int(formulario_liquidacion))
+    return pdf_bytes, data_vig
 
 
 def _antioquia_calcular_validez_pdf(vigencia):
@@ -1802,7 +1951,7 @@ def antioquia_generar_todas_declaraciones(placa, identificacion, tipo_documento_
             job_actualizar(job_id, f"Generando declaración de la vigencia {vigencia}...",
                             datos_parciales=resultados)
         try:
-            pdf_bytes = antioquia_generar_pdf_declaracion(
+            pdf_bytes, _data_vig = antioquia_generar_pdf_declaracion(
                 placa, identificacion, tipo_documento_abrev, vigencia,
                 modelo, municipio_transito, apellidos_propietario,
                 celular, email, direccion, municipio, municipio_cod, departamento_cod
@@ -2821,6 +2970,130 @@ def generar_pdf_declaracion_endpoint():
             job_error(job_id, str(e))
 
     threading.Thread(target=ejecutar_declaraciones, daemon=True).start()
+    return jsonify({"job_id": job_id, "estado": "procesando"})
+
+
+@app.route("/generar-declaracion-manual", methods=["GET"])
+def generar_declaracion_manual_endpoint():
+    """Genera la Declaracion Manual (formulario FO-M8-P6-008) diligenciada,
+    combinando: datos del vehiculo ya guardados en Tramy (tabla vehiculos),
+    los datos del propietario que escribe el usuario, y la liquidacion
+    privada + caja/traccion que se obtienen de una consulta real a la
+    Gobernacion (la misma consulta que usa la Declaracion Sugerida).
+    Se ejecuta en segundo plano por el mismo motivo que las demas consultas
+    a la Gobernacion: puede tardar por los captchas."""
+    placa = request.args.get("placa", "").upper().strip()
+    identificacion = request.args.get("identificacion", "").strip()
+    tipo_documento = request.args.get("tipo_documento", "CC").strip()
+    vigencia = request.args.get("vigencia", "").strip()
+    modelo = request.args.get("modelo", "").strip()
+    municipio_transito = request.args.get("municipio_transito", "").strip()
+    apellidos_propietario = request.args.get("apellidos_propietario", "").strip()
+    nombres_propietario = request.args.get("nombres_propietario", "").strip()
+
+    celular = request.args.get("celular", "").strip() or "3000000000"
+    email = request.args.get("email", "").strip() or "consulta@consulta.com"
+    direccion = request.args.get("direccion", "").strip() or "CRA"
+    municipio_residencia = request.args.get("municipio", "").strip() or "MEDELLIN"
+    municipio_cod = request.args.get("municipio_cod", "").strip()
+    municipio_cod = int(municipio_cod) if municipio_cod.isdigit() else 5001000
+    departamento_cod = request.args.get("departamento_cod", "").strip()
+    departamento_cod = int(departamento_cod) if departamento_cod.isdigit() else 5
+
+    if not all([placa, identificacion, vigencia, modelo, municipio_transito, apellidos_propietario]):
+        return jsonify({"error": "Faltan parametros: placa, identificacion, vigencia, modelo, municipio_transito, apellidos_propietario"}), 400
+
+    job_id = str(uuid.uuid4())
+    job_actualizar(job_id, "Iniciando...", "procesando")
+
+    def ejecutar():
+        try:
+            job_actualizar(job_id, "Consultando datos guardados del vehículo...")
+            conn = get_db_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM vehiculos WHERE placa = %s", (placa,))
+            fila = cur.fetchone()
+            vehiculo = {}
+            if fila:
+                columnas = [desc[0] for desc in cur.description]
+                vehiculo = dict(zip(columnas, fila))
+            cur.close(); conn.close()
+
+            job_actualizar(job_id, "Consultando liquidación en la Gobernación (puede tardar por el captcha)...")
+            pdf_sugerida_bytes, data_vig = antioquia_generar_pdf_declaracion(
+                placa, identificacion, tipo_documento, vigencia,
+                modelo, municipio_transito, apellidos_propietario,
+                celular=celular, email=email, direccion=direccion,
+                municipio=municipio_residencia, municipio_cod=municipio_cod,
+                departamento_cod=departamento_cod
+            )
+
+            job_actualizar(job_id, "Extrayendo Caja y Tracción del documento...")
+            caja_traccion = _extraer_caja_traccion_declaracion(pdf_sugerida_bytes)
+
+            datos = {
+                "vigencia": vigencia,
+                "nombre_completo": nombres_propietario,
+                "apellidos": apellidos_propietario,
+                "celular": celular if celular != "3000000000" else "",
+                "telefono": "",
+                "email": email if email != "consulta@consulta.com" else "",
+                "direccion": direccion if direccion != "CRA" else "",
+                "municipio_residencia": municipio_residencia,
+                "departamento_residencia": "ANTIOQUIA",
+                "numero_documento": identificacion,
+                "tipo_documento": tipo_documento,
+
+                "placa": placa,
+                "marca": vehiculo.get("marca", ""),
+                "linea": vehiculo.get("linea", ""),
+                "modelo": modelo,
+                "clase": vehiculo.get("clase", ""),
+                "carroceria": vehiculo.get("carroceria", ""),
+                "puertas": vehiculo.get("puertas", ""),
+                "cilindraje": vehiculo.get("cilindrada", ""),
+                "capacidad_carga": vehiculo.get("capacidad_carga", ""),
+                "capacidad_pasajeros": vehiculo.get("capacidad_pasajeros", ""),
+                "municipio_matricula": municipio_transito,
+                "departamento_matricula": "ANTIOQUIA",
+                "blindado": bool(vehiculo.get("info_blindaje")),
+                "importado": False,
+                "caja": caja_traccion.get("caja", ""),
+                "traccion": caja_traccion.get("traccion", ""),
+
+                # Liquidacion privada -- ver nota de mapeo mas abajo
+                "avaluo": data_vig.get("avaluoComercial", 0),
+                "impuesto": data_vig.get("impuesto", 0),
+                "sanciones": data_vig.get("sancion", 0),
+                "descuentos": data_vig.get("descuentoSancion", 0),
+                "total_cargo_5": data_vig.get("totalCargo", 0),
+                "total_cargo_6": data_vig.get("totalCargo", 0),
+                "intereses_mora": data_vig.get("interesesMora", 0),
+                "pagos_anteriores": data_vig.get("pagosAnteriores", 0),
+                "descuento_interes": data_vig.get("descuentoInteresesMora", 0),
+                "saldo_favor": data_vig.get("saldoFavor", 0),
+                # OJO: se usa "saldoPagar", NO "totalPagar" -- este ultimo
+                # incluye el costo de $25.900 del servicio de declaracion
+                # sugerida, que no aplica a la declaracion manual.
+                "total_pagar": data_vig.get("saldoPagar", 0),
+            }
+
+            job_actualizar(job_id, "Generando el documento...")
+            id_unico = uuid.uuid4().hex[:8]
+            ruta_pdf = f"/tmp/decl_manual_{placa}_{vigencia}_{id_unico}.pdf"
+            generar_declaracion_manual_pdf(datos, ruta_pdf)
+
+            url = subir_a_r2(ruta_pdf, f"declaraciones-manuales/{placa}_{vigencia}_{id_unico}.pdf",
+                              nombre_descarga=f"Declaracion_Manual_{placa}_{vigencia}.pdf")
+            os.remove(ruta_pdf)
+
+            job_terminar(job_id, {"url": url})
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc(), flush=True)
+            job_error(job_id, str(e))
+
+    threading.Thread(target=ejecutar, daemon=True).start()
     return jsonify({"job_id": job_id, "estado": "procesando"})
 
 
