@@ -3183,18 +3183,23 @@ def mis_vehiculos_runt():
 
 @app.route("/vehiculos-buscar", methods=["GET"])
 def vehiculos_buscar():
-    """Autocompletado: devuelve placas guardadas que empiecen con el texto
-    escrito, para el campo de busqueda rapida en el frontend."""
+    """Autocompletado: si hay texto ('q'), devuelve placas que empiecen con
+    ese texto; si no hay texto, devuelve las mas recientes -- para que el
+    desplegable muestre algo util apenas se abre, antes de escribir nada."""
     prefijo = request.args.get("q", "").upper().strip()
-    if not prefijo:
-        return jsonify([])
     try:
         conn = get_db_conn()
         cur = conn.cursor()
-        cur.execute("""
-            SELECT placa, marca, linea FROM vehiculos
-            WHERE placa LIKE %s ORDER BY leido_en DESC LIMIT 8
-        """, (prefijo + '%',))
+        if prefijo:
+            cur.execute("""
+                SELECT placa, marca, linea FROM vehiculos
+                WHERE placa LIKE %s ORDER BY leido_en DESC LIMIT 8
+            """, (prefijo + '%',))
+        else:
+            cur.execute("""
+                SELECT placa, marca, linea FROM vehiculos
+                ORDER BY leido_en DESC LIMIT 8
+            """)
         filas = [{"placa": r[0], "marca": r[1], "linea": r[2]} for r in cur.fetchall()]
         cur.close(); conn.close()
         return jsonify(filas)
