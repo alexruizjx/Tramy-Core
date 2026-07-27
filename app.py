@@ -237,6 +237,51 @@ def cache_antioquia_guardar_paz_salvo(placa, avaluo, estado_veh):
         print(f"Error cache guardar paz y salvo: {e}")
 
 
+def guardar_estado_cuenta_antioquia(placa, data3):
+    """Guarda TODOS los datos de la consulta (estadoCuenta, historial de
+    declaraciones, procesos fiscales, bloqueos, novedades) para poder
+    generar despues el documento Estado de Cuenta sin tener que volver a
+    consultar. Se llama cada vez que un vehiculo sale a paz y salvo."""
+    try:
+        estado_veh = data3.get("estadoCuenta", {}) or {}
+        conn = get_db_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            INSERT INTO estado_cuenta_antioquia
+                (placa, numero_certificado, valor_certificado, periodo_inicio, periodo_fin,
+                 estado_cuenta_json, lista_detalle_pagos, lista_proceso_fiscal, lista_bloqueo,
+                 novedades, actualizado_en)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (placa) DO UPDATE SET
+                numero_certificado=EXCLUDED.numero_certificado,
+                valor_certificado=EXCLUDED.valor_certificado,
+                periodo_inicio=EXCLUDED.periodo_inicio,
+                periodo_fin=EXCLUDED.periodo_fin,
+                estado_cuenta_json=EXCLUDED.estado_cuenta_json,
+                lista_detalle_pagos=EXCLUDED.lista_detalle_pagos,
+                lista_proceso_fiscal=EXCLUDED.lista_proceso_fiscal,
+                lista_bloqueo=EXCLUDED.lista_bloqueo,
+                novedades=EXCLUDED.novedades,
+                actualizado_en=NOW()
+        """, (
+            placa.upper(),
+            estado_veh.get("numeroCertificadoSap"),
+            estado_veh.get("valorEstadoCuenta"),
+            estado_veh.get("periodoInicioCertificacion"),
+            estado_veh.get("periodoFinCertificacion"),
+            json.dumps(estado_veh, ensure_ascii=False, default=str),
+            json.dumps(data3.get("listaDetallePagos", []), ensure_ascii=False, default=str),
+            json.dumps(data3.get("listaProcesoFiscal", []), ensure_ascii=False, default=str),
+            json.dumps(data3.get("listaBloqueo", []), ensure_ascii=False, default=str),
+            json.dumps(data3.get("novedades", []), ensure_ascii=False, default=str),
+        ))
+        conn.commit()
+        cur.close(); conn.close()
+        print(f"  → Estado de Cuenta guardado para {placa}")
+    except Exception as e:
+        print(f"Error guardando estado de cuenta: {e}")
+
+
 def cache_antioquia_guardar_deuda(placa, vigencias_data, avaluo):
     """Guarda en caché vigencias con deuda.
     - Vigencia año actual antes del 1 agosto: expira el 31 de julio
@@ -1065,6 +1110,111 @@ def generar_declaracion_manual_pdf(datos, ruta_salida_pdf):
     generado = os.path.join(os.path.dirname(ruta_salida_pdf), f"_decl_manual_{id_temp}.pdf")
     shutil.move(generado, ruta_salida_pdf)
     os.remove(ruta_xlsx_temp)
+
+
+def _moneda_pys(valor):
+    """Formatea un valor como '$\\xa0X.XXX.XXX', igual al formato que ya
+    usa la plantilla PYS de AppJX.xlsm (con espacio duro y punto de miles)."""
+    try:
+        return "$\xa0" + "{:,.0f}".format(float(valor)).replace(",", ".")
+    except (TypeError, ValueError):
+        return "$\xa00"
+
+
+def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
+    """Genera el documento Estado de Cuenta (certificado de paz y salvo),
+    a partir de la plantilla AppJX.xlsm real (hojas PYS + ESTADO DE
+    CUENTA). 'datos' es un dict con: estado_veh (dict de estadoCuenta),
+    lista_detalle_pagos, lista_proceso_fiscal, lista_bloqueo, novedades."""
+    wb = _openpyxl.load_workbook(FUN_PLANTILLA, data_only=False, keep_vba=True)
+    pys = wb["PYS"]
+    edc = wb["ESTADO DE CUENTA"]
+
+    estado_veh = datos.get("estado_veh", {}) or {}
+    inicio = estado_veh.get("periodoInicioCertificacion", "")
+    fin    = estado_veh.get("periodoFinCertificacion", "")
+
+    # A22:B31 -- informacion general
+    pys["B22"] = f"{inicio} a {fin}" if inicio and fin else ""
+    pys["B23"] = estado_veh.get("placa", "")
+    pys["B24"] = estado_veh.get("modelo", "")
+    pys["B25"] = estado_veh.get("municipioMatricula", "")
+    pys["B26"] = estado_veh.get("departamentoMatricula", "")
+    # Fecha de expedicion -- debe ser la fecha en que REALMENTE se
+    # consulto y se obtuvo este numero de certificado (guardada en
+    # 'fecha_consulta'), no la fecha en que se genera el documento --
+    # el numero de certificado es unico de esa consulta puntual.
+    fecha_consulta = datos.get("fecha_consulta")
+    pys["B27"] = fecha_consulta if fecha_consulta else datetime.now()
+    pys["B28"] = estado_veh.get("marca", "")
+    pys["B29"] = estado_veh.get("cilindraje", "")
+    pys["B30"] = estado_veh.get("linea", "")
+    pys["B31"] = estado_veh.get("capacidadCarga", "")
+
+    # A35:J.. -- declaraciones presentadas (una fila por cada elemento)
+    declaraciones = datos.get("lista_detalle_pagos", []) or []
+    fila = 35
+    for d in declaraciones:
+        pys.cell(row=fila, column=1,  value=d.get("tipoLiquidacion", ""))
+        pys.cell(row=fila, column=2,  value=d.get("formularioLiquidacion", ""))
+        fecha_pago = d.get("fechaPago")
+        if fecha_pago:
+            try:
+                pys.cell(row=fila, column=3, value=datetime.utcfromtimestamp(fecha_pago / 1000))
+            except (TypeError, ValueError, OSError):
+                pys.cell(row=fila, column=3, value="")
+        pys.cell(row=fila, column=4,  value=_moneda_pys(d.get("impuesto", 0)))
+        pys.cell(row=fila, column=5,  value=_moneda_pys(d.get("sancion", 0)))
+        pys.cell(row=fila, column=6,  value=_moneda_pys(d.get("descuento", 0)))
+        pys.cell(row=fila, column=7,  value=_moneda_pys(d.get("interesMora", 0)))
+        pys.cell(row=fila, column=8,  value=_moneda_pys(d.get("totalPagar", 0)))
+        pys.cell(row=fila, column=9,  value=_moneda_pys(d.get("avaluoComercial", 0)))
+        pys.cell(row=fila, column=10, value=d.get("vigencia", ""))
+        fila += 1
+
+    # M22.. / O22.. / P22.. -- procesos fiscales, bloqueos, novedades
+    procesos = datos.get("lista_proceso_fiscal", []) or []
+    bloqueos = datos.get("lista_bloqueo", []) or []
+    novedades = datos.get("novedades", []) or []
+
+    for i, p in enumerate(procesos):
+        texto = f"{p.get('descripcionProcesoFiscal', '')} ({p.get('vigencia', '')})"
+        pys.cell(row=22 + i, column=13, value=texto)  # M
+    for i, b in enumerate(bloqueos):
+        texto = f"{b.get('descripcionBloqueo', '')} ({b.get('vigencia', '')})"
+        pys.cell(row=22 + i, column=15, value=texto)  # O
+    for i, n in enumerate(novedades):
+        texto = n if isinstance(n, str) else str(n)
+        pys.cell(row=22 + i, column=16, value=texto)  # P
+
+    # "El vehiculo no presenta observaciones" solo si las 3 listas estan
+    # vacias -- si hay cualquier cosa, se quita ese aviso.
+    if procesos or bloqueos or novedades:
+        edc["A74"] = ""
+
+    # Certificado No. -- se usa el numero real que entrega la Gobernacion
+    # en esta consulta puntual (cambia cada vez que se consulta).
+    edc["AG5"] = estado_veh.get("numeroCertificadoSap", "")
+
+    hojas_a_conservar = {"PYS", "ESTADO DE CUENTA"}
+    for nombre in list(wb.sheetnames):
+        if nombre not in hojas_a_conservar:
+            del wb[nombre]
+    edc.sheet_state = "visible"
+    wb.active = wb.sheetnames.index("ESTADO DE CUENTA")
+
+    id_temp = str(uuid.uuid4())[:8]
+    ruta_xlsm_temp = f"/tmp/_edc_{id_temp}.xlsm"
+    wb.save(ruta_xlsm_temp)
+
+    subprocess.run([
+        "soffice", "--headless", "--convert-to", "pdf",
+        "--outdir", os.path.dirname(ruta_salida_pdf), ruta_xlsm_temp
+    ], check=True, timeout=90)
+
+    generado = os.path.join(os.path.dirname(ruta_salida_pdf), f"_edc_{id_temp}.pdf")
+    shutil.move(generado, ruta_salida_pdf)
+    os.remove(ruta_xlsm_temp)
 
 
 def bloquear_recursos(page):
@@ -2020,11 +2170,6 @@ def consultar_antioquia(page, placa, identificacion, tipo_documento_abrev,
     estado_veh          = data3.get("estadoCuenta", {})
     vigencias_adeudadas = data3.get("listaVigenciasAdeudas", [])
     avaluo              = estado_veh.get("avaluoComercial", 0) or 0
-    # DIAGNOSTICO TEMPORAL -- para ver todos los campos disponibles en
-    # estadoCuenta cuando el vehiculo esta a paz y salvo. Quitar despues.
-    print("=== DIAGNOSTICO estado_veh completo ===", flush=True)
-    print(estado_veh, flush=True)
-    print("=== FIN DIAGNOSTICO estado_veh ===", flush=True)
     print(f"  → Vigencias adeudadas encontradas: {len(vigencias_adeudadas)}")
     if job_id:
         if not vigencias_adeudadas:
@@ -2667,15 +2812,6 @@ def consultar_antioquia_vigencias():
             estado_veh          = data3.get("estadoCuenta", {})
             vigencias_adeudadas = data3.get("listaVigenciasAdeudas", [])
             avaluo              = estado_veh.get("avaluoComercial", 0) or 0
-            # DIAGNOSTICO TEMPORAL -- para ver TODAS las llaves de nivel
-            # superior de data3 (no solo estadoCuenta), por si hay un
-            # historial de declaraciones en otra parte de la respuesta.
-            # Quitar despues.
-            print("=== DIAGNOSTICO llaves de data3 ===", flush=True)
-            print(list(data3.keys()), flush=True)
-            print("=== DIAGNOSTICO data3 completo ===", flush=True)
-            print(data3, flush=True)
-            print("=== FIN DIAGNOSTICO data3 ===", flush=True)
             resultado['vigencias']  = vigencias_adeudadas
             resultado['avaluo']     = avaluo
             resultado['estado_veh'] = estado_veh
@@ -2683,6 +2819,10 @@ def consultar_antioquia_vigencias():
             # Guardar en caché si está a paz y salvo
             if not vigencias_adeudadas and avaluo and avaluo > 0:
                 cache_antioquia_guardar_paz_salvo(placa, avaluo, estado_veh)
+                # Se guardan tambien TODOS los datos (historial de
+                # declaraciones, procesos fiscales, bloqueos, novedades)
+                # para poder generar el documento Estado de Cuenta despues.
+                guardar_estado_cuenta_antioquia(placa, data3)
         except Exception as e:
             error_container['error'] = str(e)
             print(traceback.format_exc(), flush=True)
@@ -3143,6 +3283,59 @@ def generar_fun_endpoint():
         generar_fun(datos, ruta_pdf_local)
         nombre_remoto = f"fun/{placa}_{id_doc}.pdf"
         url = subir_a_r2(ruta_pdf_local, nombre_remoto)
+        os.remove(ruta_pdf_local)
+        return jsonify({"ok": True, "url": url})
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc(), flush=True)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/generar-estado-cuenta", methods=["GET"])
+def generar_estado_cuenta_endpoint():
+    """Genera el documento Estado de Cuenta a partir de los datos ya
+    guardados (de la ultima vez que esta placa salio a paz y salvo). No
+    requiere consulta en vivo ni captcha -- responde directo."""
+    placa = request.args.get("placa", "").upper().strip()
+    if not placa:
+        return jsonify({"error": "Debes proporcionar la placa."}), 400
+
+    if not os.path.exists(FUN_PLANTILLA):
+        return jsonify({"error": "No se encontro la plantilla AppJX.xlsm en el servidor."}), 500
+
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT estado_cuenta_json, lista_detalle_pagos, lista_proceso_fiscal,
+                   lista_bloqueo, novedades, actualizado_en
+            FROM estado_cuenta_antioquia WHERE placa = %s
+        """, (placa,))
+        fila = cur.fetchone()
+        cur.close(); conn.close()
+
+        if not fila:
+            return jsonify({"error": "No tenemos datos de Estado de Cuenta guardados para esta placa. Debes consultar primero el impuesto departamental (y que el vehículo esté a paz y salvo) antes de poder generar este documento."}), 404
+
+        datos = {
+            "estado_veh": fila[0] or {},
+            "lista_detalle_pagos": fila[1] or [],
+            "lista_proceso_fiscal": fila[2] or [],
+            "lista_bloqueo": fila[3] or [],
+            "novedades": fila[4] or [],
+            # Fecha real en que se consulto y se obtuvo este numero de
+            # certificado -- NO la fecha en que se genera el documento,
+            # ya que el certificado es unico de esa consulta puntual.
+            "fecha_consulta": fila[5],
+        }
+
+        id_doc = str(uuid.uuid4())[:10]
+        ruta_pdf_local = f"/tmp/EstadoCuenta_{placa}_{id_doc}.pdf"
+        generar_estado_cuenta_pdf(datos, ruta_pdf_local)
+
+        nombre_remoto = f"estado-cuenta/{placa}_{id_doc}.pdf"
+        url = subir_a_r2(ruta_pdf_local, nombre_remoto,
+                          nombre_descarga=f"EstadoCuenta_{placa}.pdf")
         os.remove(ruta_pdf_local)
         return jsonify({"ok": True, "url": url})
     except Exception as e:
