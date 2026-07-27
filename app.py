@@ -2020,6 +2020,11 @@ def consultar_antioquia(page, placa, identificacion, tipo_documento_abrev,
     estado_veh          = data3.get("estadoCuenta", {})
     vigencias_adeudadas = data3.get("listaVigenciasAdeudas", [])
     avaluo              = estado_veh.get("avaluoComercial", 0) or 0
+    # DIAGNOSTICO TEMPORAL -- para ver todos los campos disponibles en
+    # estadoCuenta cuando el vehiculo esta a paz y salvo. Quitar despues.
+    print("=== DIAGNOSTICO estado_veh completo ===", flush=True)
+    print(estado_veh, flush=True)
+    print("=== FIN DIAGNOSTICO estado_veh ===", flush=True)
     print(f"  → Vigencias adeudadas encontradas: {len(vigencias_adeudadas)}")
     if job_id:
         if not vigencias_adeudadas:
