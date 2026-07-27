@@ -279,18 +279,25 @@ ENVIGADO_TURNOS_API = "https://gacomponentes.envigado.gov.co/backga/back-ga/turn
 
 # Bandera simple en memoria para saber si ya hay una sesion de monitoreo
 # corriendo (evita que se disparen varias sesiones encimadas por error).
-_envigado_monitoreo_estado = {"activo": False, "inicio": None, "fin_esperado": None}
+_envigado_monitoreo_estado = {
+    "activo": False, "inicio": None, "fin_esperado": None,
+    "numero_vigilado": None, "encontrado": None
+}
 
 
-def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_monitor=1):
+def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_monitor=1, numero_vigilado=None):
     """Revisa el "monitor de turnos" de Envigado cada pocos segundos,
     durante 'duracion_segundos' (2 horas por defecto). Cada vez que
     aparece un idGestionAtencion que no habiamos visto, lo guarda con la
     hora en que Tramy lo detecto (la plataforma no entrega un timestamp
-    exacto propio del llamado -- el campo 'fechaInicial' viene vacio)."""
+    exacto propio del llamado -- el campo 'fechaInicial' viene vacio).
+    Si se indica 'numero_vigilado' (ej. "C-89"), en cuanto aparezca ese
+    numero especifico se marca en _envigado_monitoreo_estado['encontrado']
+    para que el frontend pueda mostrar una alerta destacada."""
     fin = time.time() + duracion_segundos
     ids_vistos = set()
     hoy_str = datetime.now().strftime("%d/%m/%Y")
+    numero_vigilado_norm = numero_vigilado.strip().upper() if numero_vigilado else None
 
     while time.time() < fin:
         try:
@@ -321,6 +328,15 @@ def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_mo
                     """, (idg, item.get("nroAtencion"), item.get("nombreUsuario"),
                           item.get("nombreTaquilla"), item.get("nombreServicio"),
                           item.get("idEstadoGestionAtencion")))
+
+                    if numero_vigilado_norm and (item.get("nroAtencion") or "").strip().upper() == numero_vigilado_norm:
+                        _envigado_monitoreo_estado["encontrado"] = {
+                            "nro_atencion": item.get("nroAtencion"),
+                            "nombre_usuario": item.get("nombreUsuario"),
+                            "taquilla": item.get("nombreTaquilla"),
+                            "servicio": item.get("nombreServicio"),
+                            "detectado_en": datetime.now().isoformat(),
+                        }
                 conn.commit()
                 cur.close(); conn.close()
         except Exception as e:
@@ -3541,14 +3557,17 @@ def envigado_turnos_iniciar_monitoreo_endpoint():
     duracion_minutos = request.args.get("minutos", "120")
     duracion_minutos = int(duracion_minutos) if duracion_minutos.isdigit() else 120
     duracion_segundos = duracion_minutos * 60
+    numero_vigilado = request.args.get("numero", "").strip() or None
 
     _envigado_monitoreo_estado["activo"] = True
     _envigado_monitoreo_estado["inicio"] = datetime.now().isoformat()
     _envigado_monitoreo_estado["fin_esperado"] = (datetime.now() + timedelta(seconds=duracion_segundos)).isoformat()
+    _envigado_monitoreo_estado["numero_vigilado"] = numero_vigilado
+    _envigado_monitoreo_estado["encontrado"] = None
 
     threading.Thread(
         target=_envigado_polling_turnos,
-        kwargs={"duracion_segundos": duracion_segundos},
+        kwargs={"duracion_segundos": duracion_segundos, "numero_vigilado": numero_vigilado},
         daemon=True
     ).start()
 
@@ -3567,6 +3586,8 @@ def envigado_turnos_estado_monitoreo_endpoint():
         "activo": _envigado_monitoreo_estado["activo"],
         "inicio": _envigado_monitoreo_estado["inicio"],
         "fin_esperado": _envigado_monitoreo_estado["fin_esperado"],
+        "numero_vigilado": _envigado_monitoreo_estado["numero_vigilado"],
+        "encontrado": _envigado_monitoreo_estado["encontrado"],
     })
 
 
