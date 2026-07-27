@@ -281,7 +281,7 @@ ENVIGADO_TURNOS_API = "https://gacomponentes.envigado.gov.co/backga/back-ga/turn
 # corriendo (evita que se disparen varias sesiones encimadas por error).
 _envigado_monitoreo_estado = {
     "activo": False, "inicio": None, "fin_esperado": None,
-    "numero_vigilado": None, "encontrado": None
+    "numero_vigilado": None, "encontrado": None, "detener": False
 }
 
 
@@ -300,6 +300,8 @@ def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_mo
     numero_vigilado_norm = numero_vigilado.strip().upper() if numero_vigilado else None
 
     while time.time() < fin:
+        if _envigado_monitoreo_estado["detener"]:
+            break
         try:
             params = {
                 "idMonitor": id_monitor,
@@ -335,7 +337,7 @@ def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_mo
                             "nombre_usuario": item.get("nombreUsuario"),
                             "taquilla": item.get("nombreTaquilla"),
                             "servicio": item.get("nombreServicio"),
-                            "detectado_en": datetime.now().isoformat(),
+                            "detectado_en": datetime.now().isoformat() + "Z",  # UTC -- el navegador lo convierte solo a hora local
                         }
                 conn.commit()
                 cur.close(); conn.close()
@@ -344,6 +346,7 @@ def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_mo
         time.sleep(intervalo_segundos)
 
     _envigado_monitoreo_estado["activo"] = False
+    _envigado_monitoreo_estado["detener"] = False
 
 
 def cache_antioquia_guardar_paz_salvo(placa, avaluo, estado_veh):
@@ -3508,7 +3511,7 @@ def envigado_citas_disponibles_endpoint():
             "ok": True,
             "hay_citas": len(con_citas) > 0,
             "disponibles": con_citas,
-            "verificado_en": datetime.now().isoformat()
+            "verificado_en": datetime.now().isoformat() + "Z"  # UTC -- el navegador lo convierte solo a hora local
         })
     except Exception as e:
         import traceback
@@ -3533,7 +3536,7 @@ def envigado_citas_ultimo_resultado_endpoint():
         filas = cur.fetchall()
         cur.close(); conn.close()
         disponibles = [
-            {"sede": f[0], "fecha": f[1], "cantidad_horarios": f[2], "verificado_en": f[3].isoformat()}
+            {"sede": f[0], "fecha": f[1], "cantidad_horarios": f[2], "verificado_en": f[3].isoformat() + "Z"}
             for f in filas
         ]
         return jsonify({"ok": True, "hay_citas": len(disponibles) > 0, "disponibles": disponibles})
@@ -3560,10 +3563,11 @@ def envigado_turnos_iniciar_monitoreo_endpoint():
     numero_vigilado = request.args.get("numero", "").strip() or None
 
     _envigado_monitoreo_estado["activo"] = True
-    _envigado_monitoreo_estado["inicio"] = datetime.now().isoformat()
-    _envigado_monitoreo_estado["fin_esperado"] = (datetime.now() + timedelta(seconds=duracion_segundos)).isoformat()
+    _envigado_monitoreo_estado["inicio"] = datetime.now().isoformat() + "Z"  # UTC
+    _envigado_monitoreo_estado["fin_esperado"] = (datetime.now() + timedelta(seconds=duracion_segundos)).isoformat() + "Z"  # UTC
     _envigado_monitoreo_estado["numero_vigilado"] = numero_vigilado
     _envigado_monitoreo_estado["encontrado"] = None
+    _envigado_monitoreo_estado["detener"] = False
 
     threading.Thread(
         target=_envigado_polling_turnos,
@@ -3576,6 +3580,17 @@ def envigado_turnos_iniciar_monitoreo_endpoint():
         "mensaje": f"Monitoreo iniciado por {duracion_minutos} minutos.",
         "fin_esperado": _envigado_monitoreo_estado["fin_esperado"]
     })
+
+
+@app.route("/envigado-turnos-detener-monitoreo", methods=["GET"])
+def envigado_turnos_detener_monitoreo_endpoint():
+    """Detiene la sesion de monitoreo activa antes de que se cumplan las
+    2 horas. El hilo revisa esta bandera en cada ciclo (cada 8 segundos),
+    asi que puede tardar hasta ese tiempo en detenerse del todo."""
+    if not _envigado_monitoreo_estado["activo"]:
+        return jsonify({"ok": False, "error": "No hay ningún monitoreo corriendo en este momento."}), 409
+    _envigado_monitoreo_estado["detener"] = True
+    return jsonify({"ok": True, "mensaje": "Deteniendo el monitoreo..."})
 
 
 @app.route("/envigado-turnos-estado-monitoreo", methods=["GET"])
@@ -3611,7 +3626,7 @@ def envigado_turnos_capturados_endpoint():
         cur.close(); conn.close()
         turnos = [
             {"nro_atencion": f[0], "nombre_usuario": f[1], "taquilla": f[2],
-             "servicio": f[3], "detectado_en": f[4].isoformat()}
+             "servicio": f[3], "detectado_en": f[4].isoformat() + "Z"}
             for f in filas
         ]
         return jsonify({"ok": True, "turnos": turnos})
