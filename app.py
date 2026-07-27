@@ -1196,12 +1196,51 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     # en esta consulta puntual (cambia cada vez que se consulta).
     edc["AG5"] = estado_veh.get("numeroCertificadoSap", "")
 
+    # "Avaluo para la vigencia" -- se usa directamente el avaluo de la
+    # vigencia actual (viene ya calculado en estadoCuenta), en vez de
+    # depender de la formula original (que buscaba la ultima fila de la
+    # tabla y se rompe si borramos filas despues).
+    edc["AE76"] = _moneda_pys(estado_veh.get("avaluoComercial", 0))
+
+    # Eliminar las filas vacias sobrantes de ambas tablas (no todas las
+    # placas tienen 30 declaraciones ni observaciones) -- se hace de
+    # abajo hacia arriba para no desfasar las posiciones ya escritas.
+    FILA_OBS_INICIO, FILA_OBS_FIN = 53, 72
+    max_obs = max(len(procesos), len(bloqueos), len(novedades))
+    if max_obs == 0:
+        edc.delete_rows(FILA_OBS_INICIO, FILA_OBS_FIN - FILA_OBS_INICIO + 1)
+    else:
+        ultima_fila_obs_usada = FILA_OBS_INICIO + max_obs - 1
+        if ultima_fila_obs_usada < FILA_OBS_FIN:
+            edc.delete_rows(ultima_fila_obs_usada + 1, FILA_OBS_FIN - ultima_fila_obs_usada)
+
+    FILA_DECL_INICIO, FILA_DECL_FIN = 16, 46
+    filas_declaraciones = len(declaraciones)
+    if filas_declaraciones == 0:
+        edc.delete_rows(FILA_DECL_INICIO, FILA_DECL_FIN - FILA_DECL_INICIO + 1)
+    else:
+        ultima_fila_decl_usada = FILA_DECL_INICIO + filas_declaraciones - 1
+        if ultima_fila_decl_usada < FILA_DECL_FIN:
+            edc.delete_rows(ultima_fila_decl_usada + 1, FILA_DECL_FIN - ultima_fila_decl_usada)
+
     hojas_a_conservar = {"PYS", "ESTADO DE CUENTA"}
     for nombre in list(wb.sheetnames):
         if nombre not in hojas_a_conservar:
             del wb[nombre]
     edc.sheet_state = "visible"
     wb.active = wb.sheetnames.index("ESTADO DE CUENTA")
+
+    # El texto se veia "gris suave" en vez de negro solido -- mismo
+    # problema de color de TEMA que ya resolvimos en la Declaracion
+    # Manual (LibreOffice a veces interpreta mal el indice del tema al
+    # convertir). Se fuerza negro explicito en todas las celdas con texto.
+    for hoja in (pys, edc):
+        for fila_celdas in hoja.iter_rows():
+            for celda in fila_celdas:
+                if celda.value is not None:
+                    nueva_fuente = copy.copy(celda.font)
+                    nueva_fuente.color = "FF000000"
+                    celda.font = nueva_fuente
 
     id_temp = str(uuid.uuid4())[:8]
     ruta_xlsm_temp = f"/tmp/_edc_{id_temp}.xlsm"
