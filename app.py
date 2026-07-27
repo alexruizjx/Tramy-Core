@@ -985,6 +985,18 @@ def generar_declaracion_manual_pdf(datos, ruta_salida_pdf):
         ws["CJ41"] = _moneda(datos.get("saldo_favor", 0))
         ws["CJ42"] = _moneda(datos.get("total_pagar", 0))
 
+        # J. Distribucion del recaudo -- 20% Municipio, 80% Departamento,
+        # calculado sobre el total a pagar (instructivo oficial, seccion J).
+        total_pagar_num = datos.get("total_pagar", 0) or 0
+        try:
+            total_pagar_num = float(total_pagar_num)
+        except (TypeError, ValueError):
+            total_pagar_num = 0
+        valor_municipio = round(total_pagar_num * 0.20)
+        valor_departamento = total_pagar_num - valor_municipio
+        ws["AE64"] = _moneda(valor_municipio)
+        ws["AE66"] = _moneda(valor_departamento)
+
         # G. Declarante -- se deja en blanco a proposito. Se firma y se
         # diligencia a lapicero de forma manual, no se prellena.
 
