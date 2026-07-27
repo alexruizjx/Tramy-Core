@@ -281,23 +281,24 @@ ENVIGADO_TURNOS_API = "https://gacomponentes.envigado.gov.co/backga/back-ga/turn
 # corriendo (evita que se disparen varias sesiones encimadas por error).
 _envigado_monitoreo_estado = {
     "activo": False, "inicio": None, "fin_esperado": None,
-    "numero_vigilado": None, "encontrado": None, "detener": False
+    "numeros_vigilados": [], "detener": False
 }
 
 
-def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_monitor=1, numero_vigilado=None):
+def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_monitor=1, numeros_vigilados=None):
     """Revisa el "monitor de turnos" de Envigado cada pocos segundos,
-    durante 'duracion_segundos' (2 horas por defecto). Cada vez que
-    aparece un idGestionAtencion que no habiamos visto, lo guarda con la
-    hora en que Tramy lo detecto (la plataforma no entrega un timestamp
-    exacto propio del llamado -- el campo 'fechaInicial' viene vacio).
-    Si se indica 'numero_vigilado' (ej. "C-89"), en cuanto aparezca ese
-    numero especifico se marca en _envigado_monitoreo_estado['encontrado']
-    para que el frontend pueda mostrar una alerta destacada."""
+    durante 'duracion_segundos'. Cada vez que aparece un idGestionAtencion
+    que no habiamos visto, lo guarda con la hora en que Tramy lo detecto
+    (la plataforma no entrega un timestamp exacto propio del llamado --
+    el campo 'fechaInicial' viene vacio).
+    Si se indica 'numeros_vigilados' (lista, ej. ["C-89", "G-78"]), en
+    cuanto aparezca CUALQUIERA de esos numeros se agrega a
+    _envigado_monitoreo_estado['encontrados'] para que el frontend pueda
+    mostrar una alerta destacada (con sonido y vibracion)."""
     fin = time.time() + duracion_segundos
     ids_vistos = set()
     hoy_str = datetime.now().strftime("%d/%m/%Y")
-    numero_vigilado_norm = numero_vigilado.strip().upper() if numero_vigilado else None
+    numeros_vigilados_norm = set((n or "").strip().upper() for n in (numeros_vigilados or []))
 
     while time.time() < fin:
         if _envigado_monitoreo_estado["detener"]:
@@ -321,24 +322,18 @@ def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_mo
                     if idg is None or idg in ids_vistos:
                         continue
                     ids_vistos.add(idg)
+                    nro_norm = (item.get("nroAtencion") or "").strip().upper()
+                    es_vigilado = bool(numeros_vigilados_norm and nro_norm in numeros_vigilados_norm)
+
                     cur.execute("""
                         INSERT INTO envigado_turnos_llamados
                             (id_gestion_atencion, nro_atencion, nombre_usuario, nombre_taquilla,
-                             nombre_servicio, id_estado, detectado_en)
-                        VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                             nombre_servicio, id_estado, fue_vigilado, detectado_en)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
                         ON CONFLICT (id_gestion_atencion) DO NOTHING
                     """, (idg, item.get("nroAtencion"), item.get("nombreUsuario"),
                           item.get("nombreTaquilla"), item.get("nombreServicio"),
-                          item.get("idEstadoGestionAtencion")))
-
-                    if numero_vigilado_norm and (item.get("nroAtencion") or "").strip().upper() == numero_vigilado_norm:
-                        _envigado_monitoreo_estado["encontrado"] = {
-                            "nro_atencion": item.get("nroAtencion"),
-                            "nombre_usuario": item.get("nombreUsuario"),
-                            "taquilla": item.get("nombreTaquilla"),
-                            "servicio": item.get("nombreServicio"),
-                            "detectado_en": datetime.now().isoformat() + "Z",  # UTC -- el navegador lo convierte solo a hora local
-                        }
+                          item.get("idEstadoGestionAtencion"), es_vigilado))
                 conn.commit()
                 cur.close(); conn.close()
         except Exception as e:
@@ -3546,10 +3541,14 @@ def envigado_citas_ultimo_resultado_endpoint():
 
 @app.route("/envigado-turnos-iniciar-monitoreo", methods=["GET"])
 def envigado_turnos_iniciar_monitoreo_endpoint():
-    """Arranca una sesion de monitoreo de ~2 horas (por defecto) que
-    revisa el monitor de turnos de Envigado cada pocos segundos y va
-    guardando cada llamado nuevo que aparezca. Corre en el servidor, no
-    depende de que el navegador siga abierto."""
+    """Arranca una sesion de monitoreo de maximo 2 horas (configurable),
+    que revisa el monitor de turnos de Envigado cada pocos segundos y va
+    guardando cada llamado nuevo que aparezca -- se puede detener antes
+    manualmente. Los DATOS que va capturando (toda la lista, y los que
+    coincidan con los numeros vigilados) quedan guardados en la base de
+    datos todo el dia, sin importar si la sesion de vigilancia ya termino
+    o si se inicia una sesion nueva despues -- solo se renuevan al dia
+    siguiente. Se puede vigilar hasta 10 numeros de cita a la vez."""
     if _envigado_monitoreo_estado["activo"]:
         return jsonify({
             "ok": False,
@@ -3559,25 +3558,27 @@ def envigado_turnos_iniciar_monitoreo_endpoint():
 
     duracion_minutos = request.args.get("minutos", "120")
     duracion_minutos = int(duracion_minutos) if duracion_minutos.isdigit() else 120
+    duracion_minutos = min(duracion_minutos, 120)  # tope maximo de 2 horas
     duracion_segundos = duracion_minutos * 60
-    numero_vigilado = request.args.get("numero", "").strip() or None
+
+    numeros_raw = request.args.get("numeros", "").strip()
+    numeros_vigilados = [n.strip() for n in numeros_raw.split(",") if n.strip()][:10]
 
     _envigado_monitoreo_estado["activo"] = True
     _envigado_monitoreo_estado["inicio"] = datetime.now().isoformat() + "Z"  # UTC
     _envigado_monitoreo_estado["fin_esperado"] = (datetime.now() + timedelta(seconds=duracion_segundos)).isoformat() + "Z"  # UTC
-    _envigado_monitoreo_estado["numero_vigilado"] = numero_vigilado
-    _envigado_monitoreo_estado["encontrado"] = None
+    _envigado_monitoreo_estado["numeros_vigilados"] = numeros_vigilados
     _envigado_monitoreo_estado["detener"] = False
 
     threading.Thread(
         target=_envigado_polling_turnos,
-        kwargs={"duracion_segundos": duracion_segundos, "numero_vigilado": numero_vigilado},
+        kwargs={"duracion_segundos": duracion_segundos, "numeros_vigilados": numeros_vigilados},
         daemon=True
     ).start()
 
     return jsonify({
         "ok": True,
-        "mensaje": f"Monitoreo iniciado por {duracion_minutos} minutos.",
+        "mensaje": f"Monitoreo iniciado por {duracion_minutos} minutos (o hasta que lo detengas).",
         "fin_esperado": _envigado_monitoreo_estado["fin_esperado"]
     })
 
@@ -3601,8 +3602,7 @@ def envigado_turnos_estado_monitoreo_endpoint():
         "activo": _envigado_monitoreo_estado["activo"],
         "inicio": _envigado_monitoreo_estado["inicio"],
         "fin_esperado": _envigado_monitoreo_estado["fin_esperado"],
-        "numero_vigilado": _envigado_monitoreo_estado["numero_vigilado"],
-        "encontrado": _envigado_monitoreo_estado["encontrado"],
+        "numeros_vigilados": _envigado_monitoreo_estado["numeros_vigilados"],
     })
 
 
@@ -3630,6 +3630,34 @@ def envigado_turnos_capturados_endpoint():
             for f in filas
         ]
         return jsonify({"ok": True, "turnos": turnos})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/envigado-turnos-vigilados-hoy", methods=["GET"])
+def envigado_turnos_vigilados_hoy_endpoint():
+    """Devuelve los turnos que coincidieron con algun numero vigilado,
+    capturados HOY -- persistente en base de datos, asi que sobrevive a
+    que se refresque la pagina o se inicie una sesion de monitoreo nueva
+    mas tarde en el mismo dia. Se renueva solo al pasar la medianoche
+    (deja de aparecer, ya que el filtro es por el dia de hoy)."""
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT nro_atencion, nombre_usuario, nombre_taquilla, nombre_servicio, detectado_en
+            FROM envigado_turnos_llamados
+            WHERE fue_vigilado = TRUE AND detectado_en::date = CURRENT_DATE
+            ORDER BY detectado_en DESC
+        """)
+        filas = cur.fetchall()
+        cur.close(); conn.close()
+        encontrados = [
+            {"nro_atencion": f[0], "nombre_usuario": f[1], "taquilla": f[2],
+             "servicio": f[3], "detectado_en": f[4].isoformat() + "Z"}
+            for f in filas
+        ]
+        return jsonify({"ok": True, "encontrados": encontrados})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
