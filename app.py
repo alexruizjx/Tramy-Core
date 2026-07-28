@@ -1436,11 +1436,10 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     # en esta consulta puntual (cambia cada vez que se consulta).
     edc["AG5"] = estado_veh.get("numeroCertificadoSap", "")
 
-    # La fila del "CERTIFICADO No." (fila 5) tenia una altura mucho mayor
-    # (27.75) que el resto del encabezado, dejando un espacio visual
-    # grande debajo del titulo "ESTADO DE CUENTA...". Se reduce para que
-    # quede mas pegado al titulo.
-    edc.row_dimensions[5].height = 14
+    # NOTA: se habia reducido la altura de esta fila (de 27.75 a 14) para
+    # acercar el "CERTIFICADO No." al titulo, pero eso dejo apeñuscado el
+    # texto "El suscrito funcionario..." con el logo justo debajo -- se
+    # revierte, la altura original ya tenia un espacio aceptable.
 
     # "Avaluo para la vigencia" -- se usa directamente el avaluo de la
     # vigencia actual (viene ya calculado en estadoCuenta), en vez de
@@ -1479,12 +1478,11 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     edc["A48"].alignment = Alignment(
         horizontal=celda_leyenda.alignment.horizontal,
         vertical=celda_leyenda.alignment.vertical,
-        wrapText=True
+        wrapText=False
     )
-    # Se fusiona en un ancho moderado (mas angosto que el parrafo legal de
-    # la fila 6, que va de A a BH) para que el texto, mas corto, si se
-    # vea obligado a partir en 2 lineas en vez de quedar en 1 sola.
-    edc.merge_cells("A48:AJ49")
+    # Fusion ancha (igual que el parrafo legal de la fila 6, que va de A a
+    # BH) para que el texto quede en UNA sola linea, sin partirse en dos.
+    edc.merge_cells("A48:BH48")
 
     for col in range(1, 60):
         celda_origen = edc.cell(row=46, column=col)
