@@ -673,7 +673,15 @@ def consultar_runt_vehiculo(page, placa, cedula, tipo_documento="CC", job_id=Non
     # Reintenta hasta 3 veces si el captcha resulta incorrecto (el RUNT
     # regenera la imagen cada vez que falla).
     for intento_captcha in range(3):
+        # Se espera explicitamente a que la imagen del captcha este
+        # realmente cargada (no solo presente en el DOM) -- si se lee el
+        # atributo "src" demasiado pronto puede venir vacio, y de ahi
+        # salia el error generico "list index out of range" al intentar
+        # separar el prefijo "data:image/png;base64,".
+        page.wait_for_selector('img.img-responsive.img-fluid[src]', timeout=15000)
         img_src = page.get_attribute('img.img-responsive.img-fluid', 'src')
+        if not img_src or ',' not in img_src:
+            raise Exception(f"No se pudo leer la imagen del captcha del RUNT (src {'vacio' if not img_src else 'con formato inesperado'}). Intenta consultar de nuevo.")
         imagen_base64 = img_src.split(',', 1)[1]  # quitar el prefijo "data:image/png;base64,"
 
         texto_captcha = resolver_captcha_imagen_2captcha(imagen_base64)
