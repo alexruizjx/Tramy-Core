@@ -647,7 +647,13 @@ def consultar_runt_vehiculo(page, placa, cedula, tipo_documento="CC", job_id=Non
     if job_id:
         job_actualizar(job_id, "Abriendo el RUNT...", "procesando")
 
-    page.goto(RUNT_URL, wait_until="networkidle", timeout=60000)
+    # "networkidle" esperaba a que la red quedara completamente en reposo,
+    # pero el portal del RUNT tiene actividad de fondo constante que nunca
+    # la deja quieta del todo -- causaba timeouts frecuentes aunque la
+    # pagina ya hubiera cargado bien. Se usa "domcontentloaded" (mucho mas
+    # rapido) y se confia en el wait_for_selector de abajo, que ya
+    # confirma que el formulario esta realmente listo para usarse.
+    page.goto(RUNT_URL, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_selector('input[formcontrolname="placa"]', timeout=30000)
 
     # Procedencia (Nacional) y Consultar Por (Placa y Propietario) ya vienen
