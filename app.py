@@ -1352,6 +1352,12 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     # en esta consulta puntual (cambia cada vez que se consulta).
     edc["AG5"] = estado_veh.get("numeroCertificadoSap", "")
 
+    # La fila del "CERTIFICADO No." (fila 5) tenia una altura mucho mayor
+    # (27.75) que el resto del encabezado, dejando un espacio visual
+    # grande debajo del titulo "ESTADO DE CUENTA...". Se reduce para que
+    # quede mas pegado al titulo.
+    edc.row_dimensions[5].height = 14
+
     # "Avaluo para la vigencia" -- se usa directamente el avaluo de la
     # vigencia actual (viene ya calculado en estadoCuenta), en vez de
     # depender de la formula original (que buscaba la ultima fila de la
@@ -1376,7 +1382,36 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
         if ultima_fila_obs_usada < FILA_OBS_FIN:
             _ocultar_filas(edc, ultima_fila_obs_usada + 1, FILA_OBS_FIN)
 
-    FILA_DECL_INICIO, FILA_DECL_FIN = 16, 46
+    # Se libera una fila mas para la tabla de declaraciones (para que
+    # quepa una vigencia adicional): la leyenda "* Tipos de declaraciones
+    # ..." que vivia en la fila 47 se traslada a la fila 48 (que era un
+    # espaciador chico y quedaba libre), y la fila 47 pasa a ser una fila
+    # mas de la tabla -- copiando las FORMULAS reales de la fila 46 (que
+    # trae los datos de PYS!*65) pero apuntando a PYS!*66, para que la
+    # fila nueva si traiga datos de verdad y no quede vacia.
+    celda_leyenda = edc["A47"]
+    edc["A48"] = celda_leyenda.value
+    edc["A48"].font = copy.copy(celda_leyenda.font)
+    edc["A48"].alignment = copy.copy(celda_leyenda.alignment)
+
+    for col in range(1, 60):
+        celda_origen = edc.cell(row=46, column=col)
+        if isinstance(celda_origen.value, str) and celda_origen.value.startswith("="):
+            celda_destino = edc.cell(row=47, column=col)
+            celda_destino.value = celda_origen.value.replace("65", "66")
+            celda_destino.font = copy.copy(celda_origen.font)
+            celda_destino.alignment = copy.copy(celda_origen.alignment)
+            celda_destino.border = copy.copy(celda_origen.border)
+            celda_destino.number_format = celda_origen.number_format
+        elif col == 1:
+            # A47 tenia la leyenda -- se limpia para dejarla lista como
+            # celda de datos (ya se copio arriba a A48).
+            celda_leyenda.value = None
+
+    edc.row_dimensions[47].height = 21.0   # misma altura que las demas filas de declaraciones
+    edc.row_dimensions[48].height = 20.25  # altura que antes tenia la leyenda, para que quepa completa
+
+    FILA_DECL_INICIO, FILA_DECL_FIN = 16, 47
     filas_declaraciones = len(declaraciones)
     if filas_declaraciones == 0:
         _ocultar_filas(edc, FILA_DECL_INICIO, FILA_DECL_FIN)
