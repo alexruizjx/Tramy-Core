@@ -218,58 +218,101 @@ ENVIGADO_CITAS_SEDES = {
     "City Plaza": 3,
 }
 ENVIGADO_CITAS_ID_SERVICIO = "90"
-ENVIGADO_CITAS_API = "https://movilidad.envigado.gov.co/backavit/avit/citas/getHorasDisponibles"
+ENVIGADO_PUNTOS_API = "https://movilidad.envigado.gov.co/backavit/avit/citas/getPuntosAtencionServiciosLowcode"
+ENVIGADO_HORAS_API = "https://movilidad.envigado.gov.co/backavit/avit/citas/getHorasDisponibles"
+ENVIGADO_VALIDAR_API = "https://movilidad.envigado.gov.co/backavit/avit/seguridad/preguntas/validarMostrarPreguntasSeguridad"
+# Documento y placa "de prueba" -- no corresponden a un ciudadano real que
+# pueda verse afectado, siguiendo la misma logica que ya usa el usuario
+# manualmente (un numero que el sistema no tiene registrado).
+ENVIGADO_CITAS_DOCUMENTO = "71632131313"
+ENVIGADO_CITAS_TIPO_DOC = "2"
+ENVIGADO_CITAS_PLACA = "RST37B"
 
 
-def envigado_consultar_horas_disponibles(id_subsede, fecha_dia):
-    """Consulta si hay horarios disponibles en una sede/fecha especifica
-    del sistema de citas de Envigado (plataforma Quipux). Devuelve la
-    cantidad de horarios encontrados (0 si no hay nada disponible)."""
-    payload = {
-        "idServicios": ENVIGADO_CITAS_ID_SERVICIO,
-        "idSubsede": id_subsede,
-        "cantidadTramites": 1,
-        "tiempoAtencion": 1,
-        "tiempoAtencionTotal": 9,
-        "cantidadLimiteLibracion": "15",
-        "fechaDia": fecha_dia,
-        "isIncluirHorariosCancelados": "N",
-        "nroDocumento": "71632131313",
-        "tipoDocumento": "2",
-    }
+def envigado_hay_puntos_disponibles():
+    """Revisa si hay ALGUN punto de atencion con citas disponibles para
+    el servicio vigilado, en UNA sola peticion (mucho mas eficiente que
+    consultar dia por dia y sede por sede). Devuelve la lista cruda que
+    entrega el sitio (vacia [] si no hay nada disponible en ningun lado
+    en este momento), o None si hubo un error de conexion.
+
+    IMPORTANTE: antes hay que pasar por 'validarMostrarPreguntasSeguridad'
+    en la MISMA sesion (a pesar del nombre, no son preguntas de seguridad
+    reales -- solo validan documento+placa y devuelven codigo:0 para
+    poder seguir). Sin este paso previo la consulta no trae resultados
+    reales."""
+    session = requests.Session()
     try:
-        r = requests.post(ENVIGADO_CITAS_API, json=payload, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        total_horarios = sum(len(grupo.get("horarios", [])) for grupo in data) if isinstance(data, list) else 0
-        return total_horarios
+        payload_validar = [{
+            "documento": None,
+            "respuesta": None,
+            "placa": ENVIGADO_CITAS_PLACA,
+            "homePublic": True,
+            "tipoDocumento": ENVIGADO_CITAS_TIPO_DOC,
+            "nroDocumento": ENVIGADO_CITAS_DOCUMENTO,
+            "bloqueoPermanente": False,
+        }]
+        r_val = session.post(ENVIGADO_VALIDAR_API, json=payload_validar, timeout=20)
+        r_val.raise_for_status()
     except Exception as e:
-        print(f"Error consultando citas Envigado (subsede {id_subsede}, {fecha_dia}): {e}", flush=True)
-        return None  # None = error de consulta, distinto de 0 = sin citas
+        print(f"Error validando antes de consultar citas Envigado: {e}", flush=True)
+        return None
+
+    try:
+        payload_puntos = {"idServicios": ENVIGADO_CITAS_ID_SERVICIO, "cantidadTramites": 1}
+        r_puntos = session.post(ENVIGADO_PUNTOS_API, json=payload_puntos, timeout=20)
+        r_puntos.raise_for_status()
+        return r_puntos.json()
+    except Exception as e:
+        print(f"Error consultando puntos de atencion Envigado: {e}", flush=True)
+        return None
 
 
 def envigado_revisar_citas_disponibles(dias_adelante=14):
-    """Revisa las DOS sedes de Envigado para los proximos N dias, y guarda
-    el resultado en la base de datos. Devuelve una lista de resultados:
-    {sede, fecha, cantidad_horarios}."""
+    """Revisa si hay ALGUN punto de atencion con citas disponibles (una
+    sola peticion, no dia por dia), y guarda el resultado en la base de
+    datos. 'dias_adelante' ya no se usa para hacer mas peticiones -- se
+    deja como parametro por compatibilidad con quien ya llama esta
+    funcion. Devuelve una lista de resultados: {sede, fecha, cantidad_horarios}
+    (una entrada generica si hay citas, vacia si no hay nada)."""
+    puntos = envigado_hay_puntos_disponibles()
+    if puntos is None:
+        print("Error consultando disponibilidad de citas Envigado (ver logs arriba).", flush=True)
+        return []
+
     resultados = []
-    hoy = datetime.now()
     conn = get_db_conn()
     cur = conn.cursor()
-    for sede, id_subsede in ENVIGADO_CITAS_SEDES.items():
-        for i in range(dias_adelante):
-            fecha = hoy + timedelta(days=i)
-            fecha_str = fecha.strftime("%d/%m/%Y")
-            cantidad = envigado_consultar_horas_disponibles(id_subsede, fecha_str)
-            if cantidad is None:
-                continue
-            resultados.append({"sede": sede, "fecha": fecha_str, "cantidad_horarios": cantidad})
-            cur.execute("""
-                INSERT INTO envigado_citas_disponibles (sede, id_subsede, fecha_dia, cantidad_horarios, verificado_en)
-                VALUES (%s, %s, %s, %s, NOW())
-                ON CONFLICT (sede, fecha_dia) DO UPDATE SET
-                    cantidad_horarios=EXCLUDED.cantidad_horarios, verificado_en=NOW()
-            """, (sede, id_subsede, fecha_str, cantidad))
+
+    if isinstance(puntos, list) and len(puntos) > 0:
+        # Aun no conocemos la estructura exacta de una respuesta CON datos
+        # (solo hemos visto la vacia) -- se imprime completa en los logs
+        # para poder revisarla y afinar el formato la primera vez que se
+        # dispare de verdad.
+        print("=== CITAS ENVIGADO: se encontraron puntos disponibles ===", flush=True)
+        print(puntos, flush=True)
+        print("=== FIN ===", flush=True)
+        fecha_hoy = datetime.now().strftime("%d/%m/%Y")
+        resultados.append({
+            "sede": "Ver detalle en logs del servidor",
+            "fecha": fecha_hoy,
+            "cantidad_horarios": len(puntos)
+        })
+        cur.execute("""
+            INSERT INTO envigado_citas_disponibles (sede, id_subsede, fecha_dia, cantidad_horarios, verificado_en)
+            VALUES (%s, %s, %s, %s, NOW())
+            ON CONFLICT (sede, fecha_dia) DO UPDATE SET
+                cantidad_horarios=EXCLUDED.cantidad_horarios, verificado_en=NOW()
+        """, ("Detectado (ver logs)", 0, fecha_hoy, len(puntos)))
+    else:
+        # Sin citas en este momento -- se limpia cualquier resultado
+        # positivo anterior guardado hoy, para no mostrar un aviso viejo
+        # que ya no es cierto.
+        cur.execute("""
+            DELETE FROM envigado_citas_disponibles
+            WHERE verificado_en::date = CURRENT_DATE
+        """)
+
     conn.commit()
     cur.close(); conn.close()
     return resultados
@@ -283,6 +326,33 @@ _envigado_monitoreo_estado = {
     "activo": False, "inicio": None, "fin_esperado": None,
     "numeros_vigilados": [], "detener": False
 }
+
+# Misma idea pero para el monitoreo CONSTANTE de citas disponibles
+# (revisa cada 30 segundos, separado del monitoreo de turnos llamados).
+_envigado_citas_monitoreo_estado = {
+    "activo": False, "inicio": None, "fin_esperado": None, "detener": False
+}
+
+
+def _envigado_polling_citas(duracion_segundos, intervalo_segundos=30):
+    """Revisa si hay citas disponibles en Envigado cada 'intervalo_segundos'
+    (30 por defecto), durante 'duracion_segundos'. Usa la misma logica que
+    ya existe (envigado_revisar_citas_disponibles), que guarda el
+    resultado en la base de datos -- el aviso en Liquidacion y el boton
+    de revision manual en Ejecucion ya leen de ahi, asi que no hace falta
+    nada adicional para que se vea el resultado."""
+    fin = time.time() + duracion_segundos
+    while time.time() < fin:
+        if _envigado_citas_monitoreo_estado["detener"]:
+            break
+        try:
+            envigado_revisar_citas_disponibles()
+        except Exception as e:
+            print(f"Error en monitoreo constante de citas Envigado: {e}", flush=True)
+        time.sleep(intervalo_segundos)
+
+    _envigado_citas_monitoreo_estado["activo"] = False
+    _envigado_citas_monitoreo_estado["detener"] = False
 
 
 def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_monitor=1, numeros_vigilados=None):
@@ -3562,6 +3632,64 @@ def envigado_citas_disponibles_endpoint():
         import traceback
         print(traceback.format_exc(), flush=True)
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/envigado-citas-iniciar-monitoreo", methods=["GET"])
+def envigado_citas_iniciar_monitoreo_endpoint():
+    """Arranca una sesion de monitoreo CONSTANTE de citas disponibles en
+    Envigado -- revisa cada 30 segundos, durante maximo 2 horas (o hasta
+    que se detenga manualmente). Util para la ventana de tiempo del dia
+    en la que se sabe que pueden abrir citas nuevas."""
+    if _envigado_citas_monitoreo_estado["activo"]:
+        return jsonify({
+            "ok": False,
+            "error": "Ya hay una sesión de monitoreo de citas corriendo.",
+            "fin_esperado": _envigado_citas_monitoreo_estado["fin_esperado"]
+        }), 409
+
+    duracion_minutos = request.args.get("minutos", "120")
+    duracion_minutos = int(duracion_minutos) if duracion_minutos.isdigit() else 120
+    duracion_minutos = min(duracion_minutos, 120)  # tope maximo de 2 horas
+    duracion_segundos = duracion_minutos * 60
+
+    _envigado_citas_monitoreo_estado["activo"] = True
+    _envigado_citas_monitoreo_estado["inicio"] = datetime.now().isoformat() + "Z"  # UTC
+    _envigado_citas_monitoreo_estado["fin_esperado"] = (datetime.now() + timedelta(seconds=duracion_segundos)).isoformat() + "Z"  # UTC
+    _envigado_citas_monitoreo_estado["detener"] = False
+
+    threading.Thread(
+        target=_envigado_polling_citas,
+        kwargs={"duracion_segundos": duracion_segundos},
+        daemon=True
+    ).start()
+
+    return jsonify({
+        "ok": True,
+        "mensaje": f"Monitoreo de citas iniciado, revisando cada 30 segundos por {duracion_minutos} minutos (o hasta que lo detengas).",
+        "fin_esperado": _envigado_citas_monitoreo_estado["fin_esperado"]
+    })
+
+
+@app.route("/envigado-citas-detener-monitoreo", methods=["GET"])
+def envigado_citas_detener_monitoreo_endpoint():
+    """Detiene la sesion de monitoreo constante de citas antes de que se
+    cumpla el tiempo maximo. Puede tardar hasta 30 segundos en detenerse
+    del todo (revisa la bandera en cada ciclo)."""
+    if not _envigado_citas_monitoreo_estado["activo"]:
+        return jsonify({"ok": False, "error": "No hay ningún monitoreo de citas corriendo en este momento."}), 409
+    _envigado_citas_monitoreo_estado["detener"] = True
+    return jsonify({"ok": True, "mensaje": "Deteniendo el monitoreo de citas..."})
+
+
+@app.route("/envigado-citas-estado-monitoreo", methods=["GET"])
+def envigado_citas_estado_monitoreo_endpoint():
+    """Indica si hay una sesion de monitoreo constante de citas activa."""
+    return jsonify({
+        "ok": True,
+        "activo": _envigado_citas_monitoreo_estado["activo"],
+        "inicio": _envigado_citas_monitoreo_estado["inicio"],
+        "fin_esperado": _envigado_citas_monitoreo_estado["fin_esperado"],
+    })
 
 
 @app.route("/envigado-citas-ultimo-resultado", methods=["GET"])
