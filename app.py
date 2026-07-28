@@ -1438,6 +1438,14 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
 
     # NOTA: se habia reducido la altura de esta fila (de 27.75 a 14) para
     # acercar el "CERTIFICADO No." al titulo, pero eso dejo apeñuscado el
+    # texto "El suscrito funcionario..." con el logo. Se prueba un punto
+    # intermedio (20) que de un poco de aire sin comerse tanta capacidad
+    # de la tabla de declaraciones (con la altura original de 27.75, un
+    # caso de 18 declaraciones ya no cabia en una sola pagina).
+    edc.row_dimensions[5].height = 18
+
+    # NOTA: se habia reducido la altura de esta fila (de 27.75 a 14) para
+    # acercar el "CERTIFICADO No." al titulo, pero eso dejo apeñuscado el
     # texto "El suscrito funcionario..." con el logo justo debajo -- se
     # revierte, la altura original ya tenia un espacio aceptable.
 
@@ -1510,12 +1518,24 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
         if ultima_fila_decl_usada < FILA_DECL_FIN:
             _ocultar_filas(edc, ultima_fila_decl_usada + 1, FILA_DECL_FIN)
 
-    # NOTA: aqui habiamos forzado un salto de pagina manual para que
-    # "Observaciones" y "Avaluo para la vigencia" quedaran siempre juntos.
-    # Se quito porque, al ocultar filas (en vez de borrarlas), ese salto
-    # forzado dejaba un bloque de espacio en blanco (las filas ocultas de
-    # antes del salto igual "reservaban" el hueco). Con las filas ocultas
-    # la paginacion natural ya deberia acomodar todo bien sin forzar nada.
+    # "Observaciones" y "Avaluo para la vigencia" deben quedar SIEMPRE
+    # juntos en la misma pagina, y nunca deben cortarse a la mitad -- se
+    # fuerza un salto de pagina justo antes de "OBSERVACIONES" cuando el
+    # TOTAL combinado (declaraciones + observaciones) es demasiado grande
+    # para caber junto con las primeras 2 tablas en una sola pagina.
+    # Calibrado con un PDF real de la Gobernacion: 16 declaraciones + 12
+    # filas de observaciones (total 28) YA NO cabian en una sola pagina
+    # (se cortaba "Observaciones" a la mitad); mientras que 18
+    # declaraciones + 0 observaciones (total 18) si cabian bien.
+    # La tabla 4 (Avaluo/Periodo/Firma) ocupa un espacio fijo minimo
+    # incluso cuando Observaciones esta vacia (max_obs=0) -- por eso
+    # entra un "peso" fijo (ESPACIO_FIJO_TABLA_4) en la cuenta, no solo la
+    # cantidad de observaciones. Calibrado con un caso limite real: 18
+    # declaraciones + 0 observaciones ya se desbordaba por muy poco.
+    ESPACIO_FIJO_TABLA_4 = 3
+    UMBRAL_TOTAL_PARA_SALTO = 20
+    if (filas_declaraciones + max_obs + ESPACIO_FIJO_TABLA_4) > UMBRAL_TOTAL_PARA_SALTO:
+        edc.row_breaks.append(Break(id=51))  # quiebre despues de la fila 51 -> "OBSERVACIONES" (fila 52) arranca en pagina nueva
 
     hojas_a_conservar = {"PYS", "ESTADO DE CUENTA"}
     for nombre in list(wb.sheetnames):
