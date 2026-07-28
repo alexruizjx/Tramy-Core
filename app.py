@@ -1316,7 +1316,18 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
         texto = f"{b.get('descripcionBloqueo', '')} ({b.get('vigencia', '')})"
         pys.cell(row=22 + i, column=15, value=texto)  # O
     for i, n in enumerate(novedades):
-        texto = n if isinstance(n, str) else str(n)
+        if isinstance(n, dict):
+            descripcion = n.get("descripcionNovedad", "")
+            fecha_raw = (n.get("fechaNovedad") or "")[:10]  # "YYYY-MM-DD"
+            fecha_fmt = fecha_raw
+            if fecha_raw:
+                try:
+                    fecha_fmt = datetime.strptime(fecha_raw, "%Y-%m-%d").strftime("%d/%m/%Y")
+                except ValueError:
+                    fecha_fmt = fecha_raw
+            texto = f"{descripcion} - {fecha_fmt}" if fecha_fmt else descripcion
+        else:
+            texto = str(n)
         pys.cell(row=22 + i, column=16, value=texto)  # P
 
     # "El vehiculo no presenta observaciones" solo si las 3 listas estan
