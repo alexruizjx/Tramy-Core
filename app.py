@@ -1535,7 +1535,7 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     ESPACIO_FIJO_TABLA_4 = 3
     UMBRAL_TOTAL_PARA_SALTO = 20
     if (filas_declaraciones + max_obs + ESPACIO_FIJO_TABLA_4) > UMBRAL_TOTAL_PARA_SALTO:
-        edc.row_breaks.append(Break(id=51))  # quiebre despues de la fila 51 -> "OBSERVACIONES" (fila 52) arranca en pagina nueva
+        edc.row_breaks.append(Break(id=50))  # quiebre despues de la fila 50 -> "OBSERVACIONES" (fila 51, con su titulo) arranca en pagina nueva
 
     hojas_a_conservar = {"PYS", "ESTADO DE CUENTA"}
     for nombre in list(wb.sheetnames):
