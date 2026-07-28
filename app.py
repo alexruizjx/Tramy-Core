@@ -1374,16 +1374,12 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
         if ultima_fila_decl_usada < FILA_DECL_FIN:
             _ocultar_filas(edc, ultima_fila_decl_usada + 1, FILA_DECL_FIN)
 
-    # "Observaciones" y "Avaluo para la vigencia" deben quedar SIEMPRE
-    # juntos en la misma pagina -- si la tabla de declaraciones tiene
-    # muchas filas y no alcanza el espacio en la primera pagina, se
-    # fuerza que ambos bloques (que van seguidos) se pasen juntos a la
-    # pagina 2, en vez de arriesgarse a que se corten entre paginas.
-    # Umbral aproximado (ajustable si hace falta tras probarlo): mas de
-    # 15 declaraciones visibles ya no alcanza a caber comodo en pagina 1.
-    UMBRAL_DECLARACIONES_PARA_SALTO = 15
-    if filas_declaraciones > UMBRAL_DECLARACIONES_PARA_SALTO:
-        edc.row_breaks.append(Break(id=51))  # quiebre despues de la fila 51 -> "OBSERVACIONES" (fila 52) arranca en pagina nueva
+    # NOTA: aqui habiamos forzado un salto de pagina manual para que
+    # "Observaciones" y "Avaluo para la vigencia" quedaran siempre juntos.
+    # Se quito porque, al ocultar filas (en vez de borrarlas), ese salto
+    # forzado dejaba un bloque de espacio en blanco (las filas ocultas de
+    # antes del salto igual "reservaban" el hueco). Con las filas ocultas
+    # la paginacion natural ya deberia acomodar todo bien sin forzar nada.
 
     hojas_a_conservar = {"PYS", "ESTADO DE CUENTA"}
     for nombre in list(wb.sheetnames):
