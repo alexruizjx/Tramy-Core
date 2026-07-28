@@ -1,5132 +1,4576 @@
-import base64, re, io
-from PIL import Image
-import pytesseract
-import os
-import psycopg2
-import re
-import time
-import uuid
-import json
-import requests
-import threading
-import boto3
-from botocore.config import Config
-from datetime import datetime, timedelta, date
-from flask import Flask, request, jsonify
-from playwright.sync_api import sync_playwright
-from pypdf import PdfWriter
-from flask_cors import CORS
-
-app = Flask(__name__)  # v54.1
-CORS(app, resources={r"/*": {"origins": "*"}})
-
-TIMEOUT = 10000
-MSG_NO_MATRICULADO = "El vehiculo no se encuentra matriculado en la Secretaria de Movilidad"
-AÑO_ACTUAL = str(datetime.now().year)
-
-TWOCAPTCHA_API_KEY = os.environ.get("TWOCAPTCHA_API_KEY", "")
-
-# --- Cloudflare R2 (almacenamiento de documentos generados, ej. FUN) ---
-R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
-R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
-R2_ENDPOINT = os.environ.get("R2_ENDPOINT", "")
-R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "")
-R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "")  # ej: https://docs.tramy.app
-
-def _r2_client():
-    return boto3.client(
-        "s3",
-        endpoint_url=R2_ENDPOINT,
-        aws_access_key_id=R2_ACCESS_KEY_ID,
-        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-        config=Config(signature_version="s3v4"),
-        region_name="auto",
-    )
-
-def subir_a_r2(ruta_local, nombre_archivo_remoto, content_type="application/pdf", nombre_descarga=None):
-    """Sube un archivo a R2 y devuelve la URL publica de descarga.
-    El bucket debe tener acceso publico de lectura habilitado (o un dominio
-    personalizado conectado) para que la URL funcione directo en el navegador.
-    Si se da 'nombre_descarga', el navegador sugiere ese nombre al guardar
-    el archivo (no el nombre interno/tecnico usado en la URL)."""
-    cliente = _r2_client()
-    extra_args = {"ContentType": content_type}
-    if nombre_descarga:
-        extra_args["ContentDisposition"] = f'inline; filename="{nombre_descarga}"'
-    cliente.upload_file(
-        ruta_local, R2_BUCKET_NAME, nombre_archivo_remoto,
-        ExtraArgs=extra_args
-    )
-    return f"{R2_PUBLIC_BASE_URL}/{nombre_archivo_remoto}"
-
-
-EMTRASUR_SITE_KEY  = "6Leshn4sAAAAAIas9tkeW3vKPg0a4uYqw-7fG7Pn"
-EMTRASUR_URL       = "https://sistematizacion.emtrasur.com.co/"
-ANTIOQUIA_SITE_KEY = "0x4AAAAAACJy_BR2tRNN1cnv"
-ANTIOQUIA_URL      = "https://www.vehiculosantioquia.com.co/impuestosweb/#/public"
-ANTIOQUIA_API      = "https://www.vehiculosantioquia.com.co/raiz-backimpuestosweb/backimpuestosweb"
-
-# ============================================================
-#  TABLA DE TIPOS DE DOCUMENTO ANTIOQUIA
-# ============================================================
-ANTIOQUIA_TIPOS_DOCUMENTO = {
-    "1":  {"abreviatura": "CC",    "nombre": "Cédula de Ciudadanía"},
-    "8":  {"abreviatura": "CD",    "nombre": "Carnet Diplomático"},
-    "5":  {"abreviatura": "CE",    "nombre": "Cédula de Extranjería"},
-    "2":  {"abreviatura": "NIT",   "nombre": "NIT"},
-    "4":  {"abreviatura": "PASAP", "nombre": "Pasaporte"},
-    "29": {"abreviatura": "PPT",   "nombre": "Permiso por protección temporal"},
-    "7":  {"abreviatura": "RC",    "nombre": "Registro Civil"},
-    "6":  {"abreviatura": "TI",    "nombre": "Tarjeta de Identidad"},
-}
-
-# Mapa de abreviatura entrante → id numérico
-ANTIOQUIA_TIPO_DOC_MAP = {
-    "CC": "1", "NIT": "2", "PASAP": "4", "CE": "5",
-    "TI": "6", "RC": "7", "CD": "8", "PPT": "29"
-}
-
-ANTIOQUIA_LIMITE_VIGENCIAS = 20
-
-
-def get_db_conn():
-    return psycopg2.connect(os.environ["DATABASE_URL"])
-
-
-def job_actualizar(job_id, mensaje, estado='procesando', datos_parciales=None):
-    try:
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        if datos_parciales is not None:
-            cur.execute("""
-                INSERT INTO consulta_jobs (job_id, estado, mensaje, resultado, actualizado_en)
-                VALUES (%s, %s, %s, %s, NOW())
-                ON CONFLICT (job_id) DO UPDATE SET estado=%s, mensaje=%s, resultado=%s, actualizado_en=NOW()
-            """, (job_id, estado, mensaje, json.dumps({"parcial": datos_parciales}),
-                  estado, mensaje, json.dumps({"parcial": datos_parciales})))
-        else:
-            cur.execute("""
-                INSERT INTO consulta_jobs (job_id, estado, mensaje, actualizado_en)
-                VALUES (%s, %s, %s, NOW())
-                ON CONFLICT (job_id) DO UPDATE SET estado=%s, mensaje=%s, actualizado_en=NOW()
-            """, (job_id, estado, mensaje, estado, mensaje))
-        conn.commit()
-        cur.close(); conn.close()
-    except Exception as e:
-        print(f"Error job: {e}")
-
-def job_terminar(job_id, resultado):
-    try:
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        cur.execute("""
-            UPDATE consulta_jobs SET estado='listo', mensaje='Consulta finalizada.', resultado=%s, actualizado_en=NOW()
-            WHERE job_id=%s
-        """, (json.dumps(resultado), job_id))
-        conn.commit()
-        cur.close(); conn.close()
-    except Exception as e:
-        print(f"Error job terminar: {e}")
-
-def job_error(job_id, mensaje_error):
-    try:
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        cur.execute("""
-            UPDATE consulta_jobs SET estado='error', mensaje=%s, actualizado_en=NOW()
-            WHERE job_id=%s
-        """, (mensaje_error, job_id))
-        conn.commit()
-        cur.close(); conn.close()
-    except Exception as e:
-        print(f"Error job error: {e}")
-
-
-# ============================================================
-#  CACHE IMPUESTOS ANTIOQUIA
-# ============================================================
-
-def cache_antioquia_buscar(placa):
-    """Busca PAZ_Y_SALVO en caché para el año actual."""
-    try:
-        anio_actual = datetime.now().year
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        cur.execute("""
-            SELECT estado, total_pagar, avaluo_comercial, retefuente, vigencia
-            FROM cache_impuestos_antioquia
-            WHERE placa = %s AND vigencia = %s AND estado = 'PAZ_Y_SALVO'
-              AND (expira_en IS NULL OR expira_en >= NOW())
-            ORDER BY creado_en DESC LIMIT 1
-        """, (placa.upper(), str(anio_actual)))
-        row = cur.fetchone()
-        cur.close(); conn.close()
-        if row:
-            return {
-                "estado":     row[0],
-                "total":      row[1] or 0,
-                "avaluo":     row[2] or 0,
-                "retefuente": row[3] or 0,
-                "vigencia":   row[4],
-            }
-        return None
-    except Exception as e:
-        print(f"Error cache buscar: {e}")
-        return None
-
-
-def cache_antioquia_buscar_vigencia(placa, anio):
-    """Busca el valor cacheado de una vigencia específica con deuda."""
-    try:
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        cur.execute("""
-            SELECT total_pagar, avaluo_comercial, retefuente
-            FROM cache_impuestos_antioquia
-            WHERE placa = %s AND vigencia = %s AND estado = 'CON_DEUDA'
-              AND (expira_en IS NULL OR expira_en >= NOW())
-            ORDER BY creado_en DESC LIMIT 1
-        """, (placa.upper(), int(anio)))
-        row = cur.fetchone()
-        cur.close(); conn.close()
-        if row:
-            return {"total_pagar": row[0] or 0, "avaluo": row[1] or 0, "retefuente": row[2] or 0}
-        return None
-    except Exception as e:
-        print(f"Error cache buscar vigencia: {e}")
-        return None
-
-
-def cache_antioquia_eliminar_vigencia(placa, anio):
-    """Elimina del caché una vigencia que ya fue pagada."""
-    try:
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        cur.execute("""
-            DELETE FROM cache_impuestos_antioquia
-            WHERE placa = %s AND vigencia = %s AND estado = 'CON_DEUDA'
-        """, (placa.upper(), int(anio)))
-        conn.commit()
-        cur.close(); conn.close()
-        print(f"  → Caché eliminado para {placa} vigencia {anio} (fue pagada)")
-    except Exception as e:
-        print(f"Error cache eliminar vigencia: {e}")
-
-
-ENVIGADO_CITAS_SEDES = {
-    "Vegas (El Colombiano)": 1,
-    "City Plaza": 3,
-}
-ENVIGADO_CITAS_ID_SERVICIO = "90"
-ENVIGADO_PUNTOS_API = "https://movilidad.envigado.gov.co/backavit/avit/citas/getPuntosAtencionServiciosLowcode"
-ENVIGADO_HORAS_API = "https://movilidad.envigado.gov.co/backavit/avit/citas/getHorasDisponibles"
-ENVIGADO_VALIDAR_API = "https://movilidad.envigado.gov.co/backavit/avit/seguridad/preguntas/validarMostrarPreguntasSeguridad"
-# Documento y placa "de prueba" -- no corresponden a un ciudadano real que
-# pueda verse afectado, siguiendo la misma logica que ya usa el usuario
-# manualmente (un numero que el sistema no tiene registrado).
-ENVIGADO_CITAS_DOCUMENTO = "71632131313"
-ENVIGADO_CITAS_TIPO_DOC = "2"
-ENVIGADO_CITAS_PLACA = "RST37B"
-
-
-def envigado_hay_puntos_disponibles():
-    """Revisa si hay ALGUN punto de atencion con citas disponibles para
-    el servicio vigilado, en UNA sola peticion (mucho mas eficiente que
-    consultar dia por dia y sede por sede). Devuelve la lista cruda que
-    entrega el sitio (vacia [] si no hay nada disponible en ningun lado
-    en este momento), o None si hubo un error de conexion.
-
-    IMPORTANTE: antes hay que pasar por 'validarMostrarPreguntasSeguridad'
-    en la MISMA sesion (a pesar del nombre, no son preguntas de seguridad
-    reales -- solo validan documento+placa y devuelven codigo:0 para
-    poder seguir). Sin este paso previo la consulta no trae resultados
-    reales."""
-    session = requests.Session()
-    try:
-        payload_validar = [{
-            "documento": None,
-            "respuesta": None,
-            "placa": ENVIGADO_CITAS_PLACA,
-            "homePublic": True,
-            "tipoDocumento": ENVIGADO_CITAS_TIPO_DOC,
-            "nroDocumento": ENVIGADO_CITAS_DOCUMENTO,
-            "bloqueoPermanente": False,
-        }]
-        r_val = session.post(ENVIGADO_VALIDAR_API, json=payload_validar, timeout=20)
-        r_val.raise_for_status()
-    except Exception as e:
-        print(f"Error validando antes de consultar citas Envigado: {e}", flush=True)
-        return None
-
-    try:
-        payload_puntos = {"idServicios": ENVIGADO_CITAS_ID_SERVICIO, "cantidadTramites": 1}
-        r_puntos = session.post(ENVIGADO_PUNTOS_API, json=payload_puntos, timeout=20)
-        r_puntos.raise_for_status()
-        return r_puntos.json()
-    except Exception as e:
-        print(f"Error consultando puntos de atencion Envigado: {e}", flush=True)
-        return None
-
-
-def envigado_revisar_citas_disponibles(dias_adelante=14):
-    """Revisa si hay ALGUN punto de atencion con citas disponibles (una
-    sola peticion, no dia por dia), y guarda el resultado en la base de
-    datos. 'dias_adelante' ya no se usa para hacer mas peticiones -- se
-    deja como parametro por compatibilidad con quien ya llama esta
-    funcion. Devuelve una lista de resultados: {sede, fecha, cantidad_horarios}
-    (una entrada generica si hay citas, vacia si no hay nada)."""
-    puntos = envigado_hay_puntos_disponibles()
-    if puntos is None:
-        print("Error consultando disponibilidad de citas Envigado (ver logs arriba).", flush=True)
-        return []
-
-    resultados = []
-    conn = get_db_conn()
-    cur = conn.cursor()
-
-    if isinstance(puntos, list) and len(puntos) > 0:
-        # Aun no conocemos la estructura exacta de una respuesta CON datos
-        # (solo hemos visto la vacia) -- se imprime completa en los logs
-        # para poder revisarla y afinar el formato la primera vez que se
-        # dispare de verdad.
-        print("=== CITAS ENVIGADO: se encontraron puntos disponibles ===", flush=True)
-        print(puntos, flush=True)
-        print("=== FIN ===", flush=True)
-        fecha_hoy = datetime.now().strftime("%d/%m/%Y")
-        resultados.append({
-            "sede": "Ver detalle en logs del servidor",
-            "fecha": fecha_hoy,
-            "cantidad_horarios": len(puntos)
-        })
-        cur.execute("""
-            INSERT INTO envigado_citas_disponibles (sede, id_subsede, fecha_dia, cantidad_horarios, verificado_en)
-            VALUES (%s, %s, %s, %s, NOW())
-            ON CONFLICT (sede, fecha_dia) DO UPDATE SET
-                cantidad_horarios=EXCLUDED.cantidad_horarios, verificado_en=NOW()
-        """, ("Detectado (ver logs)", 0, fecha_hoy, len(puntos)))
-    else:
-        # Sin citas en este momento -- se limpia cualquier resultado
-        # positivo anterior guardado hoy, para no mostrar un aviso viejo
-        # que ya no es cierto.
-        cur.execute("""
-            DELETE FROM envigado_citas_disponibles
-            WHERE verificado_en::date = CURRENT_DATE
-        """)
-
-    conn.commit()
-    cur.close(); conn.close()
-    return resultados
-
-
-ENVIGADO_TURNOS_API = "https://gacomponentes.envigado.gov.co/backga/back-ga/turnos/findAtencionesMonitor"
-
-# Bandera simple en memoria para saber si ya hay una sesion de monitoreo
-# corriendo (evita que se disparen varias sesiones encimadas por error).
-_envigado_monitoreo_estado = {
-    "activo": False, "inicio": None, "fin_esperado": None,
-    "numeros_vigilados": [], "detener": False
-}
-
-# Misma idea pero para el monitoreo CONSTANTE de citas disponibles
-# (revisa cada 30 segundos, separado del monitoreo de turnos llamados).
-_envigado_citas_monitoreo_estado = {
-    "activo": False, "inicio": None, "fin_esperado": None, "detener": False
-}
-
-
-def _envigado_polling_citas(duracion_segundos, intervalo_segundos=30):
-    """Revisa si hay citas disponibles en Envigado cada 'intervalo_segundos'
-    (30 por defecto), durante 'duracion_segundos'. Usa la misma logica que
-    ya existe (envigado_revisar_citas_disponibles), que guarda el
-    resultado en la base de datos -- el aviso en Liquidacion y el boton
-    de revision manual en Ejecucion ya leen de ahi, asi que no hace falta
-    nada adicional para que se vea el resultado."""
-    fin = time.time() + duracion_segundos
-    while time.time() < fin:
-        if _envigado_citas_monitoreo_estado["detener"]:
-            break
-        try:
-            envigado_revisar_citas_disponibles()
-        except Exception as e:
-            print(f"Error en monitoreo constante de citas Envigado: {e}", flush=True)
-        time.sleep(intervalo_segundos)
-
-    _envigado_citas_monitoreo_estado["activo"] = False
-    _envigado_citas_monitoreo_estado["detener"] = False
-
-
-def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_monitor=1, numeros_vigilados=None):
-    """Revisa el "monitor de turnos" de Envigado cada pocos segundos,
-    durante 'duracion_segundos'. Cada vez que aparece un idGestionAtencion
-    que no habiamos visto, lo guarda con la hora en que Tramy lo detecto
-    (la plataforma no entrega un timestamp exacto propio del llamado --
-    el campo 'fechaInicial' viene vacio).
-    Si se indica 'numeros_vigilados' (lista, ej. ["C-89", "G-78"]), en
-    cuanto aparezca CUALQUIERA de esos numeros se agrega a
-    _envigado_monitoreo_estado['encontrados'] para que el frontend pueda
-    mostrar una alerta destacada (con sonido y vibracion)."""
-    fin = time.time() + duracion_segundos
-    ids_vistos = set()
-    hoy_str = datetime.now().strftime("%d/%m/%Y")
-    numeros_vigilados_norm = set((n or "").strip().upper() for n in (numeros_vigilados or []))
-
-    while time.time() < fin:
-        if _envigado_monitoreo_estado["detener"]:
-            break
-        try:
-            params = {
-                "idMonitor": id_monitor,
-                "cantidadTurnos": 10,
-                "fechaInicio": f"{hoy_str} 00:00:00",
-                "fechaFin": f"{hoy_str} 23:59:59",
-                "_": str(int(time.time() * 1000)),
-            }
-            r = requests.get(ENVIGADO_TURNOS_API, params=params, timeout=15)
-            r.raise_for_status()
-            data = r.json()
-            if isinstance(data, list) and data:
-                conn = get_db_conn()
-                cur = conn.cursor()
-                for item in data:
-                    idg = item.get("idGestionAtencion")
-                    if idg is None or idg in ids_vistos:
-                        continue
-                    ids_vistos.add(idg)
-                    nro_norm = (item.get("nroAtencion") or "").strip().upper()
-                    es_vigilado = bool(numeros_vigilados_norm and nro_norm in numeros_vigilados_norm)
-
-                    cur.execute("""
-                        INSERT INTO envigado_turnos_llamados
-                            (id_gestion_atencion, nro_atencion, nombre_usuario, nombre_taquilla,
-                             nombre_servicio, id_estado, fue_vigilado, detectado_en)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
-                        ON CONFLICT (id_gestion_atencion) DO NOTHING
-                    """, (idg, item.get("nroAtencion"), item.get("nombreUsuario"),
-                          item.get("nombreTaquilla"), item.get("nombreServicio"),
-                          item.get("idEstadoGestionAtencion"), es_vigilado))
-                conn.commit()
-                cur.close(); conn.close()
-        except Exception as e:
-            print(f"Error en monitoreo de turnos Envigado: {e}", flush=True)
-        time.sleep(intervalo_segundos)
-
-    _envigado_monitoreo_estado["activo"] = False
-    _envigado_monitoreo_estado["detener"] = False
-
-
-def cache_antioquia_guardar_paz_salvo(placa, avaluo, estado_veh):
-    """Guarda en caché que la placa está a paz y salvo hasta fin de año."""
-    try:
-        anio_actual = datetime.now().year
-        expira = f"{anio_actual}-12-31"
-        retefuente = round(avaluo / 100) if avaluo else 0
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        cur.execute("""
-            INSERT INTO cache_impuestos_antioquia
-                (placa, vigencia, total_pagar, avaluo_comercial, retefuente, estado, expira_en, creado_en)
-            VALUES (%s, %s, 0, %s, %s, 'PAZ_Y_SALVO', %s, NOW())
-            ON CONFLICT (placa, vigencia) DO UPDATE SET
-                total_pagar=0, avaluo_comercial=EXCLUDED.avaluo_comercial,
-                retefuente=EXCLUDED.retefuente, estado='PAZ_Y_SALVO',
-                expira_en=EXCLUDED.expira_en, actualizado_en=NOW()
-        """, (placa.upper(), str(anio_actual), avaluo or 0, retefuente, expira))
-        conn.commit()
-        cur.close(); conn.close()
-        print(f"  → Caché guardado PAZ_Y_SALVO para {placa}")
-    except Exception as e:
-        print(f"Error cache guardar paz y salvo: {e}")
-
-
-def guardar_estado_cuenta_antioquia(placa, data3):
-    """Guarda TODOS los datos de la consulta (estadoCuenta, historial de
-    declaraciones, procesos fiscales, bloqueos, novedades) para poder
-    generar despues el documento Estado de Cuenta sin tener que volver a
-    consultar. Se llama cada vez que un vehiculo sale a paz y salvo."""
-    try:
-        estado_veh = data3.get("estadoCuenta", {}) or {}
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        cur.execute("""
-            INSERT INTO estado_cuenta_antioquia
-                (placa, numero_certificado, valor_certificado, periodo_inicio, periodo_fin,
-                 estado_cuenta_json, lista_detalle_pagos, lista_proceso_fiscal, lista_bloqueo,
-                 novedades, actualizado_en)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (placa) DO UPDATE SET
-                numero_certificado=EXCLUDED.numero_certificado,
-                valor_certificado=EXCLUDED.valor_certificado,
-                periodo_inicio=EXCLUDED.periodo_inicio,
-                periodo_fin=EXCLUDED.periodo_fin,
-                estado_cuenta_json=EXCLUDED.estado_cuenta_json,
-                lista_detalle_pagos=EXCLUDED.lista_detalle_pagos,
-                lista_proceso_fiscal=EXCLUDED.lista_proceso_fiscal,
-                lista_bloqueo=EXCLUDED.lista_bloqueo,
-                novedades=EXCLUDED.novedades,
-                actualizado_en=NOW()
-        """, (
-            placa.upper(),
-            estado_veh.get("numeroCertificadoSap"),
-            estado_veh.get("valorEstadoCuenta"),
-            estado_veh.get("periodoInicioCertificacion"),
-            estado_veh.get("periodoFinCertificacion"),
-            json.dumps(estado_veh, ensure_ascii=False, default=str),
-            json.dumps(data3.get("listaDetallePagos", []), ensure_ascii=False, default=str),
-            json.dumps(data3.get("listaProcesoFiscal", []), ensure_ascii=False, default=str),
-            json.dumps(data3.get("listaBloqueo", []), ensure_ascii=False, default=str),
-            json.dumps(data3.get("novedades", []), ensure_ascii=False, default=str),
-        ))
-        conn.commit()
-        cur.close(); conn.close()
-        print(f"  → Estado de Cuenta guardado para {placa}")
-    except Exception as e:
-        print(f"Error guardando estado de cuenta: {e}")
-
-
-def cache_antioquia_guardar_deuda(placa, vigencias_data, avaluo):
-    """Guarda en caché vigencias con deuda.
-    - Vigencia año actual antes del 1 agosto: expira el 31 de julio
-    - Vigencia año actual desde 1 agosto, y vigencias anteriores: expira en 2 meses
-    """
-    try:
-        ahora       = datetime.now()
-        anio_actual = ahora.year
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        retefuente = round(avaluo / 100) if avaluo else 0
-
-        for vig in vigencias_data:
-            anio_vig   = int(vig.get('vigencia', 0))
-            total      = vig.get('total_pagar', 0) or 0
-
-            # Calcular expiración según reglas
-            es_anio_actual    = (anio_vig == anio_actual)
-            antes_de_agosto   = ahora.month < 8  # antes del 1 de agosto
-
-            if es_anio_actual and antes_de_agosto:
-                expira = f"{anio_actual}-07-31 23:59:59"
-            else:
-                # 2 meses desde ahora
-                mes_exp  = ahora.month + 2
-                anio_exp = anio_actual
-                if mes_exp > 12:
-                    mes_exp  -= 12
-                    anio_exp += 1
-                expira = f"{anio_exp}-{mes_exp:02d}-{ahora.day:02d} 23:59:59"
-
-            expira_date = expira[:10]  # solo YYYY-MM-DD para columna date
-            cur.execute("""
-                INSERT INTO cache_impuestos_antioquia
-                    (placa, vigencia, total_pagar, avaluo_comercial, retefuente, estado, expira_en, creado_en)
-                VALUES (%s, %s, %s, %s, %s, 'CON_DEUDA', %s, NOW())
-                ON CONFLICT (placa, vigencia) DO UPDATE SET
-                    total_pagar=EXCLUDED.total_pagar,
-                    avaluo_comercial=EXCLUDED.avaluo_comercial,
-                    retefuente=EXCLUDED.retefuente,
-                    estado='CON_DEUDA',
-                    expira_en=EXCLUDED.expira_en,
-                    actualizado_en=NOW()
-            """, (placa.upper(), int(anio_vig), total, avaluo or 0, retefuente, expira_date))
-
-        conn.commit()
-        cur.close(); conn.close()
-        print(f"  → Caché CON_DEUDA guardado para {placa}: {[v.get('vigencia') for v in vigencias_data]}")
-    except Exception as e:
-        print(f"Error cache guardar deuda: {e}")
-
-
-# ============================================================
-#  CACHE IMPUESTOS MUNICIPALES (Envigado, Sabaneta, Itagui, Bello,
-#  La Estrella, Medellin, etc.) -- mismo principio que el cache de
-#  Antioquia: si una placa esta a paz y salvo, lo esta hasta fin de
-#  año, asi que no hace falta volver a consultar la pagina del
-#  municipio (que es una consulta lenta via Playwright).
-# ============================================================
-
-def cache_municipal_buscar(placa, municipio):
-    """Busca PAZ_Y_SALVO en cache municipal para el año actual."""
-    try:
-        anio_actual = datetime.now().year
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        cur.execute("""
-            SELECT fecha_pago, marca_pago, valor_pago, placa_vista
-            FROM cache_impuestos_municipales
-            WHERE placa = %s AND municipio = %s AND vigencia = %s AND estado = 'PAZ_Y_SALVO'
-              AND (expira_en IS NULL OR expira_en >= NOW())
-            ORDER BY creado_en DESC LIMIT 1
-        """, (placa.upper(), municipio.lower(), str(anio_actual)))
-        row = cur.fetchone()
-        cur.close(); conn.close()
-        if row:
-            return {"fecha_pago": row[0] or "", "marca": row[1] or "", "valor_pago": row[2] or "", "placa_vista": row[3] or ""}
-        return None
-    except Exception as e:
-        print(f"Error cache municipal buscar: {e}")
-        return None
-
-
-def cache_municipal_guardar_paz_salvo(placa, municipio, fecha_pago, marca, valor_pago, placa_vista):
-    """Guarda en cache que la placa esta a paz y salvo en ese municipio hasta fin de año."""
-    try:
-        anio_actual = datetime.now().year
-        expira = f"{anio_actual}-12-31"
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        cur.execute("""
-            INSERT INTO cache_impuestos_municipales
-                (placa, municipio, vigencia, estado, fecha_pago, marca_pago, valor_pago, placa_vista, expira_en, creado_en)
-            VALUES (%s, %s, %s, 'PAZ_Y_SALVO', %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (placa, municipio, vigencia) DO UPDATE SET
-                estado='PAZ_Y_SALVO', fecha_pago=EXCLUDED.fecha_pago,
-                marca_pago=EXCLUDED.marca_pago, valor_pago=EXCLUDED.valor_pago,
-                placa_vista=EXCLUDED.placa_vista, expira_en=EXCLUDED.expira_en,
-                actualizado_en=NOW()
-        """, (placa.upper(), municipio.lower(), str(anio_actual), fecha_pago or '', marca or '', valor_pago or '', placa_vista or '', expira))
-        conn.commit()
-        cur.close(); conn.close()
-        print(f"  → Cache municipal guardado PAZ_Y_SALVO para {placa} en {municipio}")
-    except Exception as e:
-        print(f"Error cache municipal guardar: {e}")
-
-
-def resolver_captcha_imagen_2captcha(imagen_base64, intentos=3):
-    """Resuelve un captcha de imagen simple (texto distorsionado) con 2Captcha.
-    A diferencia de resolver_recaptcha_2captcha (que usa 'userrecaptcha'/'turnstile'
-    con un sitekey), esto manda la imagen directamente y 2Captcha devuelve el texto
-    que un humano leeria en ella. Se usa para el captcha del RUNT."""
-    ultimo_error = None
-    for intento in range(intentos):
-        try:
-            resp = requests.post("https://2captcha.com/in.php", data={
-                "key": TWOCAPTCHA_API_KEY, "method": "base64",
-                "body": imagen_base64, "json": 1,
-            }, timeout=15)
-            data = resp.json()
-            if data.get("status") != 1:
-                raise Exception(f"2captcha error: {data.get('request')}")
-            captcha_id = data["request"]
-
-            for _ in range(24):  # hasta 2 minutos (24 x 5s)
-                time.sleep(5)
-                resp2 = requests.get("https://2captcha.com/res.php", params={
-                    "key": TWOCAPTCHA_API_KEY, "action": "get", "id": captcha_id, "json": 1,
-                }, timeout=15)
-                data2 = resp2.json()
-                if data2.get("status") == 1:
-                    return data2["request"]
-                if data2.get("request") != "CAPCHA_NOT_READY":
-                    raise Exception(f"2captcha error: {data2.get('request')}")
-
-            raise Exception("2captcha timeout esperando solucion")
-        except Exception as e:
-            ultimo_error = e
-            print(f"  → Intento {intento+1} de captcha imagen fallo: {e}")
-    raise ultimo_error
-
-
-RUNT_URL = "https://portalpublico.runt.gov.co/#/consulta-vehiculo/consulta/consulta-ciudadana"
-RUNT_TIPO_DOC_MAP = {
-    "CC": "Cédula Ciudadanía", "CE": "Cédula Extranjería", "NIT": "NIT",
-    "PASAP": "Pasaporte", "TI": "Tarjeta Identidad", "PPT": "Permiso por Protección Temporal",
-}
-
-
-def _runt_seleccionar_mat_select(page, form_control, texto_opcion):
-    """Los <select> de Angular Material no son <select> normales -- hay que
-    hacer click para abrir el desplegable y luego click en la opcion deseada."""
-    page.click(f'mat-select[formcontrolname="{form_control}"]')
-    page.click(f'mat-option:has-text("{texto_opcion}")')
-
-
-def consultar_runt_vehiculo(page, placa, cedula, tipo_documento="CC", job_id=None):
-    """Consulta 'Placa y Propietario' en el RUNT. Devuelve un dict con los
-    campos ya organizados segun el esquema de la tabla 'vehiculos', mas un
-    sub-dict 'persona' si el RUNT tambien confirmo datos basicos del
-    propietario en esta misma consulta."""
-    if job_id:
-        job_actualizar(job_id, "Abriendo el RUNT...", "procesando")
-
-    page.goto(RUNT_URL, wait_until="networkidle", timeout=60000)
-    page.wait_for_selector('input[formcontrolname="placa"]', timeout=30000)
-
-    # Procedencia (Nacional) y Consultar Por (Placa y Propietario) ya vienen
-    # seleccionados por defecto -- no hace falta tocarlos.
-    page.fill('input[formcontrolname="placa"]', placa.upper())
-
-    if tipo_documento != "CC":
-        # "Cedula Ciudadania" es el default, solo se cambia si es otro tipo
-        texto = RUNT_TIPO_DOC_MAP.get(tipo_documento, "Cédula Ciudadanía")
-        _runt_seleccionar_mat_select(page, "tipoDocumento", texto)
-
-    page.fill('input[formcontrolname="documento"]', cedula)
-
-    if job_id:
-        job_actualizar(job_id, "Resolviendo captcha...", "procesando")
-
-    # Reintenta hasta 3 veces si el captcha resulta incorrecto (el RUNT
-    # regenera la imagen cada vez que falla).
-    for intento_captcha in range(3):
-        img_src = page.get_attribute('img.img-responsive.img-fluid', 'src')
-        imagen_base64 = img_src.split(',', 1)[1]  # quitar el prefijo "data:image/png;base64,"
-
-        texto_captcha = resolver_captcha_imagen_2captcha(imagen_base64)
-
-        page.fill('input[formcontrolname="captcha"]', texto_captcha)
-
-        if job_id:
-            job_actualizar(job_id, "Consultando informacion...", "procesando")
-
-        page.click('button[type="submit"]')
-
-        try:
-            page.wait_for_selector(
-                'cyrconsultavehiculo-info-vehiculo-detallada, .mat-error, .swal2-popup',
-                timeout=20000
-            )
-        except Exception:
-            pass
-
-        # Si el captcha estaba mal, el RUNT normalmente muestra un mensaje
-        # de error (swal2) y limpia el campo -- reintentamos con una imagen nueva.
-        error_captcha = page.query_selector('.swal2-popup:has-text("captcha")') \
-                     or page.query_selector('.swal2-popup:has-text("Captcha")')
-        if error_captcha:
-            page.click('.swal2-confirm') if page.query_selector('.swal2-confirm') else None
-            continue
-
-        break
-
-    # Si el RUNT muestra cualquier otro error (ej. "los datos registrados
-    # no corresponden con los propietarios activos"), se propaga el mensaje
-    # real en vez de seguir intentando adivinar por que fallo.
-    error_popup = page.query_selector('.swal2-popup')
-    if error_popup:
-        texto_error = error_popup.inner_text().strip()
-        if texto_error:
-            if page.query_selector('.swal2-confirm'):
-                page.click('.swal2-confirm')
-            raise Exception(texto_error)
-
-    # Los paneles de SOAT, RTM, garantias, etc. cargan sus datos con
-    # peticiones asincronas separadas, despues de que aparece el bloque
-    # principal. Si leemos el texto antes de que esas peticiones terminen,
-    # esos campos salen vacios aunque el panel ya este expandido. Se espera
-    # a que la red quede inactiva (sin peticiones pendientes) antes de seguir.
-    if job_id:
-        job_actualizar(job_id, "Esperando a que carguen todas las secciones...", "procesando")
-
-    try:
-        page.wait_for_load_state("networkidle", timeout=25000)
-    except Exception:
-        pass
-
-    # Por si ademas hay paneles genuinamente colapsados (no solo cargando),
-    # los desplegamos tambien.
-    if job_id:
-        job_actualizar(job_id, "Desplegando secciones del resultado...", "procesando")
-
-    for _ in range(3):
-        headers_colapsados = page.query_selector_all('mat-expansion-panel-header[aria-expanded="false"]')
-        for header in headers_colapsados:
-            try:
-                header.click()
-                page.wait_for_timeout(300)
-            except Exception:
-                pass
-        page.wait_for_timeout(400)
-
-    if job_id:
-        job_actualizar(job_id, "Extrayendo datos...", "procesando")
-
-    return _parsear_resultado_runt_vehiculo(page)
-
-
-def _extraer_tarjetas_runt(page):
-    """Lee directamente el HTML (no el texto visual) de cada <mat-card> de
-    la pagina de resultados, devolviendo un diccionario {etiqueta: valor}
-    por cada tarjeta. Esto es inmune a que el CSS reordene visualmente las
-    etiquetas y los valores. Revisa tanto <p> como <div> como contenedor,
-    y tanto <strong> como <b> como marcador de etiqueta, porque el RUNT usa
-    una combinacion distinta segun la seccion (Info General usa <p><strong>,
-    Datos Tecnicos usa <p><b>, RTM usa <div><strong>)."""
-    return page.evaluate("""
-        () => {
-            const tarjetas = [];
-            document.querySelectorAll('mat-card').forEach(card => {
-                const campos = {};
-                card.querySelectorAll('p, div').forEach(el => {
-                    const marcador = el.querySelector(':scope > strong, :scope > b');
-                    if (marcador) {
-                        const label = marcador.innerText.replace(/:\\s*$/, '').trim();
-                        const value = el.innerText.slice(marcador.innerText.length).trim();
-                        if (label) campos[label] = value;
-                    }
-                });
-                card.querySelectorAll('div.col-12').forEach(div => {
-                    const labs = div.querySelectorAll('label');
-                    if (labs.length >= 2) {
-                        const label = labs[0].innerText.replace(/:\\s*$/, '').trim();
-                        const value = labs[1].innerText.trim();
-                        if (label) campos[label] = value;
-                    }
-                });
-                const titulo = card.querySelector('mat-card-title');
-                if (titulo) campos['_titulo'] = titulo.innerText.trim();
-                if (Object.keys(campos).length > 0) tarjetas.push(campos);
-            });
-            return tarjetas;
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tramy — Consulta y liquidación vehicular</title>
+<link rel="icon" type="image/x-icon" href="favicon.ico">
+<link rel="icon" type="image/png" sizes="16x16" href="favicon-16x16.png">
+<link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#1a2340">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body>
+<!-- Formulario Consulta Vehicular Antioquia v6 -->
+
+<script>
+  // Perfil del usuario logueado, disponible globalmente para el resto de la app.
+  // Sera null hasta que se confirme que no hay sesion, o un objeto con
+  // { full_name, role, settings: { business_name, slogan, contact_info, honorario } }
+  window.tramyProfile = null;
+
+  // Devuelve el honorario guardado (como string, listo para un input), o '0' si no aplica.
+  // Interruptor Asesor / Cliente Final -- determina cual columna de
+  // precio usar al buscar el honorario de cada municipio.
+  window.tramyTipoClienteActual = 'asesor';
+
+  window.tramyActualizarBotonesTipoCliente = function(){
+    var btnA = document.getElementById('tramyBtnAsesor');
+    var btnC = document.getElementById('tramyBtnClienteFinal');
+    if(!btnA || !btnC) return;
+    var activo = 'background:#1a2340; color:#fff;';
+    var inactivo = 'background:none; color:#5b6472;';
+    btnA.style.cssText += (window.tramyTipoClienteActual === 'asesor') ? activo : inactivo;
+    btnC.style.cssText += (window.tramyTipoClienteActual === 'cliente_final') ? activo : inactivo;
+  };
+
+  window.tramySeleccionarTipoCliente = function(tipo){
+    window.tramyTipoClienteActual = tipo;
+    window.tramyActualizarBotonesTipoCliente();
+    window.tramyAplicarHonorarioGuardado();
+  };
+
+  // Busca, en settings.honorarios_por_entidad (Normal y Dificil), el
+  // precio guardado para un municipio especifico, segun el tipo de
+  // cliente activo (Asesor o Cliente Final). Devuelve null si no hay
+  // nada guardado para ese municipio en ninguna de las dos listas.
+  window.tramyBuscarHonorarioMunicipio = function(municipio){
+    if(!window.tramyProfile || !window.tramyProfile.settings) return null;
+    var hpe = window.tramyProfile.settings.honorarios_por_entidad;
+    if(!hpe || !municipio) return null;
+    var municipioNorm = municipio.trim().toUpperCase();
+    var listas = [hpe.normal || [], hpe.dificil || []];
+    for(var i = 0; i < listas.length; i++){
+      for(var j = 0; j < listas[i].length; j++){
+        var item = listas[i][j];
+        if((item.municipio || '').trim().toUpperCase() === municipioNorm){
+          var valor = (window.tramyTipoClienteActual === 'cliente_final') ? item.precio_cliente_final : item.precio_asesor;
+          return (valor !== undefined && valor !== null) ? valor : null;
         }
-    """)
+      }
+    }
+    return null;
+  };
 
+  window.tramyHonorarioGuardado = function(){
+    var campoMunicipio = document.getElementById('ant-municipio');
+    var municipio = campoMunicipio ? campoMunicipio.value : '';
+    var porMunicipio = window.tramyBuscarHonorarioMunicipio(municipio);
+    if(porMunicipio !== null) return String(porMunicipio);
+    return '0';
+  };
 
-def _extraer_resumen_runt(page):
-    """La franja superior (placa, estado del vehiculo, tipo de servicio,
-    clase de vehiculo) no vive dentro de ninguna <mat-card> -- son pares de
-    <label>Etiqueta:</label> y <b>Valor</b> como hermanos dentro de un
-    mismo '.row'. Se emparejan por posicion dentro de cada fila."""
-    return page.evaluate("""
-        () => {
-            const resumen = {};
-            document.querySelectorAll('.row').forEach(row => {
-                const labels = Array.from(row.querySelectorAll(':scope > div > label'));
-                const valores = Array.from(row.querySelectorAll(':scope > div.show-grande > b'));
-                if (labels.length > 0 && labels.length === valores.length) {
-                    labels.forEach((lab, i) => {
-                        const key = lab.innerText.replace(/:\\s*$/, '').trim();
-                        resumen[key] = valores[i].innerText.trim();
-                    });
+  // Aplica el honorario guardado al campo de liquidacion. A diferencia de
+  // antes, esto SI puede pisar el valor actual -- porque ahora depende
+  // del municipio y del interruptor Asesor/Cliente Final, y debe
+  // actualizarse cada vez que cualquiera de esos dos cambie.
+  window.tramyAplicarHonorarioGuardado = function(){
+    var campo = document.getElementById('liq-honorarios');
+    if(campo){
+      campo.value = window.tramyHonorarioGuardado();
+    }
+  };
+
+  window.tramyActualizarBotonesTipoCliente();
+
+  // Precarga, en las filas de "cobros" (conceptos libres), los conceptos que
+  // el usuario eligio como predeterminados desde su panel. Solo aplica a los
+  // conceptos que NO son campos fijos del formulario (Paz y Salvo y Envios
+  // y/o Domicilios se manejan aparte, ver tramyAjustarFijosPredeterminados).
+  window.tramyAplicarConceptosPredeterminados = function(){
+    if(!window.tramyProfile || !window.tramyProfile.settings) return;
+    var todos = window.tramyProfile.settings.conceptos_predeterminados;
+    if(!Array.isArray(todos) || todos.length === 0) return;
+
+    var CONCEPTOS_DINAMICOS = ['4 X 1.000', 'Improntas'];
+    var seleccion = todos.filter(function(c){ return CONCEPTOS_DINAMICOS.indexOf(c) >= 0; }).slice(0, 3);
+
+    seleccion.forEach(function(nombre, idx){
+      var n = idx + 1;
+      if(n > 1 && !document.getElementById('liq-cobro-'+n) && typeof window.antAgregarCobro === 'function'){
+        window.antAgregarCobro();
+      }
+      var campoNombre = document.getElementById('liq-cobro-nombre-'+n);
+      if(campoNombre) campoNombre.value = nombre;
+
+      var valores = window.tramyProfile.settings.conceptos_valores || {};
+      var campoValor = document.getElementById('liq-cobro-valor-'+n);
+      if(campoValor && valores[nombre]){
+        campoValor.value = Number(valores[nombre]).toLocaleString('es-CO');
+        campoValor.dispatchEvent(new Event('input'));
+      }
+    });
+  };
+
+  // Paz y Salvo y Envios y/o Domicilios son campos fijos del formulario, con
+  // su propia logica de negocio (Paz y Salvo depende del municipio). Aqui
+  // solo controlamos el caso de "el usuario NO lo quiere por defecto" -- lo
+  // ocultamos aunque la logica normal diria que se muestre. Si SI lo eligio,
+  // no tocamos nada y dejamos que la logica normal decida (para no mostrar
+  // Paz y Salvo en un municipio donde no aplica).
+  window.tramyAjustarFijosPredeterminados = function(){
+    if(!window.tramyProfile || !window.tramyProfile.settings) return;
+    var conceptos = window.tramyProfile.settings.conceptos_predeterminados;
+    var valores = window.tramyProfile.settings.conceptos_valores || {};
+    if(!Array.isArray(conceptos)) return; // el usuario nunca configuro esto -> no tocar nada
+
+    if(conceptos.indexOf('Paz y Salvo') === -1){
+      var rowPS = document.getElementById('liq-row-pazsalvo');
+      var campoPS = document.getElementById('liq-pazsalvo');
+      if(rowPS) rowPS.style.display = 'none';
+      if(campoPS){ campoPS.value = '0'; campoPS.dispatchEvent(new Event('input')); }
+    } else if(valores['Paz y Salvo']){
+      var campoPS2 = document.getElementById('liq-pazsalvo');
+      if(campoPS2){ campoPS2.value = Number(valores['Paz y Salvo']).toLocaleString('es-CO'); campoPS2.dispatchEvent(new Event('input')); }
+    }
+    if(conceptos.indexOf('Envios y/o Domicilios') === -1){
+      var rowEnv = document.getElementById('liq-row-envios');
+      var campoEnv = document.getElementById('liq-envios');
+      if(rowEnv) rowEnv.style.display = 'none';
+      if(campoEnv){ campoEnv.value = '0'; campoEnv.dispatchEvent(new Event('input')); }
+    } else if(valores['Envios y/o Domicilios']){
+      var campoEnv2 = document.getElementById('liq-envios');
+      if(campoEnv2){ campoEnv2.value = Number(valores['Envios y/o Domicilios']).toLocaleString('es-CO'); campoEnv2.dispatchEvent(new Event('input')); }
+    }
+  };
+
+  // Lista de vehiculos guardados del usuario logueado (placas consultadas antes).
+  window.tramyVehiculosGuardados = [];
+
+  // Guarda (o actualiza) el vehiculo leido por OCR en Railway (tabla
+  // 'vehiculos', la misma que usa el RUNT). Si esa placa ya tiene datos de
+  // una consulta al RUNT, esos prevalecen -- el backend se encarga de no
+  // sobrescribirlos, aqui solo se manda lo que se leyo.
+  window.tramyGuardarVehiculo = function(datos){
+    if(!window.tramyCurrentUserId) return;
+    if(!datos.placa) return;
+    var API = 'https://consulta-impuestos-production.up.railway.app';
+    fetch(API + '/guardar-vehiculo-ocr', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        placa: datos.placa, municipio: datos.municipio || null,
+        tipo_documento: datos.tipo_documento || null, cedula: datos.cedula || null,
+        apellidos: datos.apellidos || null, clase: datos.clase || null,
+        marca: datos.marca || null, linea: datos.linea || null, modelo: datos.modelo || null,
+        cilindrada: datos.cilindrada || null, servicio: datos.servicio || null,
+        carroceria: datos.carroceria || null, limitacion_propiedad: datos.limitacion_propiedad || null,
+        user_id: window.tramyCurrentUserId
+      })
+    }).catch(function(){});
+  };
+
+  // Trae la lista de vehiculos guardados y la muestra como chips seleccionables.
+  window.tramyCargarVehiculosGuardados = function(){
+    if(!window.tramySupabaseClient || !window.tramyCurrentUserId) return;
+    window.tramySupabaseClient.from('vehiculos_guardados')
+      .select('*').eq('user_id', window.tramyCurrentUserId)
+      .order('actualizado_en', { ascending: false })
+      .then(function(res){
+        if(!res.data || res.data.length === 0) return;
+        window.tramyVehiculosGuardados = res.data;
+        window.tramyRenderVehiculosGuardados();
+      });
+  };
+
+  window.tramyRenderVehiculosGuardados = function(){
+    var panel = document.getElementById('tramyVehiculosPanel');
+    var lista = document.getElementById('tramyVehiculosLista');
+    if(!panel || !lista) return;
+    lista.innerHTML = '';
+    window.tramyVehiculosGuardados.forEach(function(v){
+      var chip = document.createElement('button');
+      chip.type = 'button';
+      chip.textContent = v.placa + (v.marca ? ' · ' + v.marca : '');
+      chip.style.cssText = 'padding:8px 14px; border-radius:20px; border:1.5px solid #1a2340; background:#fff; color:#1a2340; font-weight:600; font-size:13.5px; cursor:pointer;';
+      chip.onclick = function(){
+        if(typeof window.aplicarDatosLeidos === 'function'){
+          window.aplicarDatosLeidos(v);
+        }
+      };
+      lista.appendChild(chip);
+    });
+    panel.style.display = 'block';
+  };
+
+  function tramyMostrarResultadoRUNT(r, esGuardadoPrevio, idDestino){
+    var resultadoBox = document.getElementById(idDestino || 'tramyRuntResultado');
+    var lineas = [];
+
+    lineas.push('<b>' + (esGuardadoPrevio ? '📋 Datos guardados de una consulta anterior' : '✅ Consulta RUNT completada') + '</b>');
+    if(r.leido_en){
+      lineas.push('<span style="color:#5B6472; font-size:12.5px;">Datos leídos el ' + r.leido_en + '</span>');
+    }
+    lineas.push('SOAT: ' + (r.soat_vigente ? ('vigente hasta ' + (r.soat_fecha_fin || '')) : 'NO vigente'));
+    lineas.push('RTM: ' + (r.rtm_vigente ? ('vigente hasta ' + (r.rtm_fecha_fin || '')) : 'NO vigente'));
+    lineas.push('Gravámenes a la propiedad: ' + (r.gravamenes_propiedad ? 'SI' : 'NO'));
+
+    if(r.ultimo_tramite_tipo){
+      lineas.push('Último trámite: ' + r.ultimo_tramite_tipo + (r.ultimo_tramite_fecha ? ' (' + r.ultimo_tramite_fecha + ')' : ''));
+    }
+
+    if(r.garantia_inscripcion_id_prenda){
+      lineas.push('Garantía mobiliaria - Inscripción de prenda registrado por ' + (r.garantia_inscripcion_entidad || ''));
+    }
+    if(r.garantia_levantamiento_id_prenda){
+      lineas.push('Garantía mobiliaria - Levantamiento de prenda registrado por ' + (r.garantia_levantamiento_entidad || ''));
+    }
+    if(!r.garantia_inscripcion_id_prenda && !r.garantia_levantamiento_id_prenda){
+      lineas.push('Sin garantías mobiliarias (prendas) registradas.');
+    }
+
+    if(r.garantia_favor_acreedor){
+      lineas.push('Garantía a favor de: ' + r.garantia_favor_acreedor);
+    }
+
+    resultadoBox.innerHTML = lineas.join('<br>');
+  }
+
+  // Escribe los datos del RUNT en los campos del formulario. El RUNT manda:
+  // sobrescribe lo que haya del OCR en los mismos campos.
+  // Extrae el nombre del municipio desde el texto de "Autoridad de Transito"
+  // del RUNT (ej. "STRIA TTOYTTE MCPAL LA ESTRELLA" -> "LA ESTRELLA"),
+  // comparando contra la lista de municipios conocidos. Se revisan los mas
+  // largos primero para que los de varias palabras (ej. "LA ESTRELLA")
+  // no se confundan con coincidencias parciales.
+  function tramyExtraerMunicipioDeAutoridad(texto){
+    if(!texto || !window.ANT_MUNICIPIOS) return '';
+    var limpio = texto.toUpperCase().trim()
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, ''); // quitar tildes
+    var candidatos = window.ANT_MUNICIPIOS.slice().sort(function(a,b){ return b.length - a.length; });
+    for(var i = 0; i < candidatos.length; i++){
+      if(limpio.indexOf(candidatos[i]) !== -1){
+        return candidatos[i];
+      }
+    }
+    return '';
+  }
+
+  // Determina si el vehiculo se considera "nuevo" para efectos de si ya le
+  // corresponde tener revision tecnico-mecanica: motos/motocarros y
+  // vehiculos de servicio publico son nuevos hasta los 2 años; los demas
+  // (carros particulares) hasta los 5 años. Devuelve true/false, o null si
+  // no hay fecha de matricula para calcularlo.
+  // Lleva la placa actual a las demas secciones (Revision, Ejecucion,
+  // Utilidades) por la URL, para que todo el trabajo quede ligado al
+  // mismo vehiculo al moverse entre secciones.
+  window.tramyActualizarLinksSecciones = function(placa, vigencias){
+    if(!placa) return;
+    ['tramyTabRevision', 'tramyTabEjecucion', 'tramyTabUtilidades'].forEach(function(id){
+      var el = document.getElementById(id);
+      if(!el) return;
+      var base = el.getAttribute('href').split('?')[0];
+      var url = base + '?placa=' + encodeURIComponent(placa);
+      if(vigencias && vigencias.length) url += '&vigencias=' + encodeURIComponent(vigencias.join(','));
+      el.setAttribute('href', url);
+    });
+  };
+
+  // Si se llega a Liquidacion con una placa en la URL (viniendo de otra
+  // seccion), se actualizan los enlaces de una vez con esa misma placa.
+  (function(){
+    var params = new URLSearchParams(window.location.search);
+    var placaUrl = params.get('placa');
+    if(placaUrl) window.tramyActualizarLinksSecciones(placaUrl);
+  })();
+
+  function tramyEsVehiculoNuevo(r){
+    if(!r.fecha_matricula_inicial) return null;
+    var fechaMat = new Date(r.fecha_matricula_inicial);
+    if(isNaN(fechaMat.getTime())) return null;
+
+    var edadAnios = (new Date() - fechaMat) / (1000 * 60 * 60 * 24 * 365.25);
+    var clase = (r.clase || '').toUpperCase();
+    var servicio = (r.servicio || '').toUpperCase();
+    var esMotoOMotocarro = clase.indexOf('MOTO') !== -1;
+    var esPublico = servicio.indexOf('PUBLIC') !== -1;
+    var umbralAnios = (esMotoOMotocarro || esPublico) ? 2 : 5;
+
+    return edadAnios < umbralAnios;
+  }
+
+  // Colorea filas completas del formulario segun lo que indiquen los datos
+  // del RUNT, para que salten a la vista los puntos de atencion.
+  function tramyAplicarColoresRunt(r, esVehiculoNuevo){
+    var ROJO  = '#fbdcdc';
+    var VERDE = '#dcf5df';
+
+    function colorear(id, color){
+      var el = document.getElementById(id);
+      if(!el) return;
+      var fila = el.closest('.ant-group');
+      if(fila) fila.style.background = color || '';
+    }
+
+    // Gravamenes a la Propiedad (fusionado con Prenda) -- rojo si SI
+    colorear('ant-limitacion-propiedad', r.gravamenes_propiedad ? ROJO : '');
+
+    // Limitaciones a la Propiedad -- rojo si hay alguna registrada
+    colorear('ant-limitaciones-propiedad', r.limitacion_tipo ? ROJO : '');
+
+    // Garantia Mobiliaria -- verde si hay alguna registrada (inscripcion o levantamiento)
+    var hayGarantiaMobiliaria = !!(r.garantia_inscripcion_id_prenda || r.garantia_levantamiento_id_prenda);
+    colorear('ant-garantia-mobiliaria', hayGarantiaMobiliaria ? VERDE : '');
+
+    // SOAT -- verde si vigente, rojo si no
+    colorear('ant-soat', r.soat_vigente ? VERDE : ROJO);
+
+    // Fecha Matricula Inicial -- verde si el vehiculo es nuevo
+    colorear('ant-fecha_matricula', esVehiculoNuevo === true ? VERDE : '');
+
+    // RTM -- verde si vigente, o si esta exento por ser nuevo y no tener
+    // informacion registrada (no le corresponde aun); rojo en otro caso.
+    var rtmExento = (esVehiculoNuevo === true) && !r.rtm_fecha_fin;
+    if(r.rtm_vigente || rtmExento){
+      colorear('ant-rtm', VERDE);
+    } else {
+      colorear('ant-rtm', ROJO);
+    }
+
+    // Fecha Ultimo Traspaso -- rojo si el traspaso fue hace menos de 3
+    // meses (umbral aproximado; falta confirmar con la Gobernacion de
+    // Antioquia el tiempo real que tardan en actualizar su base de datos
+    // tras un traspaso). Esto alerta de que puede que a un no se pueda
+    // consultar el impuesto/retefuente actual con el propietario nuevo.
+    var tipoTramiteNorm2 = (r.ultimo_tramite_tipo || '').toUpperCase();
+    if(tipoTramiteNorm2.indexOf('TRASPASO') !== -1 && r.ultimo_tramite_fecha){
+      var fechaTraspaso = new Date(r.ultimo_tramite_fecha);
+      if(!isNaN(fechaTraspaso.getTime())){
+        var mesesDesdeTraspaso = (new Date() - fechaTraspaso) / (1000 * 60 * 60 * 24 * 30.44);
+        colorear('ant-fecha-ultimo-traspaso', mesesDesdeTraspaso < 3 ? ROJO : '');
+      }
+    } else {
+      colorear('ant-fecha-ultimo-traspaso', '');
+    }
+  }
+
+  // Muestra, dentro del modulo de Impuesto Departamental, una alerta
+  // cuando el ultimo tramite del vehiculo fue un traspaso hecho hace
+  // menos de 3 meses -- explica por que puede fallar la consulta y si el
+  // impuesto departamental se puede dar por al dia o no.
+  // Para tramites MUNICIPALES: a diferencia del departamental (que es
+  // especifico de traspaso, por el tema de que la Gobernacion tarda en
+  // actualizar al propietario nuevo), aqui aplica CUALQUIER tramite -- ya
+  // que en los municipios, para poder hacer casi cualquier tramite hay
+  // que estar a paz y salvo del impuesto municipal. Excepciones: revision
+  // tecnico-mecanica, SOAT, y certificado de tradicion, que no requieren
+  // estar a paz y salvo para expedirse.
+  var TRAMITES_EXCLUIDOS_PAZ_SALVO_MUNICIPAL = ['TECNICOMECANICA', 'TECNICO MECANICA', 'TECNOMECANICA', 'SOAT', 'TRADICION'];
+
+  function tramyRevisarPazSalvoMunicipalPorTramite(r){
+    window._tramyMunicipioAlDiaPorTramite = false;
+    window._tramyMunicipioAlDiaFechaTexto = '';
+
+    var tipoTramiteNorm = (r.ultimo_tramite_tipo || '').toUpperCase();
+    if(!tipoTramiteNorm || !r.ultimo_tramite_fecha) return;
+
+    var esExcluido = TRAMITES_EXCLUIDOS_PAZ_SALVO_MUNICIPAL.some(function(palabra){
+      return tipoTramiteNorm.indexOf(palabra) !== -1;
+    });
+    if(esExcluido) return;
+
+    var fechaTramite = new Date(r.ultimo_tramite_fecha);
+    if(isNaN(fechaTramite.getTime())) return;
+
+    var mismoAnio = (fechaTramite.getFullYear() === new Date().getFullYear());
+    if(!mismoAnio) return;
+
+    window._tramyMunicipioAlDiaPorTramite = true;
+    window._tramyMunicipioAlDiaFechaTexto = r.ultimo_tramite_fecha;
+  }
+
+  function tramyRevisarAlertaTraspasoDepto(r){
+    window._tramyTraspasoRecienteMismoAnio = false;
+
+    var caja = document.getElementById('ant-alerta-traspaso-depto');
+    var cajaVerde = document.getElementById('ant-alerta-traspaso-depto-verde');
+    if(!caja || !cajaVerde) return;
+
+    var tipoTramiteNorm = (r.ultimo_tramite_tipo || '').toUpperCase();
+    if(tipoTramiteNorm.indexOf('TRASPASO') === -1 || !r.ultimo_tramite_fecha){
+      caja.style.display = 'none';
+      cajaVerde.style.display = 'none';
+      return;
+    }
+
+    var fechaTraspaso = new Date(r.ultimo_tramite_fecha);
+    if(isNaN(fechaTraspaso.getTime())){
+      caja.style.display = 'none';
+      cajaVerde.style.display = 'none';
+      return;
+    }
+
+    var hoy = new Date();
+    var mesesDesdeTraspaso = (hoy - fechaTraspaso) / (1000 * 60 * 60 * 24 * 30.44);
+    if(mesesDesdeTraspaso >= 3){
+      caja.style.display = 'none';
+      cajaVerde.style.display = 'none';
+      return;
+    }
+
+    var fechaTexto = r.ultimo_tramite_fecha;
+    var mismoAnio = (fechaTraspaso.getFullYear() === hoy.getFullYear());
+    window._tramyTraspasoRecienteMismoAnio = mismoAnio;
+
+    if(mismoAnio){
+      cajaVerde.innerHTML = '✓ El impuesto Departamental está al día.<br>Último traspaso realizado el día ' + fechaTexto;
+      cajaVerde.style.display = 'block';
+      caja.innerHTML = 'El haber realizado traspaso este mismo año significa que el vehículo está al día en la Gobernación. Sin embargo, también significa que el propietario ha cambiado, y como el traspaso fue hace menos de tres meses es muy posible que el módulo te dé error de propietario, ya que la Gobernación de Antioquia se tarda más o menos ese mismo tiempo para actualizar el propietario.'
+        + '<br>Sin embargo, puedes intentarlo.'
+        + '<br>Si necesitas el retefuente, más abajo hay un módulo para eso.';
+      caja.style.display = 'block';
+    } else {
+      cajaVerde.style.display = 'none';
+      caja.innerHTML = 'Ten en cuenta que el último traspaso realizado a este vehículo fue el día ' + fechaTexto + '. O sea, hace menos de tres meses, así que es posible que el propietario actual de este vehículo aún no esté actualizado en la Gobernación, por eso te puede dar error.'
+        + '<br>El impuesto departamental puede no estar al día, si quieres consultarlo deberás llamar a la línea de atención al cliente de la Gobernación 604 444 4666.'
+        + '<br>Si necesitas el retefuente, más abajo hay un módulo para eso.';
+      caja.style.display = 'block';
+    }
+  }
+
+  function tramyPoblarCamposDesdeRUNT(r){
+    var mapa = {
+      'ant-marca': r.marca, 'ant-linea': r.linea, 'ant-modelo': r.modelo,
+      'ant-clase': r.clase, 'ant-servicio': r.servicio, 'ant-cilindrada': r.cilindrada,
+      'ant-carroceria': r.carroceria, 'ant-color': r.color,
+      'ant-numero_serie': r.numero_serie, 'ant-numero_motor': r.numero_motor,
+      'ant-numero_chasis': r.numero_chasis, 'ant-vin': r.vin,
+      'ant-combustible': r.combustible,
+      'ant-puertas': r.puertas, 'ant-capacidad_carga': r.capacidad_carga,
+      'ant-peso_bruto': r.peso_bruto_vehicular, 'ant-capacidad_pasajeros': r.capacidad_pasajeros,
+      'ant-capacidad': r.pasajeros_sentados, 'ant-numero_ejes': r.numero_ejes,
+      'ant-estado_vehiculo': r.estado_vehiculo, 'ant-fecha_matricula': r.fecha_matricula_inicial
+    };
+    Object.keys(mapa).forEach(function(id){
+      var el = document.getElementById(id);
+      if(el && mapa[id] !== undefined && mapa[id] !== null && mapa[id] !== ''){
+        el.value = mapa[id];
+      }
+    });
+
+    // Municipio: usa el guardado directo (viene del OCR) si existe; si no,
+    // lo extrae de "Autoridad de Transito" (caso RUNT). Usa la misma
+    // funcion/efectos que si el usuario lo hubiera escogido manualmente
+    // (activa impuestos departamentales/municipales y tramites).
+    var municipioDetectado = r.municipio || tramyExtraerMunicipioDeAutoridad(r.autoridad_transito);
+    if(r.autoridad_transito) window.tramyUltimoAutoridadTransito = r.autoridad_transito;
+    if(municipioDetectado && typeof window.selMunicipio === 'function'){
+      window.selMunicipio(municipioDetectado);
+    }
+
+    // Identificacion del propietario -- el RUNT nunca la trae, asi que solo
+    // se llena desde el cache si el campo esta VACIO. Nunca se sobrescribe
+    // lo que el usuario ya escribio (eso fue justo el bug: escribir una
+    // cedula nueva quedaba "atascado" porque el cache reponia la vieja).
+    var tipoDocEl = document.getElementById('ant-tipodoc');
+    if(tipoDocEl && r.propietario_tipo_documento && !tipoDocEl.value) tipoDocEl.value = r.propietario_tipo_documento;
+
+    var cedulaEl = document.getElementById('ant-cedula');
+    if(cedulaEl && r.propietario_cedula && !cedulaEl.value.trim()) cedulaEl.value = r.propietario_cedula;
+
+    var apellidosEl = document.getElementById('ant-apellidos');
+    if(apellidosEl && r.propietario_nombre && !apellidosEl.value.trim()) apellidosEl.value = r.propietario_nombre;
+
+    var gravamenes = document.getElementById('ant-limitacion-propiedad');
+    if(gravamenes){
+      gravamenes.value = r.gravamenes_propiedad ? 'SI' : 'NO';
+      gravamenes.dispatchEvent(new Event('change'));
+    }
+
+    var soat = document.getElementById('ant-soat');
+    if(soat) soat.value = r.soat_vigente ? ('Vigente hasta ' + (r.soat_fecha_fin || '')) : 'NO vigente';
+
+    var esVehiculoNuevo = tramyEsVehiculoNuevo(r);
+    var rtmExento = (esVehiculoNuevo === true) && !r.rtm_fecha_fin;
+
+    var rtm = document.getElementById('ant-rtm');
+    if(rtm){
+      if(r.rtm_vigente){
+        rtm.value = 'Vigente hasta ' + (r.rtm_fecha_fin || '');
+      } else if(rtmExento){
+        rtm.value = 'No aplica aún (vehículo nuevo)';
+      } else {
+        rtm.value = 'NO vigente';
+      }
+    }
+
+    var tramite = document.getElementById('ant-ultimo-tramite');
+    if(tramite) tramite.value = r.ultimo_tramite_tipo ? (r.ultimo_tramite_tipo + (r.ultimo_tramite_fecha ? ' (' + r.ultimo_tramite_fecha + ')' : '')) : 'Sin información';
+
+    // Fecha de ultimo traspaso -- solo se sabe si el traspaso fue
+    // justamente el ultimo tramite hecho al vehiculo (si despues hubo
+    // otro tramite, el RUNT ya no muestra la fecha del traspaso aparte).
+    var fechaTraspasoEl = document.getElementById('ant-fecha-ultimo-traspaso');
+    if(fechaTraspasoEl){
+      var tipoTramiteNorm = (r.ultimo_tramite_tipo || '').toUpperCase();
+      if(tipoTramiteNorm.indexOf('TRASPASO') !== -1 && r.ultimo_tramite_fecha){
+        fechaTraspasoEl.value = r.ultimo_tramite_fecha;
+      } else {
+        fechaTraspasoEl.value = 'Sin traspaso reciente registrado como último trámite';
+      }
+    }
+
+    var garantiaFavor = document.getElementById('ant-garantia-favor');
+    if(garantiaFavor) garantiaFavor.value = r.garantia_favor_acreedor || 'Sin información';
+
+    var garantiaMob = document.getElementById('ant-garantia-mobiliaria');
+    if(garantiaMob){
+      if(r.garantia_inscripcion_id_prenda){
+        garantiaMob.value = 'Inscripción registrada por ' + (r.garantia_inscripcion_entidad || '');
+      } else if(r.garantia_levantamiento_id_prenda){
+        garantiaMob.value = 'Levantamiento registrado por ' + (r.garantia_levantamiento_entidad || '');
+      } else {
+        garantiaMob.value = 'Sin garantías mobiliarias registradas';
+      }
+    }
+
+    var limitacionesEl = document.getElementById('ant-limitaciones-propiedad');
+    if(limitacionesEl){
+      if(r.limitacion_tipo){
+        limitacionesEl.value = r.limitacion_tipo + (r.limitacion_entidad ? ' - ' + r.limitacion_entidad : '');
+      } else {
+        limitacionesEl.value = 'Sin limitaciones registradas';
+      }
+    }
+
+    tramyAplicarColoresRunt(r, esVehiculoNuevo);
+    tramyRevisarAlertaTraspasoDepto(r);
+    tramyRevisarPazSalvoMunicipalPorTramite(r);
+
+    var placaInput = document.getElementById('ant-placa');
+    if(placaInput && r.placa) placaInput.value = r.placa;
+
+    var placaEditarEl = document.getElementById('ant-placa-editar');
+    if(placaEditarEl && r.placa){
+      placaEditarEl.value = r.placa;
+      placaEditarEl.dispatchEvent(new Event('input'));
+    }
+  }
+
+  // Se dispara automaticamente cuando hay tipo de documento + numero de
+  // documento + placa (ya sea escritos a mano o leidos por OCR). Revisa el
+  // cache global (de cualquier usuario, para ahorrar 2Captcha): si hay algo
+  // reciente lo trae con la fecha y opcion de refrescar; si no, muestra un
+  // boton para consultar (nunca consulta sola, sin que el usuario lo pida).
+  window.tramyVerificarDisponibilidadRunt = async function(){
+    var estadoBox = document.getElementById('tramyRuntEstadoInfo');
+    if(!estadoBox) return;
+
+    // Esta funcion tiene costo potencial (2Captcha), asi que solo aplica
+    // para la cuenta Premium -- para Free, nunca se muestra nada aqui.
+    if(!window.tramyProfile || window.tramyProfile.role !== 'admin'){
+      estadoBox.style.display = 'none';
+      return;
+    }
+
+    var tipoDocEl = document.getElementById('ant-tipodoc');
+    var tipoDoc = tipoDocEl ? tipoDocEl.value : '';
+    var cedula  = (document.getElementById('ant-cedula').value || '').trim();
+    var placaEditarEl = document.getElementById('ant-placa-editar');
+    var placa = (placaEditarEl ? placaEditarEl.value : (document.getElementById('ant-placa').value || '')).trim().toUpperCase();
+
+    if(!tipoDoc || !cedula || !placa){
+      estadoBox.style.display = 'none';
+      return;
+    }
+
+    var API = 'https://consulta-impuestos-production.up.railway.app';
+    estadoBox.style.display = 'block';
+    estadoBox.innerHTML = '⏳ Revisando si ya tenemos datos guardados de esta placa...';
+
+    try{
+      var resp = await fetch(API + '/vehiculo-runt-guardado?placa=' + encodeURIComponent(placa));
+      var data = await resp.json();
+
+      if(data && data.placa){
+        tramyPoblarCamposDesdeRUNT(data);
+        estadoBox.innerHTML =
+          '📋 Datos leídos el ' + (data.leido_en || '') + '. ' +
+          '<button onclick="tramyConsultarRUNTForzado()" style="margin-left:6px; padding:4px 10px; border-radius:6px; border:none; background:#1a2340; color:#fff; font-size:12px; cursor:pointer;">Consultar de nuevo</button>';
+
+        // Igual queda registrado en "Mis vehiculos consultados", aunque el
+        // dato haya venido del cache y no de una consulta nueva.
+        if(window.tramyCurrentUserId){
+          fetch(API + '/registrar-mi-consulta?user_id=' + encodeURIComponent(window.tramyCurrentUserId) +
+            '&placa=' + encodeURIComponent(placa) + '&cedula=' + encodeURIComponent(cedula)).catch(function(){});
+        }
+      } else {
+        estadoBox.innerHTML =
+          '<button onclick="tramyConsultarRUNTForzado()" style="padding:9px 16px; border-radius:8px; border:none; background:#1a2340; color:#fff; font-size:13px; font-weight:600; cursor:pointer;">🔎 Consultar datos en el RUNT</button>';
+      }
+    } catch(err){
+      estadoBox.style.display = 'none';
+      console.log('Error revisando cache RUNT:', err);
+    }
+  };
+
+  // Dispara la verificacion automaticamente mientras se escriben los datos
+  // a mano (con una pequeña espera, para no disparar una peticion por cada
+  // tecla), y tambien cuando cambia el tipo de documento. Solo para Premium.
+  var tramyVerificarRuntTimeout = null;
+  document.addEventListener('input', function(e){
+    if(!e.target || (e.target.id !== 'ant-cedula' && e.target.id !== 'ant-placa-editar')) return;
+    if(!window.tramyProfile || window.tramyProfile.role !== 'admin') return;
+    clearTimeout(tramyVerificarRuntTimeout);
+    tramyVerificarRuntTimeout = setTimeout(window.tramyVerificarDisponibilidadRunt, 500);
+  });
+  document.addEventListener('change', function(e){
+    if(!e.target || e.target.id !== 'ant-tipodoc') return;
+    if(!window.tramyProfile || window.tramyProfile.role !== 'admin') return;
+    window.tramyVerificarDisponibilidadRunt();
+  });
+
+  // Fuerza una consulta nueva al RUNT (con costo de 2Captcha), sin importar
+  // si ya habia algo guardado.
+  // Abre el panel para elegir el tramite y generar el FUN diligenciado.
+  window.tramyAbrirGenerarFUN = function(){
+    var panel = document.getElementById('tramyFunPanel');
+    var abrir = panel.style.display !== 'block';
+    panel.style.display = abrir ? 'block' : 'none';
+    if(abrir){
+      document.getElementById('tramyFunSeleccionTramite').style.display = 'block';
+      document.getElementById('tramyFunResultado').style.display = 'none';
+    }
+  };
+
+  // Mostrar el campo de "municipio de destino" solo si el tramite elegido
+  // es un traslado.
+  document.addEventListener('change', function(e){
+    if(e.target && e.target.id === 'tramyFunTramite'){
+      var esTraslado = e.target.value.indexOf('TRASLADO') !== -1;
+      document.getElementById('tramyFunTrasladoWrap').style.display = esTraslado ? 'block' : 'none';
+    }
+  });
+
+  window.tramyGenerarFUN = async function(){
+    var resultado = document.getElementById('tramyFunResultado');
+    resultado.style.display = 'block';
+    resultado.innerHTML = '⏳ Generando el FUN... esto puede tardar 10-20 segundos.';
+
+    function val(id){
+      var el = document.getElementById(id);
+      return el ? el.value.trim() : '';
+    }
+
+    var datos = {
+      placa: val('ant-placa-editar'),
+      municipio: val('ant-municipio') || val('ant-municipio-input'),
+      autoridad_transito: window.tramyUltimoAutoridadTransito || '',
+      servicio: val('ant-servicio'),
+      clase: val('ant-clase'),
+      marca: val('ant-marca'),
+      linea: val('ant-linea'),
+      modelo: val('ant-modelo'),
+      color: val('ant-color'),
+      cilindrada: val('ant-cilindrada'),
+      carroceria: val('ant-carroceria'),
+      capacidad: val('ant-capacidad'),
+      numero_serie: val('ant-numero_serie'),
+      numero_motor: val('ant-numero_motor'),
+      numero_chasis: val('ant-numero_chasis'),
+      vin: val('ant-vin'),
+      gravamenes_propiedad: val('ant-limitacion-propiedad') === 'SI',
+      fecha_matricula_inicial: val('ant-fecha_matricula'),
+      tramite: document.getElementById('tramyFunTramite').value,
+      traslado_municipio: val('tramyFunTrasladoMunicipio'),
+      // El formulario del FUN pide apellidos y nombres por separado, pero
+      // Tramy guarda el nombre completo en un solo campo -- se manda todo
+      // en "nombres" por ahora (se ve completo en el PDF, solo que en una
+      // sola columna en vez de repartido en Primer/Segundo Apellido).
+      propietario_nombres: val('ant-apellidos'),
+      propietario_documento: val('ant-cedula'),
+    };
+
+    try{
+      var API = 'https://consulta-impuestos-production.up.railway.app';
+      var resp = await fetch(API + '/generar-fun', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(datos)
+      });
+      var data = await resp.json();
+
+      if(data.ok && data.url){
+        resultado.innerHTML = '✅ FUN generado.<br><br>' +
+          '<a href="' + data.url + '" target="_blank" style="display:inline-block; padding:10px 18px; background:#1a6e3c; color:#fff; text-decoration:none; border-radius:8px; font-weight:700;">📄 Descargar FUN</a>';
+      } else {
+        resultado.innerHTML = '❌ ' + (data.error || 'Ocurrió un error generando el FUN.');
+      }
+    } catch(err){
+      resultado.innerHTML = '❌ Error de conexión: ' + err.message;
+    }
+  };
+
+  window.tramyConsultarRUNTForzado = async function(){
+    var placa  = (document.getElementById('ant-placa').value || '').trim().toUpperCase();
+    var cedula = (document.getElementById('ant-cedula').value || '').trim();
+    var estadoBox = document.getElementById('tramyRuntEstadoInfo');
+    estadoBox.style.display = 'block';
+
+    if(!placa || !cedula){
+      estadoBox.innerHTML = '⚠️ Escribe la placa y la cédula del propietario antes de consultar el RUNT.';
+      return;
+    }
+
+    var API = 'https://consulta-impuestos-production.up.railway.app';
+    estadoBox.innerHTML = '⏳ Consultando el RUNT... esto puede tardar 1-2 minutos.';
+
+    try{
+      var url = API + '/consultar-runt-vehiculo?placa=' + encodeURIComponent(placa) + '&cedula=' + encodeURIComponent(cedula);
+      if(window.tramyCurrentUserId) url += '&user_id=' + encodeURIComponent(window.tramyCurrentUserId);
+
+      var resp = await fetch(url);
+      var data = await resp.json();
+      if(!data.job_id){
+        if(data.limite_activo){
+          estadoBox.innerHTML = '⏳ ' + data.error;
+        } else {
+          estadoBox.innerHTML = '❌ No se pudo iniciar la consulta: ' + (data.error || 'error desconocido');
+        }
+        return;
+      }
+
+      var intentos = 0;
+      var intervalo = setInterval(async function(){
+        intentos++;
+        if(intentos > 40){
+          clearInterval(intervalo);
+          estadoBox.innerHTML = '❌ La consulta tardó demasiado. Intenta de nuevo.';
+          return;
+        }
+        var estadoResp = await fetch(API + '/consultar/estado?job_id=' + data.job_id);
+        var estado = await estadoResp.json();
+
+        if(estado.estado === 'listo'){
+          clearInterval(intervalo);
+          tramyPoblarCamposDesdeRUNT(estado.resultado);
+          estadoBox.innerHTML = '✅ Consulta RUNT completada (' + (estado.resultado.leido_en || '') + ')';
+        } else if(estado.estado === 'error'){
+          clearInterval(intervalo);
+          estadoBox.innerHTML = '❌ ' + (estado.mensaje || 'Ocurrió un error consultando el RUNT.');
+        } else {
+          estadoBox.innerHTML = '⏳ ' + (estado.mensaje || 'Consultando...');
+        }
+      }, 4000);
+    } catch(err){
+      estadoBox.innerHTML = '❌ Error de conexión: ' + err.message;
+    }
+  };
+
+  // Boton "Mis vehiculos consultados": abre un campo de busqueda con
+  // autocompletado sobre el historial PERSONAL (solo lo que este usuario
+  // especificamente ha consultado antes) -- se filtra en el servidor
+  // mientras se escribe, para que funcione bien aunque la lista crezca
+  // mucho (a diferencia de una lista fija de chips).
+  window.tramyAbrirMisVehiculosConsultados = function(){
+    var panel = document.getElementById('tramyMisVehiculosRuntPanel');
+    var abrir = panel.style.display !== 'block';
+    panel.style.display = abrir ? 'block' : 'none';
+
+    if(abrir && !window.tramyCurrentUserId){
+      document.getElementById('tramyMisVehiculosBuscar').placeholder = 'Inicia sesión para ver tu historial';
+    }
+    if(abrir){
+      document.getElementById('tramyMisVehiculosBuscar').focus();
+      window.tramyMisVehiculosFiltrar();
+    }
+  };
+
+  var tramyMisVehiculosTimeout = null;
+
+  window.tramyMisVehiculosFiltrar = function(){
+    var input = document.getElementById('tramyMisVehiculosBuscar');
+    var lista = document.getElementById('tramyMisVehiculosRuntLista');
+    var texto = input.value.trim().toUpperCase();
+
+    clearTimeout(tramyMisVehiculosTimeout);
+
+    if(!window.tramyCurrentUserId){
+      lista.style.display = 'none';
+      return;
+    }
+
+    // Espera un poco a que la persona deje de escribir, para no disparar
+    // una peticion por cada tecla.
+    tramyMisVehiculosTimeout = setTimeout(async function(){
+      var API = 'https://consulta-impuestos-production.up.railway.app';
+      try{
+        var resp = await fetch(API + '/mis-vehiculos-runt?user_id=' + encodeURIComponent(window.tramyCurrentUserId) +
+          (texto ? '&q=' + encodeURIComponent(texto) : ''));
+        var data = await resp.json();
+
+        if(!Array.isArray(data) || data.length === 0){
+          lista.innerHTML = '<div style="padding:12px; text-align:center; font-size:13px; color:#5B6472;">' +
+            (texto ? 'Sin resultados.' : 'Todavía no has consultado ningún vehículo en el RUNT.') + '</div>';
+          lista.style.display = 'block';
+          return;
+        }
+
+        lista.innerHTML = '';
+        data.forEach(function(v){
+          var item = document.createElement('div');
+          var etiquetaFuente = v.fuente === 'RUNT'
+            ? '<span style="color:#0F6E56; font-size:11px; font-weight:700;">✓ RUNT</span>'
+            : '<span style="color:#B23B2E; font-size:11px; font-weight:700;">parcial (OCR)</span>';
+          item.innerHTML = '<div style="display:flex; justify-content:space-between; align-items:center;">' +
+            '<span>' + v.placa + (v.marca ? ' · ' + v.marca : '') + (v.linea ? ' ' + v.linea : '') + '</span>' +
+            etiquetaFuente + '</div>';
+          item.title = 'Consultado el ' + (v.actualizado_en || '');
+          item.style.cssText = 'padding:10px 12px; cursor:pointer; font-size:13.5px; border-bottom:1px solid #EFE9DB;';
+          item.onmouseover = function(){ item.style.background = '#f4f6fb'; };
+          item.onmouseout = function(){ item.style.background = '#fff'; };
+          item.onclick = async function(){
+            var r = await fetch(API + '/vehiculo-runt-guardado?placa=' + encodeURIComponent(v.placa));
+            var datos = await r.json();
+            if(datos && datos.placa){
+              if(typeof window.antModoEntrada === 'function') window.antModoEntrada('manual');
+              tramyPoblarCamposDesdeRUNT(datos);
+              var estadoBox = document.getElementById('tramyRuntEstadoInfo');
+              estadoBox.style.display = 'block';
+              estadoBox.innerHTML = '📋 Datos leídos el ' + (datos.leido_en || '') +
+                '. <button onclick="tramyConsultarRUNTForzado()" style="margin-left:6px; padding:4px 10px; border-radius:6px; border:none; background:#1a2340; color:#fff; font-size:12px; cursor:pointer;">Consultar de nuevo</button>';
+            }
+            document.getElementById('tramyMisVehiculosRuntPanel').style.display = 'none';
+            input.value = '';
+            lista.style.display = 'none';
+          };
+          lista.appendChild(item);
+        });
+        lista.style.display = 'block';
+      } catch(err){
+        lista.innerHTML = '<div style="padding:12px; text-align:center; font-size:13px; color:#5B6472;">Error cargando el historial.</div>';
+        lista.style.display = 'block';
+      }
+    }, 300);
+  };
+
+  // Cerrar el desplegable si se hace clic afuera
+  document.addEventListener('click', function(e){
+    var lista = document.getElementById('tramyMisVehiculosRuntLista');
+    if(lista && !e.target.closest('#tramyMisVehiculosRuntPanel')){
+      lista.style.display = 'none';
+    }
+  });
+
+  (function(){
+    var SUPABASE_URL = 'https://ddndoxtmffoaklhwbmkq.supabase.co';
+    var SUPABASE_ANON_KEY = 'sb_publishable_x3cjuv1b2Uxq_-55-PsBqw_gCTto337';
+    var navClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    window.tramySupabaseClient = navClient;
+
+    navClient.auth.getSession().then(function(result){
+      var session = result.data.session;
+      if(!session) return;
+
+      window.tramyCurrentUserId = session.user.id;
+
+      navClient.from('profiles').select('*').eq('id', session.user.id).maybeSingle()
+        .then(function(res){
+          if(!res.data) return;
+          window.tramyProfile = res.data;
+
+          var displayName = res.data.full_name || session.user.email;
+          var link = document.getElementById('navAuthLink');
+          if(link){
+            link.textContent = '👤 ' + displayName;
+            link.href = 'panel.html';
+          }
+
+          // Inicializar el interruptor Asesor/Cliente Final con lo que el
+          // usuario haya configurado como predeterminado en su panel.
+          if(res.data.settings && res.data.settings.cliente_predeterminado){
+            window.tramyTipoClienteActual = res.data.settings.cliente_predeterminado;
+          }
+          window.tramyActualizarBotonesTipoCliente();
+
+          // Precargar el honorario guardado en el campo de liquidacion,
+          // por si el usuario ya llego a esa parte del formulario.
+          window.tramyAplicarHonorarioGuardado();
+          window.tramyAplicarConceptosPredeterminados();
+          window.tramyCargarVehiculosGuardados();
+
+          // Si se llega desde otra seccion (Revision, Ejecucion,
+          // Utilidades) con una placa en la URL, se carga automaticamente
+          // lo que ya tengamos guardado de ese vehiculo -- todo el trabajo
+          // queda ligado al mismo vehiculo sin repetir datos a mano.
+          (function(){
+            var paramsUrl = new URLSearchParams(window.location.search);
+            var placaUrl = paramsUrl.get('placa');
+            if(!placaUrl) return;
+            fetch(ANT_API + '/vehiculo-runt-guardado?placa=' + encodeURIComponent(placaUrl))
+              .then(function(r){ return r.json(); })
+              .then(function(datos){
+                if(datos && datos.placa){
+                  if(typeof window.antModoEntrada === 'function') window.antModoEntrada('manual');
+                  tramyPoblarCamposDesdeRUNT(datos);
+                  var estadoBox = document.getElementById('tramyRuntEstadoInfo');
+                  if(estadoBox){
+                    estadoBox.style.display = 'block';
+                    estadoBox.innerHTML = '📋 Datos leídos el ' + (datos.leido_en || '') +
+                      '. <button onclick="tramyConsultarRUNTForzado()" style="margin-left:6px; padding:4px 10px; border-radius:6px; border:none; background:#1a2340; color:#fff; font-size:12px; cursor:pointer;">Consultar de nuevo</button>';
+                  }
                 }
+              })
+              .catch(function(){});
+          })();
+
+          // Los botones de RUNT tienen costo real (2Captcha), asi que por
+          // ahora solo se muestran desde Plus en adelante (no para Free).
+          // Lo mismo para "Mis Vehiculos" y "Generar FUN". La Declaracion
+          // Sugerida se movio a la seccion de Utilidades (solo Master).
+          var esMaster = (res.data.role === 'admin');
+          var esPlus = (res.data.role === 'plus') || esMaster;
+          window.tramyEsAdmin = esMaster;
+          window.tramyEsPlus = esPlus;
+
+          if(esMaster){
+            ['tramyTabRevision', 'tramyTabEjecucion', 'tramyTabUtilidades'].forEach(function(id){
+              var el = document.getElementById(id);
+              if(el) el.style.display = 'inline-block';
             });
-            return resumen;
-        }
-    """) or {}
+
+            // Aviso de citas disponibles en Envigado -- exclusivo Master,
+            // usa el ultimo resultado ya guardado (rapido, sin consultar
+            // la API en vivo cada vez que alguien entra a Tramy). La
+            // revision en vivo se hace desde Ejecucion.
+            // OJO: se usa la URL directa (no la variable ANT_API) porque
+            // este bloque corre en un <script> anterior al que declara
+            // ANT_API -- usarla aqui rompia con "ANT_API is not defined"
+            // y eso cortaba toda la funcion, incluyendo la revelacion de
+            // los botones de Plus/Master mas abajo.
+            try {
+              fetch('https://consulta-impuestos-production.up.railway.app/envigado-citas-ultimo-resultado')
+                .then(function(r){ return r.json(); })
+                .then(function(data){
+                  if(!data.ok || !data.hay_citas) return;
+                  var caja = document.getElementById('tramyAvisoCitasEnvigado');
+                  var lista = data.disponibles.slice(0, 5).map(function(d){
+                    return '<b>' + d.sede + '</b> — ' + d.fecha + ' (' + d.cantidad_horarios + ' horarios)';
+                  }).join('<br>');
+                  caja.innerHTML = '🔔 <b>¡Hay citas disponibles en Envigado!</b><br>' + lista
+                    + '<br><a href="ejecucion.html" style="color:#1a5c2e; text-decoration:underline;">Ver en Ejecución →</a>';
+                  caja.style.display = 'block';
+                })
+                .catch(function(){});
+            } catch(e) { /* nunca debe tumbar el resto de la funcion */ }
+          }
+
+          if(esPlus){
+            var btnMisVehiculos = document.getElementById('btn-entrada-mis-vehiculos');
+            if(btnMisVehiculos) btnMisVehiculos.style.display = 'block';
+            var camposPremium = document.getElementById('tramyCamposPremium');
+            if(camposPremium) camposPremium.style.display = 'contents';
+            var btnFun = document.getElementById('ant-btn-fun');
+            if(btnFun) btnFun.style.display = 'block';
+          }
+        });
+    });
+  })();
+</script>
+
+<style>
+  .ant-app-navbar {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 9999;
+    background: #1a2340; height: 48px;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.18);
+  }
+  .ant-app-navbar-titulo {
+    font-family: Arial, sans-serif; font-size: 16px; font-weight: 900;
+    color: #fff; letter-spacing: 1px;
+  }
+  .ant-app-navbar-salir {
+    font-family: Arial, sans-serif; font-size: 13px; font-weight: 700;
+    color: #fff; text-decoration: none; padding: 6px 14px;
+    border: 1px solid rgba(255,255,255,0.3); border-radius: 6px;
+    transition: background .2s;
+  }
+  .ant-app-navbar-salir:hover { background: rgba(255,255,255,0.12); }
+
+  .ant-secciones-nav {
+    position: fixed; top: 48px; left: 0; right: 0; z-index: 9998;
+    background: #f4f6fb; border-bottom: 1px solid #dde3ec;
+    display: flex; gap: 4px; padding: 6px 12px; overflow-x: auto;
+  }
+  .tramy-seccion-tab {
+    font-family: Arial, sans-serif; font-size: 12.5px; font-weight: 700;
+    color: #5b6472; text-decoration: none; padding: 7px 14px;
+    border-radius: 7px; white-space: nowrap; transition: background .15s, color .15s;
+  }
+  .tramy-seccion-tab:hover { background: #e4e9f4; }
+  .tramy-seccion-tab.activa { background: #1a2340; color: #fff; }
+
+  .ant-wrap { max-width: 760px; margin: 0 auto; padding: 86px 8px 24px 8px; font-family: Arial, sans-serif; }
+
+  .ant-top { background: #fff; border: 1px solid #dde3ec; border-radius: 10px; padding: 13px 18px; margin-bottom: 10px; }
+  #ant-saludo { padding-top: 3px; padding-bottom: 6px; margin-bottom: 6px; margin-top: 0; }
+
+  .ant-card { background: #fff; border: 1px solid #dde3ec; border-radius: 10px; padding: 16px 18px; margin-bottom: 10px; display: none; }
+  .ant-card.visible { display: block; }
+  .ant-card-liq { background: #fff; border: 1px solid #dde3ec; border-radius: 10px; padding: 16px 18px; margin-bottom: 10px; }
+
+  .ant-bloque-titulo {
+    font-size: 15px; font-weight: 900; color: #fff;
+    background: #1a2340; border-radius: 7px;
+    padding: 11px 16px; margin-bottom: 16px;
+    display: flex; align-items: center; justify-content: space-between;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .ant-bloque-titulo-texto { flex: 1; text-align: center; }
+  .ant-bloque-titulo-chevron { font-size: 14px; min-width: 20px; text-align: right; }
+  .ant-bloque-titulo-left { min-width: 20px; }
+
+  .ant-bienvenida { text-align: center; padding: 2px 20px 2px; margin-bottom: 2px; }
+  .ant-bienvenida-titulo { font-size: 22px; font-weight: 900; color: #0047AB; margin-bottom: 6px; }
+  .ant-bienvenida-sub { font-size: 15px; color: #555; line-height: 1.6; }
+
+  /* Botones entrada */
+  .ant-entrada-btns { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+  .ant-entrada-btn {
+    flex: 1 1 calc(50% - 4px); padding: 10px 6px; border: 2px solid #dde3ec; border-radius: 9px;
+    background: #f8fafc; cursor: pointer; font-size: 12px; font-weight: 700;
+    color: #1a2340; text-align: center; transition: all .2s;
+  }
+  @media(min-width: 480px) { .ant-entrada-btn { flex: 1; } }
+  .ant-entrada-btn:hover { border-color: #3b7de8; background: #f0f6ff; color: #1a5fa8; }
+  .ant-entrada-btn.activo { border-color: #1a5fa8; background: #e8f0f8; color: #1a5fa8; }
+  .ant-entrada-btn .ant-entrada-icon { font-size: 22px; display: block; margin-bottom: 4px; }
+
+  /* Lista desplegable honorarios y cobros */
+  .ant-honorarios-wrap { position: relative; }
+  .ant-cobro-valor-wrap { position: relative; flex: 1; }
+  .ant-cobro-valor-wrap .ant-liq-input { width: 100%; box-sizing: border-box; }
+  .ant-chips-wrap { position: absolute; top: 100%; left: 0; right: 0; border: 0.5px solid var(--color-border-secondary,#ccd3de); border-radius: var(--border-radius-md,8px); overflow: hidden; margin-top: 3px; z-index: 1000; display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.10); max-height: 220px; overflow-y: auto; }
+  .ant-chip { display: flex; justify-content: space-between; align-items: center; padding: 9px 12px; font-size: 13px; cursor: pointer; color: var(--color-text-primary,#1a2340); border-bottom: 0.5px solid var(--color-border-tertiary,#eef0f5); background: var(--color-background-primary,#fff); transition: background .12s; }
+  .ant-chip:last-child { border-bottom: none; }
+  .ant-chip:hover { background: var(--color-background-secondary,#f5f7fa); }
+  .ant-chip.activo { background: #EAF3DE; color: #3B6D11; }
+  .ant-chip .ant-chip-check { font-size: 11px; color: #3B6D11; opacity: 0; }
+  .ant-chip.activo .ant-chip-check { opacity: 1; }
+  /* Autocomplete cobros (concepto) */
+  .ant-cobro-wrap { position: relative; }
+  .ant-cobro-lista { position: absolute; top: 100%; left: 0; right: 0; background: var(--color-background-primary,#fff); border: 0.5px solid var(--color-border-secondary,#ccd3de); border-radius: 8px; z-index: 1000; display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.10); max-height: 200px; overflow-y: auto; }
+  .ant-cobro-lista div { padding: 10px 12px; cursor: pointer; font-size: 14px; color: var(--color-text-primary,#1a2340); border-bottom: 0.5px solid var(--color-border-tertiary,#eef0f5); }
+  .ant-cobro-lista div:last-child { border-bottom: none; }
+  .ant-cobro-lista div:hover, .ant-cobro-lista div.activo { background: var(--color-background-secondary,#e8f0f8); font-weight: 500; }
+  /* Municipio */
+  .ant-mun-wrap { position: relative; }
+  .ant-mun-input {
+    width: 100%; padding: 10px 14px; border: 1px solid #ccd3de;
+    border-radius: 7px; font-size: 16px; box-sizing: border-box;
+    outline: none; transition: border .2s; background: #fff;
+    text-align: center;
+  }
+  .ant-mun-input:focus { border-color: #3b7de8; }
+  .ant-mun-lista {
+    border: 1px solid #ccd3de; border-top: none;
+    border-radius: 0 0 7px 7px; max-height: 200px;
+    overflow-y: auto; background: white;
+    position: absolute; width: 100%; z-index: 1000; display: none;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+  }
+  .ant-mun-lista div { padding: 10px 14px; cursor: pointer; font-size: 16px; text-align: center; }
+  .ant-mun-lista div:hover, .ant-mun-lista div.activo { background: #e8f0f8; font-weight: 600; }
+
+  /* OCR */
+  .ant-ocr-zone {
+    border: 2px dashed #3b7de8; border-radius: 10px; padding: 22px;
+    text-align: center; background: #f0f6ff; cursor: pointer;
+    margin-bottom: 14px; transition: background 0.2s; position: relative;
+  }
+  .ant-ocr-zone:hover, .ant-ocr-zone.dragover { background: #dceeff; border-color: #1a2340; }
+  #ant-ocr-segunda-slot.dragover #ant-ocr-segunda-placeholder { background: #dceeff; border-color: #1a2340; }
+  .ant-ocr-zone input[type="file"] { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; z-index: 2; }
+  .ant-ocr-icon { font-size: 30px; margin-bottom: 4px; }
+  .ant-ocr-texto { font-size: 14px; color: #3b7de8; font-weight: 600; }
+  .ant-ocr-sub { font-size: 12px; color: #888; margin-top: 3px; }
+  .ant-ocr-preview { max-height: 130px; border-radius: 7px; margin-top: 8px; border: 1px solid #ccd3de; position: relative; z-index: 1; display: block; margin-left: auto; margin-right: auto; }
+  .ant-ocr-status { font-size: 26px; line-height: 1.4; margin-top: 8px; padding: 12px 16px; border-radius: 6px; display: none; text-align: center; font-weight: 700; }
+  .ant-ocr-status.procesando { background: #fff3cd; color: #856404; }
+  .ant-ocr-status.ok  { background: #f0fff6; color: #1a6e3c; }
+  .ant-ocr-status.err { background: #fff0f0; color: #c0392b; }
+
+  /* Campos */
+  .ant-grid { display: flex; flex-direction: column; margin-bottom: 8px; border: 1px solid #dde3ec; border-radius: 6px; overflow: hidden; }
+  .ant-grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 14px; }
+  .ant-group {
+    position: relative; display: flex; align-items: stretch;
+    gap: 0; padding: 0; border-bottom: 1px solid #dde3ec; background: #fff;
+  }
+  .ant-group:nth-child(even) { background: #f7f9fc; }
+  /* Regla de "campo vacio en rojo" desactivada a peticion del usuario --
+     entraba en conflicto con los colores del RUNT (gravamenes, SOAT, RTM, etc.) */
+  .ant-group.ant-campo-vacio { }
+  .ant-group:last-child { border-bottom: none; }
+  .ant-label {
+    flex: 0 0 44%; text-align: left; font-size: 12.5px; font-weight: 700;
+    color: #1a2340; text-transform: none; letter-spacing: normal; margin: 0;
+    padding: 3px 8px; border-right: 1px solid #dde3ec;
+    display: flex; align-items: center;
+  }
+  .ant-input {
+    flex: 1 1 auto; min-width: 0; max-width: 56%; text-align: right;
+    padding: 3px 8px; border: none;
+    border-radius: 0; font-size: 13.5px; box-sizing: border-box;
+    outline: none; transition: background .15s; background: transparent;
+  }
+  .ant-input:focus { background: #eaf1ff; }
+  .ant-input.upper { text-transform: uppercase; }
+
+  /* Botones */
+  .ant-btn {
+    width: auto; padding: 9px 3px; border: none; border-radius: 7px;
+    font-size: 14px; font-weight: 700; cursor: pointer;
+    transition: background .2s; display: flex;
+    align-items: center; justify-content: center; gap: 8px; margin-top: 12px;
+    min-width: 140px; margin-left: auto; margin-right: auto;
+  }
+  .ant-btn-verde  { background: #1a6e3c; color: #fff; }
+  .ant-btn-verde:hover  { background: #2a9e5c; }
+  .ant-btn-azul   { background: #1a5fa8; color: #fff; }
+  .ant-btn-azul:hover   { background: #2a7fd8; }
+  .ant-btn-wa     { background: #25D366; color: #fff; }
+  .ant-btn-wa:hover     { background: #1da851; }
+  .ant-btn:disabled { background: #9aabc2; cursor: not-allowed; }
+
+  .ant-no-depto { background: #fff3cd; border: 1px solid #ffc107; border-radius: 7px; padding: 10px 14px; color: #856404; font-size: 13px; font-weight: 600; display: none; }
+
+  /* Tramites con autocomplete y X */
+  .ant-tramite-bloque { background: #f8fafc; border: 1px solid #e0e7ef; border-radius: 8px; padding: 12px; margin-bottom: 10px; position: relative; }
+  .ant-tramite-num { font-size: 11px; font-weight: 700; color: #1a5fa8; text-transform: uppercase; margin-bottom: 7px; display: flex; justify-content: space-between; align-items: center; }
+  .ant-tramite-x {
+    background: none; border: none; color: #c0392b; font-size: 18px; font-weight: 900;
+    cursor: pointer; padding: 0 4px; line-height: 1; display: none;
+  }
+  .ant-tramite-x:hover { color: #e74c3c; }
+
+  /* Autocomplete tramite */
+  .ant-tram-wrap { position: relative; }
+  .ant-tram-input {
+    width: 100%; padding: 9px 12px; border: 1px solid #ccd3de;
+    border-radius: 7px; font-size: 14px; box-sizing: border-box;
+    outline: none; background: #fff; transition: border .2s;
+  }
+  .ant-tram-input:focus { border-color: #3b7de8; }
+  .ant-tram-input:disabled { background: #f5f5f5; color: #999; cursor: not-allowed; }
+  .ant-tram-lista {
+    border: 1px solid #ccd3de; border-top: none;
+    border-radius: 0 0 7px 7px; max-height: 180px;
+    overflow-y: auto; background: white;
+    position: absolute; width: 100%; z-index: 1000; display: none;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  }
+  .ant-tram-lista div { padding: 9px 14px; cursor: pointer; font-size: 13px; }
+  .ant-tram-lista div:hover, .ant-tram-lista div.activo { background: #e8f0f8; font-weight: 600; }
+
+  .ant-tarifa-precio-inline {
+    display: none; margin-top: 7px; padding: 7px 12px;
+    background: #e8f5e9; border: 1px solid #a5d6a7; border-radius: 6px;
+    font-size: 14px; color: #1a6e3c; font-weight: 700;
+  }
+
+  /* Resultados */
+  .ant-result { margin-top: 12px; }
+  .ant-alert  { padding: 12px 16px; border-radius: 7px; font-size: 14px; margin-bottom: 10px; }
+  .ant-alert.error   { background: #fff0f0; border: 1px solid #f5c6c6; color: #c0392b; }
+  .ant-alert.success { background: #f0fff6; border: 1px solid #b2e4c8; color: #1a6e3c; }
+  .ant-alert.warning { background: #fffaf0; border: 1px solid #f5dba0; color: #7a4a00; }
+  .ant-info { display: flex; gap: 16px; margin-bottom: 12px; flex-wrap: wrap; }
+  .ant-info-item label { font-size: 11px; color: #888; display: block; margin-bottom: 2px; }
+  .ant-info-item span  { font-size: 13px; font-weight: 600; color: #1a2340; }
+  .ant-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .ant-table th { background: #f4f6fb; color: #555; font-weight: 600; padding: 8px 10px; text-align: left; border-bottom: 2px solid #dde3ec; }
+  .ant-table td { padding: 8px 10px; border-bottom: 1px solid #eef0f5; color: #333; }
+  .ant-table tr:last-child td { border-bottom: none; }
+  .ant-total-bar { display: flex; justify-content: space-between; align-items: center; background: #2a7fd8; color: #fff; border-radius: 7px; padding: 12px 16px; margin-top: 12px; }
+  .ant-total-bar span:first-child { font-size: 13px; opacity: .85; }
+  .ant-total-bar span:last-child  { font-size: 20px; font-weight: 700; }
+  .ant-extra { display: flex; justify-content: space-between; padding: 8px 14px; background: #f4f6fb; border-radius: 6px; margin-top: 6px; font-size: 13px; color: #444; }
+  .ant-loading { display: flex; align-items: center; gap: 12px; padding: 18px 0; color: #555; font-size: 14px; }
+  .ant-spinner-ring {
+    width: 28px; height: 28px; flex-shrink: 0;
+    background-image: url('tramy-logo-navbar.png');
+    background-size: contain; background-repeat: no-repeat; background-position: center;
+    animation: ant-pulso 1.1s ease-in-out infinite;
+  }
+  @keyframes ant-pulso {
+    0%, 100% { transform: scale(0.85); opacity: 0.7; }
+    50% { transform: scale(1.05); opacity: 1; }
+  }
+  @keyframes ant-spin { to { transform: rotate(360deg); } }
+  .ant-warning { background: #fff3cd; border: 1px solid #ffc107; border-radius: 7px; padding: 10px 14px; color: #856404; font-size: 13px; margin-top: 10px; }
+
+  /* Liquidacion */
+  .ant-liq-item { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid #eef0f5; }
+  .ant-liq-item:last-child { border-bottom: none; }
+  .ant-liq-nombre { font-size: 13px; color: #444; font-weight: 600; }
+  .ant-liq-input { width: 140px; padding: 7px 10px; border: 1px solid #ccd3de; border-radius: 6px; font-size: 13px; text-align: right; box-sizing: border-box; outline: none; }
+  .ant-liq-input:focus { border-color: #3b7de8; }
+  .ant-liq-total { background: #2a7fd8; color: #fff; border-radius: 8px; padding: 14px 18px; margin-top: 16px; display: flex; justify-content: space-between; align-items: center; }
+  .ant-liq-total span:first-child { font-size: 14px; opacity: .85; }
+  .ant-liq-total span:last-child  { font-size: 24px; font-weight: 900; }
+  .ant-liq-nota { font-size: 11px; color: #888; margin-top: 8px; text-align: center; }
+  .ant-liq-cobro { display: grid; grid-template-columns: 1fr 140px 32px; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid #eef0f5; }
+  .ant-liq-cobro-nombre { font-size: 13px; color: #444; border: 1px solid #ccd3de; border-radius: 6px; padding: 6px 10px; outline: none; width: 100%; box-sizing: border-box; background: #fff; }
+  .ant-liq-cobro-nombre:focus { border-color: #3b7de8; }
+  .ant-liq-btn-add { background: #1a5fa8; color: #fff; border: none; border-radius: 6px; width: 32px; height: 32px; font-size: 20px; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background .2s; flex-shrink: 0; }
+  .ant-liq-btn-add:hover { background: #2a7fd8; }
+  .ant-liq-btn-del { background: #c0392b; color: #fff; border: none; border-radius: 6px; width: 32px; height: 32px; font-size: 18px; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background .2s; flex-shrink: 0; }
+  .ant-liq-btn-del:hover { background: #e74c3c; }
+  .ant-wa-preview { margin-top: 12px; border-radius: 8px; overflow: hidden; border: 1px solid #dde3ec; display: none; }
+  .ant-wa-preview img { width: 100%; display: block; }
+
+  /* Tooltip ayuda */
+  .ant-ayuda-btn { background: none; border: 1.5px solid #fff; color: #fff; border-radius: 50%; width: 18px; height: 18px; font-size: 11px; font-weight: 900; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; margin-left: 6px; flex-shrink: 0; opacity: 0.85; transition: opacity .2s; }
+  .ant-ayuda-btn:hover { opacity: 1; }
+  .ant-ayuda-panel { display: none; background: #f0f6ff; border: 1px solid #b3d0f5; border-radius: 8px; padding: 12px 14px; margin-top: 10px; font-size: 13px; color: #1a2340; line-height: 1.6; }
+  .ant-ayuda-panel ol { margin: 6px 0 0 16px; padding: 0; }
+  .ant-ayuda-panel li { margin-bottom: 4px; }
+
+  .ant-progreso-wrap { padding: 14px; background: #f8fafc; border-radius: 8px; border: 1px solid #dde3ec; }
+  .ant-progreso-msg { font-size: 14px; color: #1a2340; font-weight: 600; margin-bottom: 10px; line-height: 1.4; }
+  .ant-progreso-barra-bg { background: #e0e7ef; border-radius: 10px; height: 10px; overflow: hidden; }
+  .ant-progreso-barra { background: linear-gradient(90deg, #1a5fa8, #25a06e); height: 10px; border-radius: 10px; width: 5%; transition: width 0.8s ease; }
+
+  /* Botón nueva liquidación */
+  .ant-fab-nuevo {
+    position: fixed; bottom: 20px; right: 20px; z-index: 9998;
+    width: 56px; height: 56px; border-radius: 50%;
+    background: #0047AB; color: #fff; border: none;
+    font-size: 32px; font-weight: 300; cursor: pointer;
+    box-shadow: 0 4px 12px rgba(0,71,171,0.4);
+    display: flex; align-items: center; justify-content: center;
+    transition: background .2s, transform .2s;
+    line-height: 1;
+  }
+  .ant-fab-nuevo:hover { background: #1a5fa8; transform: scale(1.08); }
+
+  /* Botón reporte */
+  .ant-reporte-btn {
+    position: fixed; bottom: 20px; left: 20px; z-index: 9998;
+    background: #1a2340; color: #fff; border: none; border-radius: 50px;
+    padding: 10px 16px; font-size: 12px; font-weight: 700; cursor: pointer;
+    box-shadow: 0 3px 10px rgba(0,0,0,0.2); transition: background .2s;
+    display: flex; align-items: center; gap: 6px; font-family: Arial, sans-serif;
+  }
+  .ant-reporte-btn:hover { background: #2a3a60; }
+  .ant-reporte-panel {
+    position: fixed; bottom: 70px; left: 20px; z-index: 9997;
+    background: #fff; border: 1px solid #dde3ec; border-radius: 12px;
+    padding: 18px; width: 280px; box-shadow: 0 6px 24px rgba(0,0,0,0.15);
+    display: none; font-family: Arial, sans-serif;
+  }
+  .ant-reporte-titulo { font-size: 14px; font-weight: 700; color: #1a2340; margin-bottom: 12px; }
+  .ant-reporte-opciones { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+  .ant-reporte-opcion {
+    padding: 6px 12px; border: 1px solid #dde3ec; border-radius: 20px;
+    font-size: 12px; cursor: pointer; transition: all .2s; color: #444;
+    background: #f8fafc;
+  }
+  .ant-reporte-opcion:hover, .ant-reporte-opcion.sel { background: #1a2340; color: #fff; border-color: #1a2340; }
+  .ant-reporte-textarea {
+    width: 100%; border: 1px solid #ccd3de; border-radius: 7px;
+    padding: 8px 10px; font-size: 12px; resize: none; outline: none;
+    box-sizing: border-box; margin-bottom: 10px; font-family: Arial, sans-serif;
+  }
+  .ant-reporte-textarea:focus { border-color: #3b7de8; }
+  .ant-reporte-enviar {
+    width: 100%; padding: 9px; background: #1a6e3c; color: #fff;
+    border: none; border-radius: 7px; font-size: 13px; font-weight: 700;
+    cursor: pointer; transition: background .2s;
+  }
+  .ant-reporte-enviar:hover { background: #2a9e5c; }
+  .ant-reporte-ok { font-size: 13px; color: #1a6e3c; font-weight: 700; text-align: center; display: none; margin-top: 8px; }
+
+  /* Retefuente */
+  .ant-ret-opcion {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 14px; border: 1px solid #dde3ec; border-radius: 7px;
+    margin-bottom: 8px; cursor: pointer; transition: background .2s;
+    font-size: 13px;
+  }
+  .ant-ret-opcion:hover { background: #f0f6ff; border-color: #3b7de8; }
+  .ant-ret-opcion.seleccionada { background: #e8f5e9; border-color: #1a6e3c; }
+  .ant-ret-opcion-nombre { color: #1a2340; font-weight: 600; flex: 1; }
+  .ant-ret-opcion-valor { color: #1a6e3c; font-weight: 700; text-align: right; min-width: 120px; }
+
+  /* Preview con orientación */
+  .ant-preview-wrap { display: none; margin-bottom: 12px; }
+  .ant-preview-aviso {
+    background: #fff3cd; border: 1px solid #ffc107; border-radius: 8px;
+    padding: 10px 14px; font-size: 15px; color: #856404; font-weight: 600;
+    margin-bottom: 8px; text-align: center;
+  }
+  .ant-preview-img-wrap { position: relative; text-align: center; margin-bottom: 8px; }
+  .ant-preview-img-wrap img { max-height: 180px; border-radius: 8px; border: 1px solid #ccd3de; transition: transform 0.3s; }
+  .ant-btn-girar {
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+    background: #1a5fa8; color: #fff; border: none; border-radius: 7px;
+    padding: 11px 24px; font-size: 15px; font-weight: 700; cursor: pointer;
+    margin: 0 auto 10px auto; transition: background .2s;
+  }
+  .ant-btn-girar:hover { background: #2a7fd8; }
+  .ant-btn-continuar {
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+    background: #1a6e3c; color: #fff; border: none; border-radius: 7px;
+    padding: 11px 24px; font-size: 15px; font-weight: 700; cursor: pointer;
+    margin: 0 auto; transition: background .2s; width: 100%;
+  }
+  .ant-btn-continuar:hover { background: #2a9e5c; }
+</style>
+
+<div class="ant-app-navbar">
+  <span class="ant-app-navbar-titulo" style="display:flex; align-items:center; gap:8px;">
+    <img src="tramy-logo-navbar.png" alt="Tramy" style="width:28px; height:28px; object-fit:contain;">
+    TRAMY
+  </span>
+  <div style="display:flex; gap:8px; align-items:center;">
+    <a href="login.html" class="ant-app-navbar-salir" id="navAuthLink">Iniciar sesión</a>
+    <a href="https://juridicox.com/" class="ant-app-navbar-salir">Salir →</a>
+  </div>
+</div>
+
+<div class="ant-secciones-nav">
+  <a href="index.html" id="tramyTabLiquidacion" class="tramy-seccion-tab activa">LIQUIDACIÓN</a>
+  <a href="revision.html" id="tramyTabRevision" class="tramy-seccion-tab" style="display:none;">REVISIÓN</a>
+  <a href="ejecucion.html" id="tramyTabEjecucion" class="tramy-seccion-tab" style="display:none;">EJECUCIÓN</a>
+  <a href="utilidades.html" id="tramyTabUtilidades" class="tramy-seccion-tab" style="display:none;">UTILIDADES</a>
+</div>
+
+<div class="ant-wrap">
+
+  <div id="tramyAvisoCitasEnvigado" style="display:none; background:#dcf5df; border:1.5px solid #8fd6a0; border-radius:8px; padding:12px 14px; margin-bottom:14px; font-size:13.5px; color:#1a5c2e;"></div>
+
+  <!-- SALUDO -->
+  <div class="ant-top" id="ant-saludo">
+    <div class="ant-bienvenida" id="ant-bienvenida">
+      <div style="text-align:center; margin-bottom:6px;">
+        <span style="font-size:18px; font-weight:900; color:#0047AB;">Hola, </span><span style="font-size:32px; font-weight:900; color:#0047AB;">soy Tramy</span>
+      </div>
+      <div style="font-size:16px; color:#1a2340; text-align:center; line-height:1.6; font-family:Arial, sans-serif; font-weight:700;">Hagamos esto juntos.<br>Yo liquido, tú haces la magia.</div>
+    </div>
+  </div>
+
+  <!-- OCR + Municipio -->
+  <div class="ant-top" id="bloque-info-top" style="display:block;">
+    <div id="contenido-info-top">
+
+    <!-- Encabezado Paso 1 -->
+    <div id="ant-paso1-header" class="ant-bloque-titulo" style="cursor:default;">
+      <span class="ant-bloque-titulo-left" style="opacity:0;">▼</span>
+      <span class="ant-bloque-titulo-texto">PASO 1 — INFORMACIÓN</span>
+      <span style="display:flex;align-items:center;gap:6px;">
+        <button class="ant-ayuda-btn" onclick="event.stopPropagation();antToggleAyuda('ayuda-paso1')" title="Ayuda">?</button>
+        <span class="ant-bloque-titulo-chevron" style="opacity:0;">▲</span>
+      </span>
+    </div>
+    <div id="ayuda-paso1" class="ant-ayuda-panel">
+      Puedes subir una foto de la tarjeta de propiedad por el lado de en frente, captura del RUNT, foto del formulario, compraventa o cualquier imagen en la que tengas todos o la mayoría de los datos del vehículo. También puedes tomar la foto directamente con la cámara del celular. Ten en cuenta que si faltan datos deberás llenarlos manualmente para poder entregarte toda la información necesaria para tu liquidación.
+    </div>
+
+    <!-- Botones de entrada -->
+    <div class="ant-entrada-btns">
+      <div class="ant-entrada-btn" id="btn-entrada-camara" onclick="antModoEntrada('camara')">
+        <span class="ant-entrada-icon">📷</span>
+        Tomar foto
+      </div>
+      <div class="ant-entrada-btn activo" id="btn-entrada-ocr" onclick="antModoEntrada('ocr')">
+        <span class="ant-entrada-icon">🖼️</span>
+        Subir o arrastrar
+      </div>
+      <div class="ant-entrada-btn" id="btn-entrada-runt" onclick="antModoEntrada('runt')">
+        <span class="ant-entrada-icon">📋</span>
+        Pegar datos del RUNT
+      </div>
+      <div class="ant-entrada-btn" id="btn-entrada-manual" onclick="antModoEntrada('manual')">
+        <span class="ant-entrada-icon">✏️</span>
+        Ingresar manualmente
+      </div>
+      <div class="ant-entrada-btn" id="btn-entrada-mis-vehiculos" onclick="tramyAbrirMisVehiculosConsultados()" style="display:none;">
+        <span class="ant-entrada-icon">📂</span>
+        Mis vehículos consultados
+      </div>
+    </div>
+
+    <div id="tramyMisVehiculosRuntPanel" style="display:none; margin-top:10px; padding:10px 12px; border-radius:8px; border:1.5px solid #dde3ec; background:#f8fafc;">
+      <div style="font-size:12.5px; font-weight:700; color:#5B6472; margin-bottom:8px; text-align:center;">Buscar en tus vehículos consultados</div>
+      <div style="position:relative;">
+        <input id="tramyMisVehiculosBuscar" type="text" maxlength="7" placeholder="Escribe una placa (ej. ABC123)" autocomplete="off"
+          oninput="tramyMisVehiculosFiltrar()"
+          style="width:100%; box-sizing:border-box; padding:10px 12px; border:1.5px solid #DAD3C2; border-radius:8px; font-size:14px; text-transform:uppercase;">
+        <div id="tramyMisVehiculosRuntLista" style="display:none; position:absolute; top:44px; left:0; right:0; background:#fff; border:1.5px solid #DAD3C2; border-radius:8px; z-index:50; max-height:240px; overflow-y:auto;"></div>
+      </div>
+    </div>
+
+    <!-- Input cámara (oculto) -->
+    <input type="file" id="ant-camara-file" accept="image/*" capture="environment" style="display:none">
+
+    <!-- Zona pegar datos del RUNT -->
+    <div id="ant-zona-runt" style="display:none; margin-bottom:14px;">
+      <label class="ant-label" style="display:block; margin-bottom:4px;" for="ant-runt-placa">Datos del RUNT por Placa</label>
+      <textarea id="ant-runt-placa" rows="5" placeholder="Pega aqui el texto copiado de la consulta del RUNT por placa..." style="
+        width:100%; box-sizing:border-box; padding:10px 12px; border:2px solid #d0dce8;
+        border-radius:6px; font-size:13px; font-family:inherit; resize:vertical;"></textarea>
+
+      <label class="ant-label" style="display:block; margin:12px 0 4px;" for="ant-runt-cedula">Datos del RUNT por Cedula</label>
+      <textarea id="ant-runt-cedula" rows="5" placeholder="Pega aqui el texto copiado de la consulta del RUNT por cedula..." style="
+        width:100%; box-sizing:border-box; padding:10px 12px; border:2px solid #d0dce8;
+        border-radius:6px; font-size:13px; font-family:inherit; resize:vertical;"></textarea>
+
+      <button class="ant-btn-continuar" style="margin-top:12px;" onclick="antLeerRunt()">Leer datos</button>
+      <div class="ant-ocr-status" id="ant-runt-status"></div>
+    </div>
+
+    <!-- Zona OCR (subir/arrastrar) -->
+    <div id="ant-zona-ocr">
+      <div class="ant-ocr-zone" id="ant-ocr-zone">
+        <input type="file" id="ant-ocr-file" accept="image/*,application/pdf">
+        <div class="ant-ocr-icon">🖼️</div>
+        <div class="ant-ocr-texto">Haz clic aqui o arrastra la tarjeta de propiedad</div>
+        <div class="ant-ocr-sub">JPG, PNG, WEBP o PDF</div>
+      </div>
+      <!-- Panel de orientación -->
+      <div class="ant-preview-wrap" id="ant-preview-wrap">
+        <div style="display:flex; gap:8px; align-items:stretch;">
+          <div style="flex:1; min-width:0;">
+            <div class="ant-preview-img-wrap" style="height:160px;">
+              <img id="ant-ocr-preview" src="" style="width:100%; height:160px; object-fit:contain; display:block; border-radius:7px; background:#f4f6fb;">
+              <div id="ant-ocr-preview-pdf" style="display:none; text-align:center; padding:20px 8px; background:#f4f6fb; border-radius:7px; border:1px solid #ccd3de; height:160px; box-sizing:border-box;">
+                <div style="font-size:36px;">📄</div>
+                <div id="ant-ocr-preview-pdf-nombre" style="font-size:11px; color:#1a2340; font-weight:700; margin-top:6px; word-break:break-all;"></div>
+              </div>
+            </div>
+            <button class="ant-btn-girar" id="ant-btn-girar-primera" style="width:100%; box-sizing:border-box; margin-top:8px;" onclick="antGirarImagen()">↻ Girar Imagen 1</button>
+          </div>
+          <div style="flex:1; min-width:0;">
+            <div id="ant-ocr-segunda-slot" style="position:relative; height:160px;">
+              <div id="ant-ocr-segunda-placeholder" onclick="document.getElementById('ant-ocr-file-2').click()" style="
+                border:2px dashed #3b7de8; border-radius:7px; cursor:pointer; box-sizing:border-box;
+                display:flex; flex-direction:column; align-items:center; justify-content:center;
+                height:160px; padding:10px; text-align:center; background:#f0f6ff;">
+                <div style="font-size:24px;">➕</div>
+                <div style="font-size:12px; color:#3b7de8; font-weight:700; margin-top:4px;">Agregar la otra cara<br>(opcional)</div>
+              </div>
+              <input type="file" id="ant-ocr-file-2" accept="image/*,application/pdf" style="display:none">
+              <img id="ant-ocr-preview-2" src="" onclick="document.getElementById('ant-ocr-file-2').click()" style="display:none; width:100%; height:160px; object-fit:contain; border-radius:7px; border:1px solid #ccd3de; background:#f4f6fb; cursor:pointer;">
+              <div id="ant-ocr-preview-pdf-2" onclick="document.getElementById('ant-ocr-file-2').click()" style="display:none; text-align:center; padding:20px 8px; background:#f4f6fb; border-radius:7px; border:1px solid #ccd3de; height:160px; box-sizing:border-box; cursor:pointer;">
+                <div style="font-size:36px;">📄</div>
+                <div id="ant-ocr-preview-pdf-nombre-2" style="font-size:11px; color:#1a2340; font-weight:700; margin-top:6px; word-break:break-all;"></div>
+              </div>
+            </div>
+            <button class="ant-btn-girar" id="ant-btn-girar-segunda" style="display:none; width:100%; box-sizing:border-box; margin-top:8px;" onclick="antGirarImagen2()">↻ Girar Imagen 2</button>
+          </div>
+        </div>
+
+        <button onclick="antEliminarImagen()" style="
+          display:block; width:100%; box-sizing:border-box; margin-top:10px;
+          background:#c0392b; color:#fff; border:none; border-radius:7px;
+          padding:11px 16px; font-size:15px; font-weight:700; cursor:pointer;
+          transition:background .2s;" onmouseover="this.style.background='#e74c3c'" onmouseout="this.style.background='#c0392b'">
+          🗑 Eliminar
+        </button>
+
+        <button class="ant-btn-continuar" style="margin-top:10px;" onclick="antContinuarOCR()">Continuar</button>
+      </div>
+      <div class="ant-ocr-status" id="ant-ocr-status"></div>
+    </div>
+
+    <!-- Municipio -->
+    </div><!-- fin contenido-info-top -->
+  </div><!-- fin bloque-info-top -->
 
 
-def _parsear_resultado_runt_vehiculo(page):
-    tarjetas = _extraer_tarjetas_runt(page)
-    resumen = _extraer_resumen_runt(page)
+  <!-- BLOQUE 1 — INFORMACION -->
+  <div class="ant-card" id="bloque-info">
+    <!-- Placa visual -- por encima del encabezado, siempre visible -->
+    <div style="margin-bottom:8px; text-align:center;">
+      <label class="ant-label" style="text-align:center; display:none;">Placa</label>
+      <div style="
+        display:inline-block; position:relative; margin-top:4px;
+        box-shadow: 3px 3px 10px rgba(0,0,0,0.25); border-radius:6px; overflow:hidden;
+      ">
+        <!-- Fondo placa colombiana -->
+        <div style="
+          background:#FDD835; border:3px solid #111;
+          border-radius:6px; padding:8px 10px 6px 10px; width:220px;
+          position:relative; box-sizing:border-box;
+        ">
+          <!-- Caracteres + escudo en fila -->
+          <div style="display:flex; align-items:center; justify-content:center; gap:0;">
 
-    # Se combinan todos los campos de todas las tarjetas en un diccionario
-    # plano para leerlos facil. Algunas tarjetas (Info General) tienen un
-    # solo campo cada una; otras (Datos Tecnicos) traen varios campos juntos
-    # en una sola tarjeta. Las tarjetas que se repiten (SOAT, RTM, cada
-    # poliza historica) tambien quedan aqui, pero no importa que se
-    # sobreescriban entre si porque esos campos se leen aparte, directo de
-    # la lista `tarjetas`, no de este diccionario plano.
-    plano = dict(resumen)
-    for t in tarjetas:
-        for k, v in t.items():
-            if k != "_titulo":
-                plano[k] = v
+            <!-- Primeras 3 letras -->
+            <div id="ant-placa-letras" style="
+              font-size:28px; font-weight:900; letter-spacing:4px;
+              color:#111; font-family:'Arial Black', Arial, sans-serif;
+              min-width:80px; text-align:center;
+            ">---</div>
 
-    plano_lower = {k.lower(): v for k, v in plano.items()}
+            <!-- Últimos 3 caracteres -->
+            <div id="ant-placa-numeros" style="
+              font-size:28px; font-weight:900; letter-spacing:4px;
+              color:#111; font-family:'Arial Black', Arial, sans-serif;
+              min-width:80px; text-align:center;
+            ">---</div>
+          </div>
 
-    def campo(nombre):
-        return plano_lower.get(nombre.lower(), "")
+          <!-- Input oculto que guarda el valor real -->
+          <input id="ant-placa" type="text" maxlength="7"
+            style="position:absolute; opacity:0; pointer-events:none; width:1px; height:1px;">
 
-    datos = {
-        "marca": campo("Marca"),
-        "linea": campo("Línea"),
-        "modelo": campo("Modelo"),
-        "color": campo("Color"),
-        "clase": campo("Clase de vehículo"),
-        "servicio": campo("Tipo de servicio"),
-        "numero_serie": campo("Número de serie"),
-        "numero_motor": campo("Número de motor"),
-        "numero_chasis": campo("Número de chasis"),
-        "vin": campo("Número de VIN"),
-        "cilindrada": campo("Cilindraje"),
-        "carroceria": campo("Tipo de carrocería"),
-        "combustible": campo("Tipo Combustible"),
-        "autoridad_transito": campo("Autoridad de tránsito"),
-        "puertas": campo("Puertas"),
-        "capacidad_carga": campo("Capacidad de Carga"),
-        "peso_bruto_vehicular": campo("Peso Bruto Vehicular"),
-        "capacidad_pasajeros": campo("Capacidad de Pasajeros"),
-        "pasajeros_sentados": campo("Pasajeros Sentados"),
-        "numero_ejes": campo("Número de Ejes"),
-        "estado_vehiculo": campo("Estado del vehículo"),
-        "gravamenes_propiedad": campo("Gravámenes a la propiedad").upper() == "SI",
-        "fecha_matricula_inicial": _convertir_fecha_ddmmyyyy(campo("Fecha de Matricula Inicial")),
+          <!-- Municipio -->
+          <div id="ant-placa-municipio" style="
+            font-size:10px; font-weight:900; color:#111; text-align:center;
+            letter-spacing:2px; margin-top:3px; text-transform:uppercase; min-height:12px;
+          "></div>
+        </div>
+
+
+      </div>
+
+    </div>
+
+    <!-- Cabecera con colapso -->
+    <div class="ant-bloque-titulo" style="cursor:pointer;" onclick="antToggleInfo()">
+      <span class="ant-bloque-titulo-left" style="opacity:0;">▼</span>
+      <span class="ant-bloque-titulo-texto" id="titulo-info">PASO 1 — INFORMACION</span>
+      <span id="ant-info-placa-mun" style="font-size:12px; opacity:0.85; margin-left:6px; display:none;"></span>
+      <span class="ant-bloque-titulo-chevron" id="ant-info-chevron">▲</span>
+    </div>
+
+    <!-- Contenido completo -->
+    <div id="ant-info-colapsado" style="display:none;"></div>
+    <div id="ant-info-contenido">
+      <div id="tramyRuntEstadoInfo" style="display:none; margin-bottom:12px; padding:10px 12px; border-radius:8px; background:#eef2fb; font-size:13px; color:#1a2340; text-align:center; max-width:280px; margin-left:auto; margin-right:auto;"></div>
+
+      <div class="ant-grid">
+        <div class="ant-group">
+          <label class="ant-label" for="ant-placa-editar">Placa</label>
+          <input class="ant-input upper" id="ant-placa-editar" type="text" maxlength="7" placeholder="Ej: ABC123">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-tipodoc">Tipo Documento</label>
+          <select class="ant-input" id="ant-tipodoc">
+            <option value="CC">C.C. - Cedula de Ciudadania</option>
+            <option value="NIT">NIT</option>
+            <option value="CE">C.E. - Cedula de Extranjeria</option>
+            <option value="TI">T.I. - Tarjeta de Identidad</option>
+            <option value="RC">R.C. - Registro Civil</option>
+            <option value="PPT">P.P.T. - Permiso por Proteccion Temporal</option>
+          </select>
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-cedula">Identificacion</label>
+          <input class="ant-input" id="ant-cedula" type="text" inputmode="numeric" placeholder="Ej: 1128402520">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-municipio-input">Municipio</label>
+          <div class="ant-mun-wrap" style="flex:1 1 auto; max-width:56%;">
+            <input type="text" class="ant-mun-input" id="ant-municipio-input" placeholder="Escribe o selecciona..." autocomplete="off" style="text-align:right; padding:3px 8px; font-size:13.5px; border:none; border-radius:0; background:transparent;">
+            <input type="hidden" id="ant-municipio">
+            <div class="ant-mun-lista" id="ant-mun-lista"></div>
+          </div>
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-apellidos">Nombre</label>
+          <input class="ant-input upper" id="ant-apellidos" type="text" placeholder="Ej: LOPEZ AGUDELO">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-clase">Clase de Vehiculo</label>
+          <input class="ant-input upper" id="ant-clase" type="text" placeholder="Ej: AUTOMOVIL">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-marca">Marca</label>
+          <input class="ant-input upper" id="ant-marca" type="text" placeholder="Ej: CHEVROLET">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-linea">Linea</label>
+          <input class="ant-input upper" id="ant-linea" type="text" placeholder="Ej: SPARK">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-modelo">Modelo</label>
+          <input class="ant-input" id="ant-modelo" type="text" inputmode="numeric" placeholder="Ej: 2015" maxlength="4">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-cilindrada">Cilindraje (cc)</label>
+          <input class="ant-input" id="ant-cilindrada" type="text" placeholder="Ej: 1200">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-servicio">Servicio</label>
+          <input class="ant-input upper" id="ant-servicio" type="text" placeholder="Ej: PARTICULAR">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-capacidad">Capacidad Pax Sentados</label>
+          <input class="ant-input" id="ant-capacidad" type="text" placeholder="Ej: 5">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-carroceria">Carroceria</label>
+          <input class="ant-input upper" id="ant-carroceria" type="text" placeholder="Ej: SEDAN">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-limitacion-propiedad">Gravámenes a la Propiedad</label>
+          <select class="ant-input" id="ant-limitacion-propiedad">
+            <option value="">Sin información</option>
+            <option value="NO">NO</option>
+            <option value="SI">SI</option>
+          </select>
+        </div>
+
+        <!-- Campos adicionales del RUNT -- solo relevantes para Premium -->
+        <div id="tramyCamposPremium" style="display:none;">
+        <div class="ant-group">
+          <label class="ant-label" for="ant-color">Color</label>
+          <input class="ant-input upper" id="ant-color" type="text" placeholder="Ej: BLANCO">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-numero_serie">Número de Serie</label>
+          <input class="ant-input upper" id="ant-numero_serie" type="text">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-numero_motor">Número de Motor</label>
+          <input class="ant-input upper" id="ant-numero_motor" type="text">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-numero_chasis">Número de Chasis</label>
+          <input class="ant-input upper" id="ant-numero_chasis" type="text">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-vin">VIN</label>
+          <input class="ant-input upper" id="ant-vin" type="text">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-combustible">Combustible</label>
+          <input class="ant-input upper" id="ant-combustible" type="text" placeholder="Ej: GASOLINA">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-puertas">Puertas</label>
+          <input class="ant-input" id="ant-puertas" type="text">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-capacidad_carga">Capacidad de Carga</label>
+          <input class="ant-input" id="ant-capacidad_carga" type="text">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-peso_bruto">Peso Bruto Vehicular</label>
+          <input class="ant-input" id="ant-peso_bruto" type="text">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-capacidad_pasajeros">Capacidad de Pasajeros</label>
+          <input class="ant-input" id="ant-capacidad_pasajeros" type="text">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-numero_ejes">Número de Ejes</label>
+          <input class="ant-input" id="ant-numero_ejes" type="text">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-estado_vehiculo">Estado del Vehículo</label>
+          <input class="ant-input upper" id="ant-estado_vehiculo" type="text" placeholder="Ej: ACTIVO">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-fecha_matricula">Fecha Matrícula Inicial</label>
+          <input class="ant-input" id="ant-fecha_matricula" type="text" placeholder="DD/MM/AAAA">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-soat">SOAT</label>
+          <input class="ant-input" id="ant-soat" type="text" placeholder="Sin consultar">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-rtm">RTM (Tecnomecánica)</label>
+          <input class="ant-input" id="ant-rtm" type="text" placeholder="Sin consultar">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-ultimo-tramite">Último Trámite</label>
+          <input class="ant-input" id="ant-ultimo-tramite" type="text" placeholder="Sin consultar">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-fecha-ultimo-traspaso">Fecha Último Traspaso</label>
+          <input class="ant-input" id="ant-fecha-ultimo-traspaso" type="text" placeholder="Sin consultar">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-garantia-favor">Garantía a Favor De</label>
+          <input class="ant-input" id="ant-garantia-favor" type="text" placeholder="Sin consultar">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-garantia-mobiliaria">Garantía Mobiliaria (Prenda RNGM)</label>
+          <input class="ant-input" id="ant-garantia-mobiliaria" type="text" placeholder="Sin consultar">
+        </div>
+        <div class="ant-group">
+          <label class="ant-label" for="ant-limitaciones-propiedad">Limitaciones a la Propiedad</label>
+          <input class="ant-input" id="ant-limitaciones-propiedad" type="text" placeholder="Sin consultar">
+        </div>
+        </div><!-- fin tramyCamposPremium -->
+      </div>
+
+      <button class="ant-btn ant-btn-verde" onclick="antConfirmarInfo()" style="margin-top:8px;">
+        ✓ He comparado los datos y están bien
+      </button>
+    </div>
+  </div>
+
+  <!-- BLOQUE 2 — IMPUESTO DEPARTAMENTAL -->
+  <div class="ant-card" id="bloque-depto">
+    <div class="ant-bloque-titulo" style="cursor:pointer;" onclick="antToggleBloque('depto')">
+      <span class="ant-bloque-titulo-left" style="opacity:0;">▼</span>
+      <span class="ant-bloque-titulo-texto" id="titulo-depto">PASO 2 — IMPUESTO DEPARTAMENTAL</span>
+      <span style="display:flex;align-items:center;gap:6px;">
+        <button class="ant-ayuda-btn" onclick="event.stopPropagation();antToggleAyuda('ayuda-depto')" title="Ayuda">?</button>
+        <span class="ant-bloque-titulo-chevron" id="chevron-depto">▲</span>
+      </span>
+    </div>
+    <div id="ayuda-depto" class="ant-ayuda-panel">
+      Este módulo funciona igual que si consultaras directamente en la página de impuestos departamentales de Antioquia. Si te sale error puede ser por los mismos motivos que si lo hicieras tú mismo en la página oficial:
+      <ol>
+        <li>La placa ingresada no coincide con la identificación del propietario. Verifica los datos y realiza el proceso nuevamente — este error es el más frecuente y significa que el propietario que aparece en tu tarjeta no es el propietario actual según la base de datos de la Gobernación de Antioquia. Revisa en el RUNT para verificar que ese sí sea el propietario. Si lo es, revisa la tarjeta por el lado de atrás: si hace menos de tres meses le hicieron traspaso, la Gobernación aún no ha actualizado.</li>
+        <li>Cualquier otro error será debido a que: la plataforma de impuestos departamentales de Antioquia está caída, la plataforma interna de Tramy está caída, o el vehículo tiene algún dato desactualizado en la base de datos de la Gobernación de Antioquia.</li>
+        <li>Si el vehículo está a nombre de persona indeterminada, debes consultar con los datos de la persona indeterminada, los cuales son: cédula <strong>5134</strong>, nombre <strong>PERSONA INDETERMINADA</strong>.</li>
+        <li>En los casos en que no es posible obtener el dato por este medio, tampoco es posible obtenerlo por la página oficial de impuestos departamentales. Deberás llamar al <strong>604 444 4666 opción 6</strong>.</li>
+      </ol>
+    </div>
+    <div id="contenido-depto">
+    <div id="ant-alerta-traspaso-depto-verde" style="display:none; margin-bottom:8px; padding:10px 12px; border-radius:8px; background:#dcf5df; border:1px solid #8fd6a0; font-size:14px; font-weight:700; color:#1a5c2e; line-height:1.5; text-align:center;"></div>
+    <div id="ant-alerta-traspaso-depto" style="display:none; margin-bottom:12px; padding:10px 12px; border-radius:8px; background:#fff3cd; border:1px solid #ffe08a; font-size:13px; color:#5c4813; line-height:1.5;"></div>
+    <div class="ant-no-depto" id="ant-no-depto" style="display:none">⚠️ Este vehiculo NO PAGA IMPUESTOS DEPARTAMENTALES</div>
+    <button class="ant-btn ant-btn-verde" id="ant-btn-impuesto" style="display:none">🏛️ Consultar</button>
+    <div class="ant-result" id="ant-result-depto"></div>
+    </div>
+  </div>
+
+  <!-- BLOQUE 3 — IMPUESTO MUNICIPAL -->
+  <div class="ant-card" id="bloque-municipal">
+    <div class="ant-bloque-titulo" style="cursor:pointer;" onclick="antToggleBloque('municipal')">
+      <span class="ant-bloque-titulo-left" style="opacity:0;">▼</span>
+      <span class="ant-bloque-titulo-texto" id="titulo-municipal">PASO 3 — IMPUESTO MUNICIPAL</span>
+      <span style="display:flex;align-items:center;gap:6px;">
+        <span class="ant-bloque-titulo-chevron" id="chevron-municipal">▲</span>
+      </span>
+    </div>
+    <div id="contenido-municipal">
+    <button class="ant-btn ant-btn-azul" id="ant-btn-municipal">🏘️ Consultar</button>
+    <div class="ant-result" id="ant-result-municipal"></div>
+    </div>
+  </div>
+
+  <!-- BLOQUE 4 — TRAMITES -->
+  <div class="ant-card" id="bloque-tramites">
+    <div class="ant-bloque-titulo" style="cursor:pointer;" onclick="antToggleBloque('tramites')">
+      <span class="ant-bloque-titulo-left" style="opacity:0;">▼</span>
+      <span class="ant-bloque-titulo-texto" id="titulo-tramites">PASO 4 — TRAMITES</span>
+      <span class="ant-bloque-titulo-chevron" id="chevron-tramites">▲</span>
+    </div>
+    <div id="contenido-tramites">
+    <div class="ant-tramite-bloque" id="ant-bloque-1">
+      <div class="ant-tramite-num">
+        <span>Tramite 1</span>
+      </div>
+      <div class="ant-tram-wrap">
+        <input type="text" class="ant-tram-input" id="ant-tramite-1" placeholder="Escribe para filtrar tramites..." autocomplete="off" disabled>
+        <div class="ant-tram-lista" id="ant-tram-lista-1"></div>
+      </div>
+      <div class="ant-tarifa-precio-inline" id="ant-precio-1"></div>
+    </div>
+    <div class="ant-tramite-bloque" id="ant-bloque-2" style="display:none">
+      <div class="ant-tramite-num">
+        <span>Tramite 2</span>
+        <button class="ant-tramite-x" id="ant-x-2" onclick="antEliminarTramite(2)" title="Eliminar">✕</button>
+      </div>
+      <div class="ant-tram-wrap">
+        <input type="text" class="ant-tram-input" id="ant-tramite-2" placeholder="Escribe para filtrar tramites..." autocomplete="off" disabled>
+        <div class="ant-tram-lista" id="ant-tram-lista-2"></div>
+      </div>
+      <div class="ant-tarifa-precio-inline" id="ant-precio-2"></div>
+    </div>
+    <div class="ant-tramite-bloque" id="ant-bloque-3" style="display:none">
+      <div class="ant-tramite-num">
+        <span>Tramite 3</span>
+        <button class="ant-tramite-x" id="ant-x-3" onclick="antEliminarTramite(3)" title="Eliminar">✕</button>
+      </div>
+      <div class="ant-tram-wrap">
+        <input type="text" class="ant-tram-input" id="ant-tramite-3" placeholder="Escribe para filtrar tramites..." autocomplete="off" disabled>
+        <div class="ant-tram-lista" id="ant-tram-lista-3"></div>
+      </div>
+      <div class="ant-tarifa-precio-inline" id="ant-precio-3"></div>
+    </div>
+    <div class="ant-tramite-bloque" id="ant-bloque-4" style="display:none">
+      <div class="ant-tramite-num">
+        <span>Tramite 4</span>
+        <button class="ant-tramite-x" id="ant-x-4" onclick="antEliminarTramite(4)" title="Eliminar">✕</button>
+      </div>
+      <div class="ant-tram-wrap">
+        <input type="text" class="ant-tram-input" id="ant-tramite-4" placeholder="Escribe para filtrar tramites..." autocomplete="off" disabled>
+        <div class="ant-tram-lista" id="ant-tram-lista-4"></div>
+      </div>
+      <div class="ant-tarifa-precio-inline" id="ant-precio-4"></div>
+    </div>
+    <div class="ant-tramite-bloque" id="ant-bloque-5" style="display:none">
+      <div class="ant-tramite-num">
+        <span>Tramite 5</span>
+        <button class="ant-tramite-x" id="ant-x-5" onclick="antEliminarTramite(5)" title="Eliminar">✕</button>
+      </div>
+      <div class="ant-tram-wrap">
+        <input type="text" class="ant-tram-input" id="ant-tramite-5" placeholder="Escribe para filtrar tramites..." autocomplete="off" disabled>
+        <div class="ant-tram-lista" id="ant-tram-lista-5"></div>
+      </div>
+      <div class="ant-tarifa-precio-inline" id="ant-precio-5"></div>
+    </div>
+    </div>
+  </div>
+
+  <!-- BLOQUE RETEFUENTE -->
+  <div class="ant-card" id="bloque-retefuente" style="display:none;">
+    <div class="ant-bloque-titulo" style="cursor:pointer;" onclick="antToggleBloque('ret')">
+      <span class="ant-bloque-titulo-left" style="opacity:0;">▼</span>
+      <span class="ant-bloque-titulo-texto" id="titulo-ret">PASO 5 — RETEFUENTE</span>
+      <span style="display:flex;align-items:center;gap:6px;">
+        <button class="ant-ayuda-btn" onclick="event.stopPropagation();antToggleAyuda('ayuda-ret')" title="Ayuda">?</button>
+        <span class="ant-bloque-titulo-chevron" id="chevron-ret">▲</span>
+      </span>
+    </div>
+    <div id="ayuda-ret" class="ant-ayuda-panel">
+      Este módulo tiene exactamente los mismos datos del SITBGA. Recuerda que el retefuente obtenido es a modo de guía, ya que es el taquillero que ingresa el trámite quien elige el retefuente a utilizar para la liquidación del mismo. Es por eso que te entrego varias opciones, para que tú determines cuál utilizar dependiendo de las características del vehículo que estás liquidando.
+    </div>
+    <div id="contenido-ret">
+      <div id="ant-ret-datos-veh" style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px;">
+        <span id="ret-dato-clase" style="background:#e8f0f8; border-radius:20px; padding:4px 12px; font-size:13px; font-weight:700; color:#1a2340;"></span>
+        <span id="ret-dato-marca" style="background:#e8f0f8; border-radius:20px; padding:4px 12px; font-size:13px; font-weight:700; color:#1a2340;"></span>
+        <span id="ret-dato-linea" style="background:#e8f0f8; border-radius:20px; padding:4px 12px; font-size:13px; font-weight:700; color:#1a2340;"></span>
+        <span id="ret-dato-modelo" style="background:#e8f0f8; border-radius:20px; padding:4px 12px; font-size:13px; font-weight:700; color:#1a2340;"></span>
+        <span id="ret-dato-cil" style="background:#e8f0f8; border-radius:20px; padding:4px 12px; font-size:13px; font-weight:700; color:#1a2340;"></span>
+        <span id="ret-dato-cap" style="background:#e8f0f8; border-radius:20px; padding:4px 12px; font-size:13px; font-weight:700; color:#1a2340;"></span>
+      </div>
+      <p style="font-size:13px; color:#555; margin:0 0 12px 0;">Elige la opción más acertada con tu vehículo.</p>
+      <div id="ant-ret-estado" style="font-size:13px; color:#888; margin-bottom:10px;"></div>
+      <div id="ant-ret-opciones"></div>
+      <div id="ant-ret-resultado" style="display:none; margin-top:12px;">
+        <div style="background:#f0fff6; border:1px solid #b2e4c8; border-radius:7px; padding:14px 16px;">
+          <div style="font-size:13px; color:#888; margin-bottom:4px;">Línea seleccionada</div>
+          <div id="ant-ret-linea-sel" style="font-size:14px; font-weight:700; color:#1a2340; margin-bottom:10px;"></div>
+          <div style="display:flex; gap:20px; flex-wrap:wrap;">
+            <div><div style="font-size:11px; color:#888;">Avalúo Comercial</div><div id="ant-ret-avaluo" style="font-size:18px; font-weight:900; color:#1a2340;"></div></div>
+            <div><div style="font-size:11px; color:#888;">Retefuente (1%)</div><div id="ant-ret-retefuente" style="font-size:18px; font-weight:900; color:#1a6e3c;"></div></div>
+          </div>
+          <button class="ant-btn ant-btn-verde" onclick="antUsarRetefuente()" style="margin-top:12px;">
+            ✓ Usar este valor en la liquidación
+          </button>
+        </div>
+      </div>
+      <p style="font-size:11px; color:#999; margin-top:14px; text-align:center; line-height:1.5;">
+        Los datos aquí enlistados provienen del <a href="https://web.mintransporte.gov.co/sibga/" target="_blank" style="color:#1a5fa8;">SIBGA</a>, de las <a href="https://mintransporte.gov.co/publicaciones/12234/base-gravable-2026/" target="_blank" style="color:#1a5fa8;">tablas de avalúos</a> publicadas por el Ministerio de Transporte.
+      </p>
+    </div>
+  </div>
+
+  <!-- BLOQUE 5 — LIQUIDACION -->
+  <div class="ant-card-liq" id="bloque-liq" style="display:none">
+    <div class="ant-bloque-titulo" style="cursor:pointer;" onclick="antToggleBloque('liq')">
+      <span class="ant-bloque-titulo-left" style="opacity:0;">▼</span>
+      <span class="ant-bloque-titulo-texto" id="titulo-liq">PASO 6 — LIQUIDACION</span>
+      <span class="ant-bloque-titulo-chevron" id="chevron-liq">▲</span>
+    </div>
+    <div id="contenido-liq">
+    <div style="display:flex; justify-content:center; margin-bottom:12px;">
+      <div style="display:inline-flex; gap:2px; background:#e4e9f4; border-radius:8px; padding:3px;">
+        <button type="button" id="tramyBtnAsesor" onclick="tramySeleccionarTipoCliente('asesor')" style="border:none; padding:7px 16px; border-radius:6px; font-size:12.5px; font-weight:700; cursor:pointer;">Asesor</button>
+        <button type="button" id="tramyBtnClienteFinal" onclick="tramySeleccionarTipoCliente('cliente_final')" style="border:none; padding:7px 16px; border-radius:6px; font-size:12.5px; font-weight:700; cursor:pointer;">Cliente Final</button>
+      </div>
+    </div>
+    <div id="liq-row-tramite1" class="ant-liq-item" style="display:none"><span class="ant-liq-nombre" id="liq-label-tramite1">Tramite 1</span><input class="ant-liq-input" id="liq-tramite1" type="text" value="0" inputmode="numeric"></div>
+    <div id="liq-row-tramite2" class="ant-liq-item" style="display:none"><span class="ant-liq-nombre" id="liq-label-tramite2">Tramite 2</span><input class="ant-liq-input" id="liq-tramite2" type="text" value="0" inputmode="numeric"></div>
+    <div id="liq-row-tramite3" class="ant-liq-item" style="display:none"><span class="ant-liq-nombre" id="liq-label-tramite3">Tramite 3</span><input class="ant-liq-input" id="liq-tramite3" type="text" value="0" inputmode="numeric"></div>
+    <div id="liq-row-tramite4" class="ant-liq-item" style="display:none"><span class="ant-liq-nombre" id="liq-label-tramite4">Tramite 4</span><input class="ant-liq-input" id="liq-tramite4" type="text" value="0" inputmode="numeric"></div>
+    <div id="liq-row-tramite5" class="ant-liq-item" style="display:none"><span class="ant-liq-nombre" id="liq-label-tramite5">Tramite 5</span><input class="ant-liq-input" id="liq-tramite5" type="text" value="0" inputmode="numeric"></div>
+    <div id="liq-row-retefuente" class="ant-liq-item" style="display:none"><span class="ant-liq-nombre">Retefuente (1% avaluo)</span><input class="ant-liq-input" id="liq-retefuente" type="text" value="0" inputmode="numeric"></div>
+    <div id="liq-row-depto" class="ant-liq-item" style="display:none"><span class="ant-liq-nombre">Impuesto Departamental</span><input class="ant-liq-input" id="liq-depto" type="text" value="0" inputmode="numeric"></div>
+    <div id="liq-row-municipal" class="ant-liq-item" style="display:none"><span class="ant-liq-nombre">Impuesto Municipal</span><input class="ant-liq-input" id="liq-municipal" type="text" value="0" inputmode="numeric"></div>
+    <div id="liq-row-honorarios" class="ant-liq-item" style="display:grid"><span class="ant-liq-nombre">Honorarios</span><div class="ant-honorarios-wrap"><input class="ant-liq-input" id="liq-honorarios" type="text" value="0" inputmode="numeric" autocomplete="off"><div class="ant-chips-wrap" id="ant-honorarios-chips"></div></div></div>
+    <div id="liq-row-pazsalvo" class="ant-liq-item" style="display:none; grid-template-columns: 1fr auto auto;"><span class="ant-liq-nombre">Paz y Salvo</span><input class="ant-liq-input" id="liq-pazsalvo" type="text" value="6.000" inputmode="numeric"><button class="ant-liq-btn-del" onclick="antEliminarFila('pazsalvo')" title="Eliminar">×</button></div>
+    <div id="liq-row-envios" class="ant-liq-item" style="display:none; grid-template-columns: 1fr auto auto;"><span class="ant-liq-nombre">Envios y/o Domicilios</span><input class="ant-liq-input" id="liq-envios" type="text" value="18.000" inputmode="numeric"><button class="ant-liq-btn-del" onclick="antEliminarFila('envios')" title="Eliminar">×</button></div>
+    <!-- Otros Cobros dinámicos -->
+    <div id="liq-cobros-wrap">
+      <div class="ant-liq-cobro" id="liq-cobro-1">
+        <div class="ant-cobro-wrap" id="ant-cobro-wrap-1"><input class="ant-liq-cobro-nombre" id="liq-cobro-nombre-1" type="text" placeholder="Concepto" autocomplete="off"><div class="ant-cobro-lista" id="ant-cobro-lista-1"></div></div>
+        <div class="ant-cobro-valor-wrap"><input class="ant-liq-input liq-cobro-valor" id="liq-cobro-valor-1" type="text" value="0" inputmode="numeric"><div class="ant-chips-wrap" id="ant-cobro-chips-1"></div></div>
+        <button class="ant-liq-btn-add" onclick="antAgregarCobro()" id="liq-cobro-add-btn" title="Agregar otro cobro">+</button>
+      </div>
+    </div>
+
+    <div class="ant-liq-total"><span>TOTAL</span><span id="liq-total">$ 0</span></div>
+    <p class="ant-liq-nota">Todos los valores son editables. El total se actualiza automaticamente.</p>
+    <button class="ant-btn ant-btn-wa" id="ant-btn-wa" onclick="antEnviarWA()">📲 Generar y Enviar por WhatsApp</button>
+    <div class="ant-wa-preview" id="ant-wa-preview"><img id="ant-wa-img" src="" alt="Vista previa liquidacion"></div>
+    <canvas id="ant-canvas-liq" style="display:none"></canvas>
+
+    <button class="ant-btn" id="ant-btn-fun" onclick="tramyAbrirGenerarFUN()" style="display:none; margin-top:8px; background:#fff; border:1.5px solid #1a2340; color:#1a2340;">📄 Generar FUN (Formulario Único Nacional)</button>
+    <div id="tramyFunPanel" style="display:none; margin-top:10px; padding:12px; border-radius:8px; border:1.5px solid #dde3ec; background:#f8fafc; text-align:center;">
+      <div id="tramyFunSeleccionTramite">
+        <div style="font-size:13px; font-weight:700; color:#1a2340; margin-bottom:8px;">¿Cuál trámite se marca en el formulario?</div>
+        <select id="tramyFunTramite" style="width:100%; padding:8px; border-radius:8px; border:1.5px solid #DAD3C2; margin-bottom:8px;">
+          <option value="MATRICULA/ REGISTRO">Matrícula / Registro</option>
+          <option value="TRASPASO">Traspaso</option>
+          <option value="TRASLADO MATRICULA / REGISTRO">Traslado Matrícula / Registro</option>
+          <option value="RADICADO  MATRICULA / REGISTRO">Radicado Matrícula / Registro</option>
+          <option value="CAMBIO DE COLOR">Cambio de Color</option>
+          <option value="CAMBIO DE SERVICIO">Cambio de Servicio</option>
+          <option value="REGRABAR MOTOR">Regrabar Motor</option>
+          <option value="REGRABAR CHASIS">Regrabar Chasis</option>
+          <option value="TRANSFORMACION">Transformación</option>
+          <option value="DUPLICADO LICENCIA TRANSITO">Duplicado Licencia Tránsito</option>
+          <option value="INSCRIPC. PRENDA">Inscripción de Prenda</option>
+          <option value="LEVANTA PRENDA">Levantamiento de Prenda</option>
+          <option value="CANCELACION MATRICULA / REGISTRO">Cancelación Matrícula / Registro</option>
+          <option value="CAMBIO DE PLACAS">Cambio de Placas</option>
+          <option value="DUPLICADO DE PLACAS">Duplicado de Placas</option>
+          <option value="REMATRICULA">Rematrícula</option>
+          <option value="CAMBIO DE CARROCERIA">Cambio de Carrocería</option>
+          <option value="OTROS">Otros</option>
+        </select>
+        <div id="tramyFunTrasladoWrap" style="display:none; margin-bottom:8px;">
+          <input id="tramyFunTrasladoMunicipio" type="text" placeholder="Municipio de destino del traslado" style="width:100%; padding:8px; border-radius:8px; border:1.5px solid #DAD3C2; box-sizing:border-box;">
+        </div>
+        <button onclick="tramyGenerarFUN()" class="ant-btn ant-btn-verde" style="width:100%;">Generar PDF</button>
+      </div>
+      <div id="tramyFunResultado" style="display:none; margin-top:10px;"></div>
+    </div>
+    </div>
+  </div>
+
+</div>
+
+
+
+<!-- Botón flotante nueva liquidación -->
+<button class="ant-fab-nuevo" onclick="antNuevaLiquidacion()" title="Nueva liquidación">+</button>
+
+
+
+<!-- Botón flotante de reporte -->
+<button class="ant-reporte-btn" onclick="antToggleReporte()" style="left:20px;right:auto;">⚠️ Reportar daños</button>
+<div class="ant-reporte-panel" id="ant-reporte-panel" style="left:20px;right:auto;">
+  <div class="ant-reporte-titulo">¿Qué está pasando?</div>
+  <div class="ant-reporte-opciones">
+    <div class="ant-reporte-opcion" onclick="antSelOpcion(this,'Dato incorrecto')">Dato incorrecto</div>
+    <div class="ant-reporte-opcion" onclick="antSelOpcion(this,'Precio errado')">Precio errado</div>
+    <div class="ant-reporte-opcion" onclick="antSelOpcion(this,'No cargó')">No cargó</div>
+    <div class="ant-reporte-opcion" onclick="antSelOpcion(this,'Error en consulta')">Error en consulta</div>
+    <div class="ant-reporte-opcion" onclick="antSelOpcion(this,'Otro')">Otro</div>
+  </div>
+  <textarea class="ant-reporte-textarea" id="ant-reporte-texto" rows="3" placeholder="Cuéntanos más (opcional)..."></textarea>
+  <button class="ant-reporte-enviar" onclick="antEnviarReporte()">Enviar reporte</button>
+  <div class="ant-reporte-ok" id="ant-reporte-ok">✓ Gracias, lo revisaremos pronto.</div>
+</div>
+
+<script>
+(function() {
+  var ANT_MUNICIPIOS = [
+    "ANDES","APARTADO","BARBOSA","BELLO","CALDAS","CAREPA","CHIGORODO",
+    "EL CARMEN DE VIBORAL","CAUCASIA","CIUDAD BOLIVAR","COPACABANA","DEPARTAMENTAL",
+    "DON MATIAS","ENVIGADO","EL SANTUARIO","FRONTINO","GIRARDOTA","GUARNE","ITAGUI","LA CEJA",
+    "LA ESTRELLA","LA UNION","MARINILLA","MEDELLIN","PUERTO BERRIO","RIONEGRO",
+    "SABANETA","SANTA FE DE ANTIOQUIA","SANTA ROSA DE OSOS","SONSON","TURBO",
+    "URRAO","YARUMAL"
+  ];
+  window.ANT_MUNICIPIOS = ANT_MUNICIPIOS;
+
+  var MUNICIPIOS_MUNICIPALES = {
+    "ENVIGADO":"envigado","SABANETA":"sabaneta","BELLO":"bello",
+    "LA ESTRELLA":"la estrella","ITAGUI":"itagui","MEDELLIN":"medellin"
+  };
+
+  // Municipios que muestran mensaje de oficina en impuesto municipal
+  var MUNICIPIOS_OFICINA_SIEMPRE = ["CALDAS","BARBOSA"];
+  var MUNICIPIOS_OFICINA_PUBLICO = ["RIONEGRO","SANTA ROSA DE OSOS","SANTA FE DE ANTIOQUIA"];
+
+  function debeMostrarMensajeOficina() {
+    var municipio = antMunicipioActual.toUpperCase();
+    var serv      = (document.getElementById('ant-servicio').value || '').trim().toUpperCase();
+    if (MUNICIPIOS_OFICINA_SIEMPRE.indexOf(municipio) >= 0) return true;
+    if (MUNICIPIOS_OFICINA_PUBLICO.indexOf(municipio) >= 0 && (serv === 'PUBLICO' || serv.normalize('NFD').replace(/[\u0300-\u036f]/g,'') === 'PUBLICO')) return true;
+    return false;
+  }
+
+  var CLASE_A_TIPO = {
+    'AUTOMOVIL':'CARRO','CAMPERO':'CARRO','CAMIONETA':'CARRO','CAMIONETA CARGA':'CARRO','CAMIONETA ESTACAS':'CARRO','VOLQUETA':'CARRO',
+    'CAMION':'CARRO','BUS':'CARRO','BUSETA':'CARRO',
+    'MOTOCICLETA':'MOTO','MOTO':'MOTO',
+    'MOTOCARRO':'MOTOCARRO','TRICIMOTO':'MOTOCARRO'
+  };
+
+  var ANT_API           = 'https://consulta-impuestos-production.up.railway.app';
+  var antDatosOCR       = null;
+  var antIdxActivo      = -1;
+  var cacheTramites     = {};
+  var antAvaluo         = 0;
+  var ocrLeido          = false;
+  var modoEntrada       = 'ocr';
+  var tramiteOpciones   = [];
+  var antMunicipioActual = ''; // municipio seleccionado, guardado en variable JS
+
+  // ── TABLA DE AUTENTICACION POR MUNICIPIO ─────────────────────────────────
+  var AUTENTICACION = {
+    "MEDELLIN": {
+      traspaso:  { propietario: ["mandato"] },
+      otro:      { propietario: ["mandato"] }
+    },
+    "ENVIGADO": {
+      traspaso:  { propietario: ["cualquier documento"] },
+      otro:      { propietario: ["cualquier documento"] }
+    },
+    "BELLO": {
+      traspaso:  { propietario: ["cualquier documento"] },
+      otro:      { propietario: ["cualquier documento"] }
+    },
+    "ITAGUI": {
+      traspaso:  { propietario: ["contrato de compraventa"] },
+      otro:      { propietario: ["formulario"] }
+    },
+    "LA CEJA": {
+      traspaso:  { propietario: [], nota_especial: "No requiere autenticación. Revisan firma del propietario en el RUNT." },
+      otro:      { propietario: [], nota_especial: "No requiere autenticación. Revisan firma del propietario en el RUNT." }
+    },
+    "COPACABANA": {
+      traspaso:  { propietario: ["mandato", "contrato de compraventa"], comprador: ["mandato"] },
+      otro:      { propietario: ["mandato", "formulario"] }
+    },
+    "DEPARTAMENTAL": {
+      traspaso:  { propietario: ["contrato de compraventa"] },
+      otro:      { propietario: ["formulario"] }
+    },
+    "GIRARDOTA": {
+      traspaso:  { propietario: ["contrato de compraventa"] },
+      otro:      { propietario: ["formulario"] }
+    },
+    "LA ESTRELLA": {
+      traspaso:  { propietario: ["contrato de compraventa"] },
+      otro:      { propietario: ["formulario"] }
+    },
+    "MARINILLA": {
+      traspaso:  { propietario: ["mandato"] },
+      otro:      { propietario: ["mandato"] }
+    },
+    "RIONEGRO": {
+      traspaso:  { propietario: ["contrato de compraventa"] },
+      otro:      { propietario: ["formulario"] }
+    },
+    "EL SANTUARIO": {
+      traspaso:  { propietario: ["contrato de compraventa", "mandato"] },
+      otro:      { propietario: ["formulario"] }
+    },
+    "SABANETA": {
+      traspaso:  { propietario: ["contrato de compraventa"] },
+      otro:      { propietario: ["formulario"] }
+    },
+    "SANTA FE DE ANTIOQUIA": {
+      traspaso:  { propietario: ["mandato"], nota_especial: "Si la firma es diferente a la cédula, debe autenticar todos los documentos." },
+      otro:      { propietario: ["mandato"], nota_especial: "Si la firma es diferente a la cédula, debe autenticar todos los documentos." }
+    }
+  };
+
+  function generarNotaAutenticacion() {
+    var municipio = antMunicipioActual.toUpperCase();
+    var reglas    = AUTENTICACION[municipio];
+    if (!reglas) return null;
+
+    // Detectar si hay al menos un traspaso entre los tramites seleccionados
+    var hayTraspaso = [1,2,3,4,5].some(function(n) {
+      var v = (document.getElementById('ant-tramite-'+n).value || '').toUpperCase();
+      return v.includes('TRASPASO');
+    });
+
+    var regla = hayTraspaso ? reglas.traspaso : reglas.otro;
+    if (!regla) return null;
+
+    var lineas = [];
+
+    // Documentos del propietario
+    if (regla.propietario && regla.propietario.length > 0) {
+      lineas.push('El propietario debe autenticar: ' + regla.propietario.join(' + ').toUpperCase());
     }
 
-    # SOAT vigente: primera tarjeta con "Número de póliza" cuyo Estado diga VIGENTE
-    datos["soat_vigente"] = False
-    for t in tarjetas:
-        if "Número de póliza" in t:
-            estado = t.get("Estado", "").upper()
-            if "VIGENTE" in estado and "NO VIGENTE" not in estado:
-                datos["soat_vigente"] = True
-                datos["soat_fecha_fin"] = _convertir_fecha_ddmmyyyy(t.get("Fecha fin de vigencia", ""))
-                break
-
-    # RTM vigente: tarjeta "REVISION TECNICO-MECANICO" con Vigente = SI
-    datos["rtm_vigente"] = False
-    for t in tarjetas:
-        if t.get("_titulo", "").upper().startswith("REVISION TECNICO"):
-            if t.get("Vigente", "").upper() == "SI":
-                datos["rtm_vigente"] = True
-                datos["rtm_fecha_fin"] = _convertir_fecha_ddmmyyyy(t.get("Fecha Vigencia", ""))
-                break
-
-    # Ultimo tramite relevante (no SOAT ni RTM) -- primera tarjeta "Solicitud NNN"
-    for t in tarjetas:
-        if t.get("_titulo", "").startswith("Solicitud"):
-            tramites = t.get("Trámites Realizados", "")
-            if tramites and "revision tecnico mecanica" not in tramites.lower() and "soat" not in tramites.lower():
-                datos["ultimo_tramite_tipo"] = tramites.strip(", ")
-                datos["ultimo_tramite_fecha"] = _convertir_fecha_ddmmyyyy(t.get("Fecha de Solicitud", ""))
-                datos["ultimo_tramite_estado"] = t.get("Estado", "")
-                datos["ultimo_tramite_entidad"] = t.get("Entidad", "")
-                break
-
-    # Garantias a Favor De -- solo si el acreedor esta afiliado a Confecamaras
-    for t in tarjetas:
-        if "Acreedor" in t and "Identificación Acreedor" in t:
-            datos["garantia_favor_acreedor"] = t.get("Acreedor", "")
-            datos["garantia_favor_entidad_nit"] = t.get("Identificación Acreedor", "").replace("NIT", "").strip()
-            datos["garantia_favor_fecha_inscripcion"] = _convertir_fecha_ddmmyyyy(t.get("Fecha Inscripción", ""))
-            break
-
-    # Garantias Mobiliarias -- hasta 2 registros (inscripcion / levantamiento),
-    # se distinguen por el texto libre del campo "Estado".
-    for t in tarjetas:
-        if "ID Prenda" in t:
-            estado_texto = t.get("Estado", "").lower()
-            prefijo = "garantia_levantamiento_" if "levantamiento" in estado_texto else "garantia_inscripcion_"
-            datos[prefijo + "id_prenda"] = t.get("ID Prenda", "")
-            datos[prefijo + "entidad"] = t.get("Entidad", "")
-            datos[prefijo + "entidad_nit"] = t.get("Identificación Entidad", "").replace("NIT", "").strip()
-            datos[prefijo + "fecha"] = _convertir_fecha_ddmmyyyy(t.get("Fecha de Registro", ""))
-
-    # Limitaciones a la Propiedad (embargo, hurto, etc.) -- distinto de
-    # Prenda/Garantias Mobiliarias. Solo se guarda la mas reciente/vigente.
-    # Nombres de columnas confirmados por el CSS real del componente
-    # (fechaExpedicion, fechaRadicacion, noDocumento, departamento,
-    # municipio) -- se prueban varias variantes de texto por si acaso.
-    for t in tarjetas:
-        titulo_lower = t.get("_titulo", "").lower()
-        if "limitacion" in titulo_lower:
-            datos["limitacion_tipo"] = t.get("Tipo de Limitación", "") or t.get("Tipo", "")
-            datos["limitacion_numero_oficio"] = (
-                t.get("Número de Documento", "") or t.get("No. de Documento", "")
-                or t.get("Número de Oficio", "") or t.get("No. Oficio", ""))
-            datos["limitacion_entidad"] = t.get("Entidad", "")
-            datos["limitacion_departamento"] = t.get("Departamento", "")
-            datos["limitacion_municipio"] = t.get("Municipio", "")
-            datos["limitacion_fecha_oficio"] = _convertir_fecha_ddmmyyyy(
-                t.get("Fecha de Expedición", "") or t.get("Fecha Expedición", "") or t.get("Fecha de Expedición del Oficio", ""))
-            datos["limitacion_fecha_registro"] = _convertir_fecha_ddmmyyyy(
-                t.get("Fecha de Radicación", "") or t.get("Fecha Radicación", "") or t.get("Fecha de Registro", ""))
-            break
-
-
-    datos["placa"] = campo("PLACA DEL VEHÍCULO").upper()
-
-    # --- DIAGNOSTICO TEMPORAL (quitar despues de confirmar los nombres reales) ---
-    datos["_debug_tarjetas_limitacion"] = [t for t in tarjetas if "limitacion" in t.get("_titulo", "").lower()]
-    datos["_debug_titulos_tarjetas"] = [t.get("_titulo", "") for t in tarjetas if t.get("_titulo")]
-    # --- FIN DIAGNOSTICO TEMPORAL ---
-
-    return datos
-
-
-def _convertir_fecha_ddmmyyyy(fecha_str):
-    """Convierte 'dd/mm/yyyy' (formato del RUNT) a 'yyyy-mm-dd' (formato de
-    Postgres), o None si el texto viene vacio."""
-    fecha_str = (fecha_str or "").strip()
-    if not fecha_str:
-        return None
-    try:
-        dd, mm, yyyy = fecha_str.split("/")
-        return f"{yyyy}-{mm}-{dd}"
-    except Exception:
-        return None
-
-
-def guardar_vehiculo_runt(datos):
-    """Guarda (o actualiza) los datos de un vehiculo consultado en el RUNT.
-    El RUNT siempre marca fuente='RUNT' y sobrescribe cualquier dato previo
-    que hubiera venido solo de una lectura por OCR."""
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        # Los campos "_debug_*" son solo para diagnostico en pantalla, no
-        # corresponden a columnas reales de la tabla.
-        columnas = [k for k in datos.keys() if k != "placa" and not k.startswith("_debug")]
-        columnas.append("fuente")
-        set_clause = ", ".join(f"{c}=EXCLUDED.{c}" for c in columnas)
-        cols_sql = ", ".join(["placa"] + columnas + ["leido_en"])
-        vals_sql = ", ".join(["%s"] * (len(columnas) + 2))
-        valores = [datos["placa"]] + [datos.get(c) for c in columnas[:-1]] + ["RUNT"] + [datetime.now()]
-        cur.execute(f"""
-            INSERT INTO vehiculos ({cols_sql})
-            VALUES ({vals_sql})
-            ON CONFLICT (placa) DO UPDATE SET {set_clause}, leido_en=EXCLUDED.leido_en
-        """, valores)
-        conn.commit()
-        cur.close(); conn.close()
-        print(f"  → Vehiculo RUNT guardado: {datos['placa']}")
-    except Exception as e:
-        print(f"Error guardando vehiculo RUNT: {e}")
-
-
-import unicodedata
-import subprocess
-import shutil
-from openpyxl.styles import PatternFill, Alignment, Border, Side
-from openpyxl.worksheet.pagebreak import Break
-import openpyxl as _openpyxl
-import copy
-
-# --- Generador de FUN (Formulario Unico Nacional) ---
-# La plantilla debe subirse al repositorio junto a app.py, con este mismo
-# nombre exacto ("AppJX.xlsm"), en el mismo directorio.
-FUN_PLANTILLA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "AppJX.xlsm")
-DECLARACION_MANUAL_PLANTILLA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DECLARACION_MANUAL_DE_IMPUESTOS_DEPARTAMENTALES.xlsx")
-
-VERDE_MARCA = PatternFill(start_color="92D050", end_color="92D050", fill_type="solid")
-
-# Cada opcion marca DOS celdas: el numero/casilla y la etiqueta de texto,
-# para que la seleccion se vea claramente (no solo el numero).
-CELDAS_TRAMITE = {
-    "MATRICULA/ REGISTRO": ("A7", "B7"), "TRASPASO": ("E7", "F7"),
-    "TRASLADO MATRICULA / REGISTRO": ("I7", "J7"), "RADICADO  MATRICULA / REGISTRO": ("N7", "O7"),
-    "CAMBIO DE COLOR": ("Q7", "R7"), "CAMBIO DE SERVICIO": ("T7", "U7"),
-    "REGRABAR MOTOR": ("A9", "B9"), "REGRABAR CHASIS": ("E9", "F9"), "TRANSFORMACION": ("I9", "J9"),
-    "DUPLICADO LICENCIA TRANSITO": ("N9", "O9"), "INSCRIPC. PRENDA": ("Q9", "R9"), "LEVANTA PRENDA": ("T9", "U9"),
-    "CANCELACION MATRICULA / REGISTRO": ("A12", "B12"), "CAMBIO DE PLACAS": ("E12", "F12"),
-    "DUPLICADO DE PLACAS": ("I12", "J12"), "REMATRICULA": ("N12", "O12"),
-    "CAMBIO DE CARROCERIA": ("Q12", "R12"),
-}
-# "OTROS" ya no vive aqui -- se marca aparte, solo cuando hay traslado (ver mas abajo)
-CELDA_OTROS_TRAMITE = ("T12", "U12")
-
-CELDAS_CLASE = {
-    "AUTOMOVIL": ("A17", "A16"), "BUS": ("D17", "D16"), "BUSETA": ("H17", "H16"),
-    "CAMION": ("L17", "L16"), "CAMIONETA": ("O17", "O16"), "CAMPERO": ("P17", "P16"),
-    "MICROBUS": ("S17", "S16"), "TRACTOCAMION": ("A19", "A18"), "MOTOCICLETA": ("D19", "D18"),
-    "MOTOCARRO": ("H19", "H18"), "MOTOTRICICLO": ("L19", "L18"), "CUATRIMOTO": ("O19", "O18"),
-    "VOLQUETA": ("P19", "P18"), "OTRO": ("S19", "S18"),
-}
-CELDAS_COMBUSTIBLE = {
-    "GASOLINA": ("AC8", "AC7"), "DIESEL": ("AE8", "AE7"), "GAS": ("AF8", "AF7"),
-    "MIXTO": ("AG8", "AG7"), "ELECTRICO": ("AH8", "AH7"), "HIDROGENO": ("AI8", "AI7"),
-    "ETANOL": ("AJ8", "AJ7"), "BIODIESEL": ("AK8", "AK7"),
-}
-CELDAS_SERVICIO = {
-    "PARTICULAR": ("AE29", "AE28"), "PUBLICO": ("AF29", "AF28"), "DIPLOMATICO": ("AG29", "AG28"),
-    "OFICIAL": ("AH29", "AH28"), "ESPECIAL": ("AI29", "AI28"), "OTROS": ("AJ29", "AJ28"),
-}
-CELDAS_REFERENCIA_SIMPLE = {
-    "AJ3": "placa", "W7": "marca", "Z7": "linea", "W10": "color",
-    "AG10": "modelo", "AI10": "cilindrada", "W13": "capacidad",
-    "AE17": "numero_motor", "W19": "carroceria", "AE19": "numero_chasis",
-    "AE22": "numero_serie", "AE24": "vin",
-    "A24": "propietario_primer_apellido", "I24": "propietario_segundo_apellido",
-    "P24": "propietario_nombres", "S26": "propietario_documento",
-    "A29": "propietario_direccion", "M29": "propietario_ciudad", "S29": "propietario_telefono",
-    "A37": "comprador_primer_apellido", "I37": "comprador_segundo_apellido",
-    "P37": "comprador_nombres", "S41": "comprador_documento",
-    "A44": "comprador_direccion", "M44": "comprador_ciudad", "S44": "comprador_telefono",
-    "AG41": "traslado_municipio",
-}
-
-
-def _fun_normalizar(texto):
-    if not texto:
-        return ""
-    texto = str(texto).upper().strip()
-    return "".join(c for c in unicodedata.normalize("NFD", texto) if unicodedata.category(c) != "Mn")
-
-
-def _fun_coincide(valor_tramy, etiqueta_formulario):
-    """Compara por PALABRA COMPLETA (no por 'contiene'), para que por ejemplo
-    'GAS' no haga match por accidente dentro de 'GASOLINA'."""
-    a, b = _fun_normalizar(valor_tramy), _fun_normalizar(etiqueta_formulario)
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    return re.search(r"\b" + re.escape(b) + r"\b", a) is not None
-
-
-def _fun_marcar_checkboxes(ws, mapa_celdas, valor_tramy):
-    """Marca TODAS las opciones que coincidan (no solo la primera) -- un
-    vehiculo de combustible dual (ej. 'GASOLINA Y GAS') debe marcar ambas."""
-    if not valor_tramy:
-        return
-    for etiqueta, celdas in mapa_celdas.items():
-        if _fun_coincide(valor_tramy, etiqueta):
-            for celda in celdas:
-                ws[celda].fill = VERDE_MARCA
-
-
-def generar_fun(datos, ruta_salida_pdf):
-    """Genera el FUN diligenciado en PDF a partir de la plantilla Excel real
-    (FORMULARIO + EXPORTAR), con las casillas marcadas en verde."""
-    wb = _openpyxl.load_workbook(FUN_PLANTILLA, data_only=False, keep_vba=True)
-    exportar = wb["EXPORTAR"]
-    formulario = wb["FORMULARIO"]
-
-    for row in formulario.iter_rows():
-        for cell in row:
-            if isinstance(cell.value, str) and "[1]EXPORTAR!" in cell.value:
-                cell.value = cell.value.replace("[1]EXPORTAR!", "EXPORTAR!")
-            elif isinstance(cell.value, str) and "[1]DATOS!" in cell.value:
-                cell.value = cell.value.replace("[1]DATOS!", "DATOS!")
-
-    exportar["D8"] = datos.get("propietario_nombres", "")
-    exportar["D9"] = datos.get("propietario_primer_apellido", "")
-    exportar["D10"] = datos.get("propietario_segundo_apellido", "")
-    exportar["D11"] = datos.get("propietario_documento", "")
-    exportar["D12"] = datos.get("propietario_direccion", "")
-    exportar["D13"] = datos.get("propietario_ciudad", "")
-    exportar["D14"] = datos.get("propietario_telefono", "")
-    exportar["D16"] = datos.get("comprador_nombres", "")
-    exportar["D17"] = datos.get("comprador_primer_apellido", "")
-    exportar["D18"] = datos.get("comprador_segundo_apellido", "")
-    exportar["D19"] = datos.get("comprador_documento", "")
-    exportar["D20"] = datos.get("comprador_direccion", "")
-    exportar["D21"] = datos.get("comprador_ciudad", "")
-    exportar["D22"] = datos.get("comprador_telefono", "")
-    exportar["D27"] = datos.get("placa", "")
-    exportar["D28"] = datos.get("servicio", "")
-    exportar["D29"] = datos.get("clase", "")
-    exportar["D30"] = datos.get("marca", "")
-    exportar["D31"] = datos.get("linea", "")
-    exportar["D32"] = datos.get("modelo", "")
-    exportar["D33"] = datos.get("color", "")
-    exportar["D34"] = datos.get("numero_serie", "")
-    exportar["D35"] = datos.get("numero_motor", "")
-    exportar["D36"] = datos.get("numero_chasis", "")
-    exportar["D37"] = datos.get("cilindrada", "")
-    exportar["D38"] = datos.get("carroceria", "")
-    exportar["D39"] = datos.get("combustible", "")
-    exportar["D40"] = datos.get("autoridad_transito", "")
-    exportar["D41"] = datos.get("capacidad", "")
-    exportar["D42"] = datos.get("vin", "")
-    exportar["D43"] = "SI" if datos.get("gravamenes_propiedad") else "NO"
-    exportar["D44"] = datos.get("fecha_matricula_inicial", "")
-    exportar["D47"] = datos.get("tramite", "")
-    exportar["D51"] = datos.get("traslado_municipio", "")
-
-    formulario["AC2"] = datos.get("autoridad_transito", "")
-    formulario["AC2"].alignment = Alignment(horizontal="center", vertical="center")
-    formulario["AA4"] = datos.get("municipio", "")
-
-    for celda, clave in CELDAS_REFERENCIA_SIMPLE.items():
-        if not datos.get(clave):
-            formulario[celda] = ""
-
-    _fun_marcar_checkboxes(formulario, CELDAS_TRAMITE, datos.get("tramite", ""))
-    _fun_marcar_checkboxes(formulario, CELDAS_CLASE, datos.get("clase", ""))
-    _fun_marcar_checkboxes(formulario, CELDAS_COMBUSTIBLE, datos.get("combustible", ""))
-    _fun_marcar_checkboxes(formulario, CELDAS_SERVICIO, datos.get("servicio", ""))
-
-    # "OTROS" (en Tramite Solicitado) NO depende del tramite elegido -- se
-    # marca unica y exclusivamente cuando hay un traslado de cuenta.
-    if datos.get("traslado_municipio"):
-        for celda in CELDA_OTROS_TRAMITE:
-            formulario[celda].fill = VERDE_MARCA
-
-    formulario["A51"] = ""  # pie de pagina "Juridicox.com..." -- se quita
-
-    hojas_a_conservar = {"FORMULARIO", "EXPORTAR", "DATOS"}
-    for nombre in list(wb.sheetnames):
-        if nombre not in hojas_a_conservar:
-            del wb[nombre]
-    formulario.sheet_state = "visible"
-    wb.active = wb.sheetnames.index("FORMULARIO")
-
-    formulario.print_area = "A1:AY47"
-    formulario.page_setup.orientation = "landscape"
-    formulario.page_setup.paperSize = formulario.PAPERSIZE_LETTER
-    formulario.page_setup.scale = 100
-
-    id_temp = str(uuid.uuid4())[:8]
-    ruta_xlsm_temp = f"/tmp/_fun_{id_temp}.xlsm"
-    wb.save(ruta_xlsm_temp)
-
-    subprocess.run([
-        "soffice", "--headless", "--convert-to", "pdf",
-        "--outdir", os.path.dirname(ruta_salida_pdf), ruta_xlsm_temp
-    ], check=True, timeout=90)
-
-    generado = os.path.join(os.path.dirname(ruta_salida_pdf), f"_fun_{id_temp}.pdf")
-    shutil.move(generado, ruta_salida_pdf)
-    os.remove(ruta_xlsm_temp)
-
-
-def _moneda(valor):
-    """Formatea un valor numerico como texto de moneda '$ X,XXX,XXX' para
-    la declaracion manual."""
-    try:
-        return "$ {:,.0f}".format(float(valor))
-    except (TypeError, ValueError):
-        return valor
-
-
-def generar_declaracion_manual_pdf(datos, ruta_salida_pdf):
-    """Genera la Declaracion Manual (formulario FO-M8-P6-008) diligenciada,
-    a partir de la plantilla Excel real (hojas CONTRIBUYENTE y ENTIDAD
-    RECAUDADORA). 'datos' es un dict con todos los campos ya resueltos:
-    datos del vehiculo, del propietario, y la liquidacion privada."""
-    wb = _openpyxl.load_workbook(DECLARACION_MANUAL_PLANTILLA)
-
-    for nombre_hoja in wb.sheetnames:
-        ws = wb[nombre_hoja]
-
-        # A. Periodo
-        ws["H12"] = datos.get("vigencia", "")
-
-        # C. Declarante
-        ws["D15"] = datos.get("nombre_completo", "")
-        ws["D18"] = datos.get("apellidos", "")
-        ws["AZ18"] = datos.get("celular", "")
-        ws["CA18"] = datos.get("telefono", "")
-        ws["CO18"] = datos.get("email", "")
-        ws["D21"] = datos.get("direccion", "")
-        ws["BE21"] = datos.get("municipio_residencia", "")
-        ws["CI21"] = datos.get("departamento_residencia", "ANTIOQUIA")
-        ws["CR15"] = datos.get("numero_documento", "")
-        tipo_doc = (datos.get("tipo_documento") or "").upper()
-        casillas_tipo_doc = {"CC": "BM15", "NIT": "BV15", "TI": "CC15", "CE": "CH15", "OTRO": "CN15"}
-        if tipo_doc in casillas_tipo_doc:
-            ws[casillas_tipo_doc[tipo_doc]] = "X"
-
-        # D. Vehiculo
-        ws["D24"] = datos.get("placa", "")
-        ws["Z24"] = datos.get("marca", "")
-        ws["BB24"] = datos.get("linea", "")
-        ws["CP24"] = datos.get("modelo", "")
-        ws["D27"] = datos.get("clase", "")
-        ws["AJ27"] = datos.get("carroceria", "")
-        # D7 GRUPO se deja en blanco (instructivo oficial)
-        ws["BZ27"] = datos.get("puertas", "")
-        ws["CL27"] = datos.get("cilindraje", "")
-        ws["D30"] = datos.get("capacidad_carga", "")
-        ws["AJ30"] = datos.get("capacidad_pasajeros", "")
-        ws["BP30"] = datos.get("municipio_matricula", "")
-        ws["CL30"] = datos.get("departamento_matricula", "ANTIOQUIA")
-
-        if datos.get("blindado"):
-            ws["S33"] = "X"
-        if datos.get("importado"):
-            ws["AN33"] = "X"
-
-        ws["CI35"] = datos.get("caja", "")
-        ws["CY35"] = datos.get("traccion", "")
-
-        # E. Liquidacion privada -- con formato de moneda
-        ws["AF38"] = _moneda(datos.get("avaluo", 0))
-        ws["AF40"] = _moneda(datos.get("impuesto", 0))
-        ws["AF41"] = _moneda(datos.get("sanciones", 0))
-        ws["AF42"] = _moneda(datos.get("descuentos", 0))
-        ws["AF43"] = _moneda(datos.get("total_cargo_5", 0))
-        ws["CJ37"] = _moneda(datos.get("total_cargo_6", 0))
-        ws["CJ38"] = _moneda(datos.get("intereses_mora", 0))
-        ws["CJ39"] = _moneda(datos.get("pagos_anteriores", 0))
-        ws["CJ40"] = _moneda(datos.get("descuento_interes", 0))
-        ws["CJ41"] = _moneda(datos.get("saldo_favor", 0))
-        ws["CJ42"] = _moneda(datos.get("total_pagar", 0))
-
-        # J. Distribucion del recaudo -- 20% Municipio, 80% Departamento,
-        # calculado sobre el total a pagar (instructivo oficial, seccion J).
-        total_pagar_num = datos.get("total_pagar", 0) or 0
-        try:
-            total_pagar_num = float(total_pagar_num)
-        except (TypeError, ValueError):
-            total_pagar_num = 0
-        valor_municipio = round(total_pagar_num * 0.20)
-        valor_departamento = total_pagar_num - valor_municipio
-        ws["AE64"] = _moneda(valor_municipio)
-        ws["AE66"] = _moneda(valor_departamento)
-
-        # G. Declarante -- se deja en blanco a proposito. Se firma y se
-        # diligencia a lapicero de forma manual, no se prellena.
-
-        # Configuracion de pagina: una sola pagina por hoja, vertical.
-        ws.print_area = "B3:DI82"
-        ws.page_setup.orientation = "portrait"
-        ws.page_setup.paperSize = ws.PAPERSIZE_LETTER
-        ws.page_setup.fitToWidth = 1
-        ws.page_setup.fitToHeight = 1
-        ws.sheet_properties.pageSetUpPr.fitToPage = True
-        ws.print_options.gridLines = False
-        ws.sheet_view.showGridLines = False
-
-        # Limpiar bordes sueltos (restos de la plantilla) que generaban
-        # lineas verticales gruesas sin pertenecer a ninguna casilla real.
-        sin_borde = Border()
-        for coord in ["I7", "K7", "G35", "H35", "M49", "B50", "B64", "B66", "J66", "L66", "N66", "V66"]:
-            ws[coord].border = sin_borde
-
-        # D50 (G.2 Nombres y Apellidos) SI es la celda real de esa casilla
-        # (no un borde suelto) -- se le restaura el contorno completo.
-        borde_fino = Side(style="thin")
-        ws["D50"].border = Border(top=borde_fino, bottom=borde_fino, left=borde_fino, right=borde_fino)
-
-        # F40 ("VEHICULOS AUTOMOTORES") y F38 ("DEL VEHICULO") tenian
-        # alineacion vertical sin fijar -- al agrandar sus filas el texto
-        # se hundia y se veia separado de la linea de arriba.
-        celda_f40 = ws["F40"]
-        celda_f40.value = "VEHICULOS AUTOMOTORES"
-        celda_f40.alignment = Alignment(vertical="top", horizontal=celda_f40.alignment.horizontal)
-        celda_f38 = ws["F38"]
-        celda_f38.alignment = Alignment(vertical="top", horizontal=celda_f38.alignment.horizontal)
-
-        ws.row_dimensions[38].height = 14
-        ws.row_dimensions[40].height = 14
-        ws.row_dimensions[28].height = 13.5
-        ws.row_dimensions[29].height = 1.5
-        ws.row_dimensions[27].height = 16.5
-
-        # Los numeros de renglon (1 al 5) mostraban "###" en el PDF sin
-        # importar el ancho de columna -- convertirlos de numero a TEXTO
-        # elimina el problema de raiz (el "###" solo le pasa a numeros).
-        ws["D37"] = "1"
-        ws["D39"] = "2"
-        ws["D41"] = "3"
-        ws["D42"] = "4"
-        ws["D43"] = "5"
-
-        # Ademas usan un color de TEMA que LibreOffice a veces interpreta
-        # mal al convertir (texto invisible) -- se fija a negro explicito.
-        for coord in ["D37", "D39", "D41", "D42", "D43"]:
-            celda = ws[coord]
-            nueva_fuente = copy.copy(celda.font)
-            nueva_fuente.color = "FF000000"
-            celda.font = nueva_fuente
-
-    id_temp = str(uuid.uuid4())[:8]
-    ruta_xlsx_temp = f"/tmp/_decl_manual_{id_temp}.xlsx"
-    wb.save(ruta_xlsx_temp)
-
-    subprocess.run([
-        "soffice", "--headless", "--convert-to", "pdf",
-        "--outdir", os.path.dirname(ruta_salida_pdf), ruta_xlsx_temp
-    ], check=True, timeout=90)
-
-    generado = os.path.join(os.path.dirname(ruta_salida_pdf), f"_decl_manual_{id_temp}.pdf")
-    shutil.move(generado, ruta_salida_pdf)
-    os.remove(ruta_xlsx_temp)
-
-
-def _moneda_pys(valor):
-    """Formatea un valor como '$\\xa0X.XXX.XXX', igual al formato que ya
-    usa la plantilla PYS de AppJX.xlsm (con espacio duro y punto de miles)."""
-    try:
-        return "$\xa0" + "{:,.0f}".format(float(valor)).replace(",", ".")
-    except (TypeError, ValueError):
-        return "$\xa00"
-
-
-def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
-    """Genera el documento Estado de Cuenta (certificado de paz y salvo),
-    a partir de la plantilla AppJX.xlsm real (hojas PYS + ESTADO DE
-    CUENTA). 'datos' es un dict con: estado_veh (dict de estadoCuenta),
-    lista_detalle_pagos, lista_proceso_fiscal, lista_bloqueo, novedades."""
-    wb = _openpyxl.load_workbook(FUN_PLANTILLA, data_only=False, keep_vba=True)
-    pys = wb["PYS"]
-    edc = wb["ESTADO DE CUENTA"]
-
-    estado_veh = datos.get("estado_veh", {}) or {}
-    inicio = estado_veh.get("periodoInicioCertificacion", "")
-    fin    = estado_veh.get("periodoFinCertificacion", "")
-
-    # A22:B31 -- informacion general
-    pys["B22"] = f"{inicio} a {fin}" if inicio and fin else ""
-    pys["B23"] = estado_veh.get("placa", "")
-    pys["B24"] = estado_veh.get("modelo", "")
-    pys["B25"] = estado_veh.get("municipioMatricula", "")
-    pys["B26"] = estado_veh.get("departamentoMatricula", "")
-    # Fecha de expedicion -- debe ser la fecha en que REALMENTE se
-    # consulto y se obtuvo este numero de certificado (guardada en
-    # 'fecha_consulta'), no la fecha en que se genera el documento --
-    # el numero de certificado es unico de esa consulta puntual.
-    fecha_consulta = datos.get("fecha_consulta")
-    pys["B27"] = fecha_consulta if fecha_consulta else datetime.now()
-    pys["B28"] = estado_veh.get("marca", "")
-    pys["B29"] = estado_veh.get("cilindraje", "")
-    pys["B30"] = estado_veh.get("linea", "")
-    pys["B31"] = estado_veh.get("capacidadCarga", "")
-
-    # A35:J.. -- declaraciones presentadas (una fila por cada elemento)
-    declaraciones = datos.get("lista_detalle_pagos", []) or []
-    fila = 35
-    for d in declaraciones:
-        pys.cell(row=fila, column=1,  value=d.get("tipoLiquidacion", ""))
-        pys.cell(row=fila, column=2,  value=d.get("formularioLiquidacion", ""))
-        fecha_pago = d.get("fechaPago")
-        if fecha_pago:
-            try:
-                pys.cell(row=fila, column=3, value=datetime.utcfromtimestamp(fecha_pago / 1000))
-            except (TypeError, ValueError, OSError):
-                pys.cell(row=fila, column=3, value="")
-        pys.cell(row=fila, column=4,  value=_moneda_pys(d.get("impuesto", 0)))
-        pys.cell(row=fila, column=5,  value=_moneda_pys(d.get("sancion", 0)))
-        pys.cell(row=fila, column=6,  value=_moneda_pys(d.get("descuento", 0)))
-        pys.cell(row=fila, column=7,  value=_moneda_pys(d.get("interesMora", 0)))
-        pys.cell(row=fila, column=8,  value=_moneda_pys(d.get("totalPagar", 0)))
-        pys.cell(row=fila, column=9,  value=_moneda_pys(d.get("avaluoComercial", 0)))
-        pys.cell(row=fila, column=10, value=d.get("vigencia", ""))
-        fila += 1
-
-    # M22.. / O22.. / P22.. -- procesos fiscales, bloqueos, novedades
-    procesos = datos.get("lista_proceso_fiscal", []) or []
-    bloqueos = datos.get("lista_bloqueo", []) or []
-    novedades = datos.get("novedades", []) or []
-
-    for i, p in enumerate(procesos):
-        texto = f"{p.get('descripcionProcesoFiscal', '')} ({p.get('vigencia', '')})"
-        pys.cell(row=22 + i, column=13, value=texto)  # M
-    for i, b in enumerate(bloqueos):
-        texto = f"{b.get('descripcionBloqueo', '')} ({b.get('vigencia', '')})"
-        pys.cell(row=22 + i, column=15, value=texto)  # O
-    for i, n in enumerate(novedades):
-        if isinstance(n, dict):
-            descripcion = n.get("descripcionNovedad", "")
-            fecha_raw = (n.get("fechaNovedad") or "")[:10]  # "YYYY-MM-DD"
-            fecha_fmt = fecha_raw
-            if fecha_raw:
-                try:
-                    fecha_fmt = datetime.strptime(fecha_raw, "%Y-%m-%d").strftime("%d/%m/%Y")
-                except ValueError:
-                    fecha_fmt = fecha_raw
-            texto = f"{descripcion} - {fecha_fmt}" if fecha_fmt else descripcion
-        else:
-            texto = str(n)
-        pys.cell(row=22 + i, column=16, value=texto)  # P
-
-    # "El vehiculo no presenta observaciones" solo si las 3 listas estan
-    # vacias -- si hay cualquier cosa, se quita ese aviso.
-    if procesos or bloqueos or novedades:
-        edc["A74"] = ""
-
-    # Columna "VIGENCIAS ADEUDADAS" (A53:A72) siempre se deja en blanco --
-    # este documento solo se genera cuando el vehiculo esta a paz y salvo,
-    # nunca hay vigencias adeudadas que mostrar aqui. Se sobrescribe
-    # directo porque la formula original (=IF(AND(...),"")) no tiene rama
-    # para cuando la condicion es falsa, y en ese caso Excel/LibreOffice
-    # muestra el texto literal "FALSE" en vez de dejarlo vacio.
-    for r in range(53, 73):
-        edc.cell(row=r, column=1, value="")
-
-    # Borde suelto (resto de la plantilla) que cortaba visualmente el
-    # texto "Tipos de declaraciones..." justo en la palabra "Corrección".
-    edc["O47"].border = Border()
-
-    # Certificado No. -- se usa el numero real que entrega la Gobernacion
-    # en esta consulta puntual (cambia cada vez que se consulta).
-    edc["AG5"] = estado_veh.get("numeroCertificadoSap", "")
-
-    # La fila del "CERTIFICADO No." (fila 5) tenia una altura mucho mayor
-    # (27.75) que el resto del encabezado, dejando un espacio visual
-    # grande debajo del titulo "ESTADO DE CUENTA...". Se reduce para que
-    # quede mas pegado al titulo.
-    edc.row_dimensions[5].height = 14
-
-    # "Avaluo para la vigencia" -- se usa directamente el avaluo de la
-    # vigencia actual (viene ya calculado en estadoCuenta), en vez de
-    # depender de la formula original (que buscaba la ultima fila de la
-    # tabla y se rompe si borramos filas despues).
-    edc["AE76"] = _moneda_pys(estado_veh.get("avaluoComercial", 0))
-
-    # Ocultar las filas vacias sobrantes de ambas tablas (no todas las
-    # placas tienen 30 declaraciones ni observaciones). Se OCULTAN en vez
-    # de borrarlas (LibreOffice no imprime filas ocultas) porque borrar
-    # filas con openpyxl en una hoja con tantas celdas fusionadas como
-    # esta corrompe las fusiones y daña el diseno.
-    def _ocultar_filas(hoja, desde, hasta):
-        for r in range(desde, hasta + 1):
-            hoja.row_dimensions[r].hidden = True
-
-    FILA_OBS_INICIO, FILA_OBS_FIN = 53, 72
-    max_obs = max(len(procesos), len(bloqueos), len(novedades))
-    if max_obs == 0:
-        _ocultar_filas(edc, FILA_OBS_INICIO, FILA_OBS_FIN)
-    else:
-        ultima_fila_obs_usada = FILA_OBS_INICIO + max_obs - 1
-        if ultima_fila_obs_usada < FILA_OBS_FIN:
-            _ocultar_filas(edc, ultima_fila_obs_usada + 1, FILA_OBS_FIN)
-
-    # Se libera una fila mas para la tabla de declaraciones (para que
-    # quepa una vigencia adicional): la leyenda "* Tipos de declaraciones
-    # ..." que vivia en la fila 47 se traslada a la fila 48 (que era un
-    # espaciador chico y quedaba libre), y la fila 47 pasa a ser una fila
-    # mas de la tabla -- copiando las FORMULAS reales de la fila 46 (que
-    # trae los datos de PYS!*65) pero apuntando a PYS!*66, para que la
-    # fila nueva si traiga datos de verdad y no quede vacia.
-    celda_leyenda = edc["A47"]
-    edc["A48"] = celda_leyenda.value
-    edc["A48"].font = copy.copy(celda_leyenda.font)
-    edc["A48"].alignment = Alignment(
-        horizontal=celda_leyenda.alignment.horizontal,
-        vertical=celda_leyenda.alignment.vertical,
-        wrapText=True
-    )
-    # Se fusiona en un ancho moderado (mas angosto que el parrafo legal de
-    # la fila 6, que va de A a BH) para que el texto, mas corto, si se
-    # vea obligado a partir en 2 lineas en vez de quedar en 1 sola.
-    edc.merge_cells("A48:AJ49")
-
-    for col in range(1, 60):
-        celda_origen = edc.cell(row=46, column=col)
-        if isinstance(celda_origen.value, str) and celda_origen.value.startswith("="):
-            celda_destino = edc.cell(row=47, column=col)
-            celda_destino.value = celda_origen.value.replace("65", "66")
-            celda_destino.font = copy.copy(celda_origen.font)
-            celda_destino.alignment = copy.copy(celda_origen.alignment)
-            celda_destino.border = copy.copy(celda_origen.border)
-            celda_destino.number_format = celda_origen.number_format
-        elif col == 1:
-            # A47 tenia la leyenda -- se limpia para dejarla lista como
-            # celda de datos (ya se copio arriba a A48).
-            celda_leyenda.value = None
-
-    edc.row_dimensions[47].height = 21.0   # misma altura que las demas filas de declaraciones
-    edc.row_dimensions[48].height = 20.25  # altura que antes tenia la leyenda, para que quepa completa
-
-    FILA_DECL_INICIO, FILA_DECL_FIN = 16, 47
-    filas_declaraciones = len(declaraciones)
-    if filas_declaraciones == 0:
-        _ocultar_filas(edc, FILA_DECL_INICIO, FILA_DECL_FIN)
-    else:
-        ultima_fila_decl_usada = FILA_DECL_INICIO + filas_declaraciones - 1
-        if ultima_fila_decl_usada < FILA_DECL_FIN:
-            _ocultar_filas(edc, ultima_fila_decl_usada + 1, FILA_DECL_FIN)
-
-    # NOTA: aqui habiamos forzado un salto de pagina manual para que
-    # "Observaciones" y "Avaluo para la vigencia" quedaran siempre juntos.
-    # Se quito porque, al ocultar filas (en vez de borrarlas), ese salto
-    # forzado dejaba un bloque de espacio en blanco (las filas ocultas de
-    # antes del salto igual "reservaban" el hueco). Con las filas ocultas
-    # la paginacion natural ya deberia acomodar todo bien sin forzar nada.
-
-    hojas_a_conservar = {"PYS", "ESTADO DE CUENTA"}
-    for nombre in list(wb.sheetnames):
-        if nombre not in hojas_a_conservar:
-            del wb[nombre]
-    edc.sheet_state = "visible"
-    wb.active = wb.sheetnames.index("ESTADO DE CUENTA")
-
-    # El texto se veia "gris suave" en vez de negro solido -- mismo
-    # problema de color de TEMA que ya resolvimos en la Declaracion
-    # Manual (LibreOffice a veces interpreta mal el indice del tema al
-    # convertir). Se fuerza negro explicito en todas las celdas con texto.
-    for hoja in (pys, edc):
-        for fila_celdas in hoja.iter_rows():
-            for celda in fila_celdas:
-                if celda.value is not None:
-                    nueva_fuente = copy.copy(celda.font)
-                    nueva_fuente.color = "FF000000"
-                    celda.font = nueva_fuente
-
-    id_temp = str(uuid.uuid4())[:8]
-    ruta_xlsm_temp = f"/tmp/_edc_{id_temp}.xlsm"
-    wb.save(ruta_xlsm_temp)
-
-    subprocess.run([
-        "soffice", "--headless", "--convert-to", "pdf",
-        "--outdir", os.path.dirname(ruta_salida_pdf), ruta_xlsm_temp
-    ], check=True, timeout=90)
-
-    generado = os.path.join(os.path.dirname(ruta_salida_pdf), f"_edc_{id_temp}.pdf")
-    shutil.move(generado, ruta_salida_pdf)
-    os.remove(ruta_xlsm_temp)
-
-
-def bloquear_recursos(page):
-    page.route("**/*", lambda route: route.abort()
-               if route.request.resource_type in ["image", "stylesheet", "font", "media", "other"]
-               else route.continue_())
-
-
-def resolver_recaptcha_2captcha(site_key, page_url, intentos=3):
-    ultimo_error = None
-    for intento in range(intentos):
-        try:
-            resp = requests.post("https://2captcha.com/in.php", data={
-                "key": TWOCAPTCHA_API_KEY, "method": "userrecaptcha",
-                "googlekey": site_key, "pageurl": page_url, "json": 1,
-            }, timeout=15)
-            data = resp.json()
-            if data.get("status") != 1:
-                raise Exception(f"2captcha error: {data.get('request')}")
-            captcha_id = data["request"]
-            for _ in range(24):
-                time.sleep(5)
-                resultado = requests.get("https://2captcha.com/res.php", params={
-                    "key": TWOCAPTCHA_API_KEY, "action": "get", "id": captcha_id, "json": 1,
-                }, timeout=10).json()
-                if resultado.get("status") == 1:
-                    return resultado["request"]
-                if resultado.get("request") not in ("CAPCHA_NOT_READY", "CAPTCHA_NOT_READY"):
-                    raise Exception(f"2captcha error: {resultado.get('request')}")
-            raise Exception("2captcha tardo demasiado.")
-        except Exception as e:
-            ultimo_error = e
-            if "IP_BANNED" in str(e) and intento < intentos - 1:
-                time.sleep(3)
-                continue
-            raise
-    raise ultimo_error
-
-
-def resolver_turnstile_2captcha(site_key, page_url, intentos=3):
-    ultimo_error = None
-    for intento in range(intentos):
-        try:
-            resp = requests.post("https://2captcha.com/in.php", data={
-                "key": TWOCAPTCHA_API_KEY, "method": "turnstile",
-                "sitekey": site_key, "pageurl": page_url, "json": 1,
-            }, timeout=15)
-            data = resp.json()
-            if data.get("status") != 1:
-                raise Exception(f"2captcha error: {data.get('request')}")
-            captcha_id = data["request"]
-            for _ in range(24):
-                time.sleep(5)
-                resultado = requests.get("https://2captcha.com/res.php", params={
-                    "key": TWOCAPTCHA_API_KEY, "action": "get", "id": captcha_id, "json": 1,
-                }, timeout=10).json()
-                if resultado.get("status") == 1:
-                    return resultado["request"]
-                if resultado.get("request") not in ("CAPCHA_NOT_READY", "CAPTCHA_NOT_READY"):
-                    raise Exception(f"2captcha error: {resultado.get('request')}")
-            raise Exception("2captcha tardo demasiado.")
-        except Exception as e:
-            ultimo_error = e
-            if "IP_BANNED" in str(e) and intento < intentos - 1:
-                time.sleep(3)
-                continue
-            raise
-    raise ultimo_error
-
-
-# ============================================================
-#  MUNICIPIOS (sin tocar)
-# ============================================================
-def consultar_envigado(page, placa):
-    url = "https://movilidad.envigado.gov.co/portal-servicios/#/impuesto-local"
-    page.goto(url, wait_until="domcontentloaded")
-    page.get_by_role("textbox", name="Placa").fill(placa)
-    page.get_by_role("button", name="Buscar").click()
-    page.wait_for_function("""() => {
-        const texto = document.body.innerText;
-        const tabla = document.querySelector('#tablaCollapseVigencias');
-        const noMatriculado = texto.includes('El vehiculo no se encuentra matriculado en la Secretaria de Movilidad');
-        // Paz y salvo: esperar que la tabla tenga al menos una fila con dato real
-        const pazYSalvoHeader = texto.includes('Último pago realizado');
-        const pazYSalvoConDatos = pazYSalvoHeader && document.querySelectorAll('table tr td').length >= 3;
-        return tabla || noMatriculado || pazYSalvoConDatos;
-    }""", timeout=TIMEOUT)
-    if page.get_by_text(MSG_NO_MATRICULADO).is_visible():
-        return [], 0
-
-    # Espera extra para que Angular termine de renderizar
-    page.wait_for_timeout(1500)
-    texto_pagina = page.inner_text("body")
-
-    # Verificar en el DOM real si existe Y ES VISIBLE la tabla de vigencias
-    # pendientes. La tabla #tablaCollapseVigencias SIEMPRE existe en el DOM
-    # (Angular la renderiza vacía), solo se oculta con ng-hide en el div
-    # contenedor cuando no hay deuda — por eso hay que chequear visibilidad
-    # real (is_visible), no solo presencia (.count() > 0).
-    try:
-        tiene_vigencias_pendientes = page.locator("#tablaCollapseVigencias").is_visible()
-    except Exception:
-        tiene_vigencias_pendientes = False
-
-    # Paz y salvo — extraer datos de la tabla #tablaUltimosPagos
-    if 'Último pago realizado' in texto_pagina and not tiene_vigencias_pendientes:
-        try:
-            page.wait_for_selector("#tablaUltimosPagos tbody tr td", timeout=5000)
-        except Exception:
-            pass
-        fecha_pago = ""
-        marca_veh  = ""
-        placa_veh  = ""
-        try:
-            fila = page.locator("#tablaUltimosPagos tbody tr").first
-            placa_veh  = (fila.locator("td[data-label='Placa']").inner_text() or "").strip()
-            marca_veh  = (fila.locator("td[data-label='Marca']").inner_text() or "").strip()
-            fecha_pago = (fila.locator("td[data-label='Fecha pago']").inner_text() or "").strip()
-        except Exception:
-            pass
-        return [{
-            "vigencia":       "PAZ Y SALVO",
-            "estado":         f"Vehículo a paz y salvo en el Tránsito de Envigado. Último pago: {fecha_pago}".strip(". "),
-            "total_vigencia": 0,
-            "paz_y_salvo":    True,
-            "fecha_pago":     fecha_pago,
-            "marca":          marca_veh,
-            "placa_info":     placa_veh,
-        }], 0
-
-    if page.locator("#selectall").is_visible():
-        page.locator("#selectall").check()
-
-    # Extraer datos de último pago aunque haya deuda (verificación anti-falso-positivo)
-    placa_ult = ""; marca_ult = ""; fecha_ult = ""; valor_ult = ""
-    try:
-        fila_ult = page.locator("#tablaUltimosPagos tbody tr").first
-        placa_ult  = (fila_ult.locator("td[data-label='Placa']").inner_text() or "").strip()
-        marca_ult  = (fila_ult.locator("td[data-label='Marca']").inner_text() or "").strip()
-        fecha_ult  = (fila_ult.locator("td[data-label='Fecha pago']").inner_text() or "").strip()
-        valor_ult  = (fila_ult.locator("td[data-label='Valor pago']").inner_text() or "").strip()
-    except Exception:
-        pass
-
-    registros = []
-    filas = page.locator("#tablaCollapseVigencias tr").all()
-    for fila in filas:
-        texto_fila = fila.inner_text().strip()
-        if not texto_fila:
-            continue
-        año = re.search(r'\b(20\d{2})\b', texto_fila)
-        montos = re.findall(r'\$\s*[\d.]+', texto_fila)
-        if año and montos:
-            valor_str = montos[-1].replace('$', '').replace(' ', '').replace('.', '')
-            try:
-                registros.append({
-                    'vigencia': año.group(), 'estado': 'Pendiente de pago',
-                    'total_vigencia': int(valor_str),
-                    'placa_ultimo_pago': placa_ult,
-                    'marca_ultimo_pago': marca_ult,
-                    'fecha_ultimo_pago': fecha_ult,
-                    'valor_ultimo_pago': valor_ult,
-                })
-            except ValueError:
-                pass
-    total = sum(r['total_vigencia'] for r in registros)
-    return registros, total
-
-
-def consultar_sabaneta(page, placa):
-    url = "https://transitosabaneta.utsetsa.com/#/impuesto-local"
-    page.goto(url, wait_until="domcontentloaded", timeout=30000)
-    page.locator("#placa").wait_for(state="visible", timeout=15000)
-    page.locator("#placa").fill(placa)
-    page.get_by_role("button", name="Buscar").click()
-    page.wait_for_timeout(20000)
-    texto_pagina = page.inner_text("body")
-    html_pagina  = page.content()
-    if MSG_NO_MATRICULADO in texto_pagina:
-        return [], 0
-    if 'Último pago realizado' in texto_pagina and 'Vigencias pendientes' not in texto_pagina:
-        placa_sab = ""; marca_sab = ""; fecha_sab = ""; valor_sab = ""
-        try:
-            fila = page.locator("#tablaUltimosPagos tbody tr").first
-            celdas = fila.locator("td").all()
-            texts = [c.inner_text().strip() for c in celdas]
-            # Orden: Placa, Marca, Fecha pago, Valor pago
-            if len(texts) > 0: placa_sab = texts[0]
-            if len(texts) > 1: marca_sab = texts[1]
-            if len(texts) > 2: fecha_sab = texts[2]
-            if len(texts) > 3: valor_sab = texts[3]
-        except Exception:
-            pass
-        return [{
-            "vigencia":       "PAZ Y SALVO",
-            "estado":         "Vehículo a paz y salvo en el Tránsito de Sabaneta.",
-            "total_vigencia": 0,
-            "paz_y_salvo":    True,
-            "placa_info":     placa_sab,
-            "marca":          marca_sab,
-            "fecha_pago":     fecha_sab,
-            "valor_pago":     valor_sab,
-        }], 0
-    if 'Vigencias pendientes' not in texto_pagina:
-        return [], 0
-    page.locator("#tablaCollapseVigencias").wait_for(state="visible", timeout=15000)
-    checkbox = page.locator("#selectall")
-    checkbox.wait_for(state="visible", timeout=15000)
-    if checkbox.is_enabled():
-        checkbox.check()
-    page.wait_for_timeout(5000)
-    spans_cop = page.locator("span.fs-16.ng-binding").all()
-    total = 0
-    for span in spans_cop[::-1]:
-        texto = span.inner_text().strip()
-        if "COP" in texto and texto != "COP 0":
-            valor_str = texto.replace("COP", "").replace(".", "").strip()
-            try:
-                total = int(valor_str)
-                break
-            except ValueError:
-                pass
-    # Extraer datos de último pago aunque haya deuda (sirven para verificar
-    # que el scraper realmente consultó ESTE vehículo y no un falso positivo)
-    placa_ult = ""; marca_ult = ""; fecha_ult = ""; valor_ult = ""
-    try:
-        fila_ult = page.locator("#tablaUltimosPagos tbody tr").first
-        celdas_ult = fila_ult.locator("td").all()
-        texts_ult = [c.inner_text().strip() for c in celdas_ult]
-        if len(texts_ult) > 0: placa_ult = texts_ult[0]
-        if len(texts_ult) > 1: marca_ult = texts_ult[1]
-        if len(texts_ult) > 2: fecha_ult = texts_ult[2]
-        if len(texts_ult) > 3: valor_ult = texts_ult[3]
-    except Exception:
-        pass
-
-    registros = []
-    filas = page.locator("#tablaCollapseVigencias tr").all()
-    for fila in filas:
-        texto_fila = fila.inner_text().strip()
-        if not texto_fila:
-            continue
-        año = re.search(r'\b(20\d{2})\b', texto_fila)
-        montos = re.findall(r'COP\s*[\d.]+', texto_fila)
-        if año and montos:
-            valor_fila = montos[-1].replace('COP', '').replace(' ', '').replace('.', '')
-            try:
-                registros.append({
-                    'vigencia': año.group(), 'estado': 'Pendiente de pago',
-                    'total_vigencia': int(valor_fila),
-                    'placa_ultimo_pago': placa_ult,
-                    'marca_ultimo_pago': marca_ult,
-                    'fecha_ultimo_pago': fecha_ult,
-                    'valor_ultimo_pago': valor_ult,
-                })
-            except ValueError:
-                pass
-    return registros, total
-
-
-def consultar_itagui(page, placa):
-    url = "https://movilidad.transitoitagui.gov.co/portal-servicios/#/impuesto-local"
-    page.goto(url, wait_until="domcontentloaded")
-    page.get_by_role("textbox", name="Placa").fill(placa)
-    page.get_by_role("button", name="Buscar").click()
-    page.wait_for_function("""() => {
-        const texto = document.body.innerText;
-        const noMatriculado = texto.includes('El vehiculo no se encuentra matriculado en la Secretaria de Movilidad');
-        const conDeuda = texto.includes('Vigencias pendientes');
-        const pazYSalvo = texto.includes('Último pago realizado') && !texto.includes('Vigencias pendientes');
-        return noMatriculado || conDeuda || pazYSalvo;
-    }""", timeout=20000)
-    texto_pagina = page.inner_text("body")
-    if MSG_NO_MATRICULADO in texto_pagina:
-        return [], 0
-
-    # Paz y salvo — extraer datos de verificación (placa/marca/fecha) igual que Envigado
-    if 'Vigencias pendientes' not in texto_pagina and AÑO_ACTUAL in texto_pagina:
-        try:
-            page.wait_for_selector("#tablaUltimosPagos tbody tr td", timeout=5000)
-        except Exception:
-            pass
-        placa_veh = ""; marca_veh = ""; fecha_pago = ""
-        try:
-            fila = page.locator("#tablaUltimosPagos tbody tr").first
-            placa_veh  = (fila.locator("td[data-label='Placa']").inner_text() or "").strip()
-            marca_veh  = (fila.locator("td[data-label='Marca']").inner_text() or "").strip()
-            fecha_pago = (fila.locator("td[data-label='Fecha pago']").inner_text() or "").strip()
-        except Exception:
-            pass
-        return [{
-            "vigencia":       "PAZ Y SALVO",
-            "estado":         f"Vehículo a paz y salvo en el Tránsito de Itagüí. Último pago: {fecha_pago}".strip(". "),
-            "total_vigencia": 0,
-            "paz_y_salvo":    True,
-            "fecha_pago":     fecha_pago,
-            "marca":          marca_veh,
-            "placa_info":     placa_veh,
-        }], 0
-
-    page.locator("#tablaCollapseVigencias").wait_for(state="visible", timeout=15000)
-    checkbox = page.locator("#selectall")
-    checkbox.wait_for(state="visible", timeout=15000)
-    if checkbox.is_enabled():
-        checkbox.check()
-    page.wait_for_timeout(3000)
-    spans_cop = page.locator("span.fs-16.ng-binding").all()
-    total = 0
-    for span in spans_cop[::-1]:
-        texto = span.inner_text().strip()
-        if "COP" in texto and texto != "COP 0":
-            valor_str = texto.replace("COP", "").replace(".", "").strip()
-            try:
-                total = int(valor_str)
-                break
-            except ValueError:
-                pass
-
-    # Extraer datos de último pago aunque haya deuda (verificación anti-falso-positivo)
-    placa_ult = ""; marca_ult = ""; fecha_ult = ""; valor_ult = ""
-    try:
-        fila_ult = page.locator("#tablaUltimosPagos tbody tr").first
-        placa_ult = (fila_ult.locator("td[data-label='Placa']").inner_text() or "").strip()
-        marca_ult = (fila_ult.locator("td[data-label='Marca']").inner_text() or "").strip()
-        fecha_ult = (fila_ult.locator("td[data-label='Fecha pago']").inner_text() or "").strip()
-        valor_ult = (fila_ult.locator("td[data-label='Valor pago']").inner_text() or "").strip()
-    except Exception:
-        pass
-
-    registros = []
-    filas = page.locator("#tablaCollapseVigencias tr").all()
-    for fila in filas:
-        texto_fila = fila.inner_text().strip()
-        if not texto_fila:
-            continue
-        año = re.search(r'\b(20\d{2})\b', texto_fila)
-        montos = re.findall(r'COP\s*[\d.]+', texto_fila)
-        if año and montos:
-            valor_fila = montos[-1].replace('COP', '').replace(' ', '').replace('.', '')
-            try:
-                registros.append({
-                    'vigencia': año.group(), 'estado': 'Pendiente de pago',
-                    'total_vigencia': int(valor_fila),
-                    'placa_ultimo_pago': placa_ult,
-                    'marca_ultimo_pago': marca_ult,
-                    'fecha_ultimo_pago': fecha_ult,
-                    'valor_ultimo_pago': valor_ult,
-                })
-            except ValueError:
-                pass
-    return registros, total
-
-
-def consultar_bello(page, placa):
-    url = "https://serviciosdigitales.movilidadavanzadabello.com.co/portal-servicios/#/public"
-    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_function("""() => { return document.querySelectorAll('input[type="search"]').length > 0; }""", timeout=30000)
-    try:
-        page.get_by_role("button", name="Close").click(timeout=5000)
-    except:
-        pass
-    page.get_by_role("searchbox", name="Placa").nth(3).fill(placa)
-    page.get_by_role("button").nth(5).click()
-    try:
-        page.wait_for_url("**/impuesto-local", timeout=15000)
-    except:
-        return [], 0
-    page.wait_for_timeout(10000)
-    texto_pagina = page.inner_text("body")
-
-    def _extraer_verificacion():
-        """Intenta extraer placa/marca/fecha/valor del último pago para verificar
-        que el sistema consultó el vehículo real (anti falso-positivo)."""
-        placa_v = ""; marca_v = ""; fecha_v = ""; valor_v = ""
-        try:
-            fila = page.locator("#tablaUltimosPagos tbody tr").first
-            if fila.count() > 0:
-                placa_v = (fila.locator("td[data-label='Placa']").inner_text() or "").strip()
-                marca_v = (fila.locator("td[data-label='Marca']").inner_text() or "").strip()
-                fecha_v = (fila.locator("td[data-label='Fecha pago']").inner_text() or "").strip()
-                valor_v = (fila.locator("td[data-label='Valor pago (COP)']").inner_text() or "").strip()
-        except Exception:
-            pass
-        return placa_v, marca_v, fecha_v, valor_v
-
-    if 'paz y salvo' in texto_pagina or 'No se encontraron registros' in texto_pagina:
-        placa_v, marca_v, fecha_v, _ = _extraer_verificacion()
-        if placa_v or marca_v or fecha_v:
-            return [{
-                "vigencia":       "PAZ Y SALVO",
-                "estado":         f"Vehículo a paz y salvo en el Tránsito de Bello. Último pago: {fecha_v}".strip(". "),
-                "total_vigencia": 0,
-                "paz_y_salvo":    True,
-                "fecha_pago":     fecha_v,
-                "marca":          marca_v,
-                "placa_info":     placa_v,
-            }], 0
-        return [], 0
-
-    # La sección "Vigencias pendientes" se oculta con ng-hide (display:none)
-    # cuando NO hay deuda, y Playwright's inner_text() no incluye texto oculto.
-    # Por eso hay que extraer la verificación (tabla de últimos pagos, que SÍ
-    # es visible siempre) ANTES de decidir si hay o no vigencias pendientes.
-    placa_ult, marca_ult, fecha_ult, valor_ult = _extraer_verificacion()
-
-    if 'Vigencias pendientes' not in texto_pagina:
-        if placa_ult or marca_ult or fecha_ult:
-            return [{
-                "vigencia":       "PAZ Y SALVO",
-                "estado":         f"Vehículo a paz y salvo en el Tránsito de Bello. Último pago: {fecha_ult}".strip(". "),
-                "total_vigencia": 0,
-                "paz_y_salvo":    True,
-                "fecha_pago":     fecha_ult,
-                "marca":          marca_ult,
-                "placa_info":     placa_ult,
-            }], 0
-        return [], 0
-
-    registros = []
-    filas_vig = page.locator("#tablaCollapseVigencias tr").all()
-    for fila in filas_vig:
-        texto = fila.inner_text().strip()
-        if not texto:
-            continue
-        año = re.search(r'\b(20\d{2})\b', texto)
-        montos = re.findall(r'COP\s*[\d.]+', texto)
-        if año and montos:
-            valor_fila = montos[-1].replace('COP', '').replace(' ', '').replace('.', '')
-            try:
-                registros.append({
-                    'vigencia': año.group(), 'estado': 'Pendiente de pago' if 'Pendiente' in texto else 'Desconocido',
-                    'total_vigencia': int(valor_fila),
-                    'placa_ultimo_pago': placa_ult,
-                    'marca_ultimo_pago': marca_ult,
-                    'fecha_ultimo_pago': fecha_ult,
-                    'valor_ultimo_pago': valor_ult,
-                })
-            except ValueError:
-                pass
-    match_total = re.search(r'Total a pagar:\s*COP\s*([\d.]+)', texto_pagina)
-    total = int(match_total.group(1).replace('.', '')) if match_total else sum(r['total_vigencia'] for r in registros)
-
-    # Si no hay vigencias reales con deuda (registros vacío / total 0) pero sí
-    # se logró extraer placa/marca/fecha del último pago, es un paz y salvo
-    # verificado (esto es lo que realmente pasa en Bello 27.1: la página no
-    # muestra el texto "paz y salvo", solo "Vigencias pendientes ()" vacío).
-    if not registros and total == 0 and (placa_ult or marca_ult or fecha_ult):
-        return [{
-            "vigencia":       "PAZ Y SALVO",
-            "estado":         f"Vehículo a paz y salvo en el Tránsito de Bello. Último pago: {fecha_ult}".strip(". "),
-            "total_vigencia": 0,
-            "paz_y_salvo":    True,
-            "fecha_pago":     fecha_ult,
-            "marca":          marca_ult,
-            "placa_info":     placa_ult,
-        }], 0
-
-    return registros, total
-
-
-def _parsear_emtrasur(data):
-    registros = []
-    for r in data:
-        registros.append({
-            "vigencia": str(r.get("AnioNoFacturado", "")),
-            "estado": "Pendiente de pago",
-            "total_vigencia": r.get("ValorPorFacturar", 0),
-            "tipo_vehiculo": r.get("TipoVehiculo", ""),
-            "ultimo_pago": r.get("AnioPagado", ""),
-            "descripcion": r.get("DescripcionNoFacturada", "").strip(),
-        })
-    total = sum(r["total_vigencia"] for r in registros)
-    return registros, total
-
-
-def consultar_laestrella(page, placa):
-    token = resolver_recaptcha_2captcha(EMTRASUR_SITE_KEY, EMTRASUR_URL)
-    api_url = f"https://sistematizacion.emtrasur.com.co/api/Sistematizacion/{placa}"
-    resp = requests.get(api_url, headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": EMTRASUR_URL,
-        "Origin": "https://sistematizacion.emtrasur.com.co",
-        "X-Captcha-Token": token,
-    }, timeout=15)
-    if resp.status_code == 200:
-        data = resp.json()
-        if data.get("Success"):
-            return _parsear_emtrasur(data.get("Data", []))
-    raise Exception(f"EMTRASUR respondio {resp.status_code}: {resp.text[:200]}")
-
-
-# ============================================================
-#  ANTIOQUIA — MÓDULO NUEVO
-# ============================================================
-def _calcular_digito_nit(nit):
-    """Calcula el dígito de verificación de un NIT colombiano (algoritmo DIAN)."""
-    factores = [3, 7, 13, 17, 19, 23, 29, 37, 41, 43]
-    n = str(nit).strip().replace("-", "").replace(".", "").zfill(10)
-    suma = sum(int(n[::-1][i]) * factores[i] for i in range(10))
-    r = suma % 11
-    return 0 if r == 0 else (1 if r == 1 else 11 - r)
-
-
-def _sesion_antioquia(placa, identificacion, tipo_documento_id,
-                      modelo, organismo_transito, apellidos_propietario):
-    """
-    Abre sesión completa en Antioquia y retorna (session, token_cuestionario, data3).
-    Costo: 2 Turnstiles.
-    """
-    try:
-        token_captcha = resolver_turnstile_2captcha(ANTIOQUIA_SITE_KEY, ANTIOQUIA_URL)
-    except Exception as e:
-        raise Exception(f"Error resolviendo captcha inicial: {e}")
-
-    session = requests.Session()
-    session.headers.update({
-        "Accept": "*/*",
-        "Content-Type": "application/json",
-        "captcha": token_captcha,
-        "Referer": "https://www.vehiculosantioquia.com.co/impuestosweb/",
-        "X-Requested-With": "XMLHttpRequest",
-        "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36",
+    // Documentos del comprador (solo Copacabana traspaso)
+    if (regla.comprador && regla.comprador.length > 0) {
+      lineas.push('El comprador debe autenticar: ' + regla.comprador.join(' + ').toUpperCase());
+    }
+
+    // Nota especial si existe
+    if (regla.nota_especial) {
+      lineas.push(regla.nota_especial);
+    }
+
+    if (lineas.length === 0) return null;
+    return 'NOTA (' + antMunicipioActual + '): ' + lineas.join(' | ');
+  }
+
+  // ── MODO ENTRADA ─────────────────────────────────────────────────────────
+
+  function actualizarColorPlaca() {
+    var serv  = (document.getElementById('ant-servicio').value || '').trim().toUpperCase();
+    var placa = document.getElementById('ant-placa-letras').closest('div[style*="background"]');
+    if (!placa) return;
+    if (serv === 'PUBLICO' || serv.normalize('NFD').replace(/[\u0300-\u036f]/g,'') === 'PUBLICO') {
+      placa.style.background = '#FFFFFF';
+    } else {
+      placa.style.background = '#FDD835';
+    }
+  }
+
+  window.antModoEntrada = function(modo) {
+    modoEntrada = modo;
+    // Marcar botón activo
+    ['btn-entrada-camara','btn-entrada-ocr','btn-entrada-runt','btn-entrada-manual'].forEach(function(id) {
+      document.getElementById(id).classList.remove('activo');
+    });
+    document.getElementById('btn-entrada-'+modo).classList.add('activo');
+
+    // Mostrar u ocultar zona OCR
+    document.getElementById('ant-zona-ocr').style.display = (modo === 'ocr' || modo === 'camara') ? 'block' : 'none';
+    document.getElementById('ant-zona-runt').style.display = modo === 'runt' ? 'block' : 'none';
+
+    if (modo === 'ocr') {
+      // Mostrar zona de arrastre limpia aunque haya datos previos
+      document.getElementById('ant-ocr-zone').style.display = 'block';
+      document.getElementById('ant-preview-wrap').style.display = 'none';
+      document.getElementById('ant-ocr-status').style.display = 'none';
+      // Colapsar todos los bloques
+      ocultarTodo();
+    } else if (modo === 'camara') {
+      // Abrir cámara directamente — zona OCR sigue visible para ver preview
+      document.getElementById('ant-ocr-zone').style.display = 'block';
+      document.getElementById('ant-preview-wrap').style.display = 'none';
+      document.getElementById('ant-camara-file').click();
+      // Colapsar todos los bloques
+      ocultarTodo();
+    } else if (modo === 'runt') {
+      ocultarTodo();
+      document.getElementById('ant-runt-status').style.display = 'none';
+    } else if (modo === 'manual') {
+      limpiarCampos();
+      ocrLeido = true;
+      document.getElementById('ant-bienvenida').style.display = 'none';
+      var vp1189 = document.getElementById('tramyVehiculosPanel'); if (vp1189) vp1189.style.display = 'none';
+      document.getElementById('ant-zona-ocr').style.display = 'none';
+      var elInfoTopManual = document.getElementById('bloque-info-top');
+      if (elInfoTopManual) elInfoTopManual.style.display = 'none';
+      document.getElementById('bloque-info').classList.add('visible');
+      actualizarVisibilidad();
+    }
+  };
+
+  window.antLeerRunt = function() {
+    var textoPlaca  = document.getElementById('ant-runt-placa').value.trim();
+    var textoCedula = document.getElementById('ant-runt-cedula').value.trim();
+    if (!textoPlaca && !textoCedula) {
+      mostrarStatusRunt('err', 'Pega al menos uno de los dos textos.');
+      return;
+    }
+    mostrarStatusRunt('procesando', 'Leyendo datos del RUNT...');
+    fetch(ANT_API+'/ocr-runt-texto', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({texto_placa: textoPlaca, texto_cedula: textoCedula})
     })
+    .then(function(r){return r.json();})
+    .then(function(data) {
+      if (data.error) { mostrarStatusRunt('err','Error: '+data.error); return; }
+      limpiarCampos();
+      var detectados = aplicarDatosLeidos(data);
+      if (detectados === 0) {
+        mostrarStatusRunt('err', 'No se pudieron detectar datos en el texto pegado.');
+      }
+    })
+    .catch(function(err){ mostrarStatusRunt('err','Error: '+err.message); });
+  };
 
-    r1 = session.post(
-        f"{ANTIOQUIA_API}/ConsultarEstadoCuentaImpAntioquia/obtenerCuestionarioEstadoCuenta",
-        json={"placa": placa, "idTipoIdentificacion": tipo_documento_id, "identificacion": identificacion},
-        timeout=60
-    )
-    try:
-        data1 = r1.json()
-    except Exception:
-        data1 = None
+  function mostrarStatusRunt(tipo, msg) {
+    var el = document.getElementById('ant-runt-status');
+    el.className = 'ant-ocr-status ' + tipo;
+    el.textContent = msg;
+    el.style.display = 'block';
+  }
 
-    if not data1 or not isinstance(data1, dict):
-        raise Exception("La placa ingresada no coincide con la identificacion del propietario. Verifica los datos e intenta de nuevo.")
+  // ── LIQUIDACION ──────────────────────────────────────────────────────────
 
-    if data1.get("codigo") == 0 or (not data1.get("referencia") and data1.get("mensaje")):
-        mensaje = data1.get("mensaje") or data1.get("descripcion") or "La placa ingresada no coincide con la identificacion del propietario."
-        raise Exception(mensaje)
+  var LIQ_IDS = ['liq-tramite1','liq-tramite2','liq-tramite3','liq-tramite4','liq-tramite5','liq-retefuente',
+                 'liq-depto','liq-municipal','liq-pazsalvo','liq-envios',
+                 'liq-honorarios'];
+  var antCobroSeq = 1; // contador siempre creciente para IDs únicos
 
-    referencia = data1.get("referencia")
-    if not referencia:
-        raise Exception("La placa ingresada no coincide con la identificacion del propietario. Verifica los datos e intenta de nuevo.")
+  function parseLiq(id) {
+    return parseInt((document.getElementById(id).value||'0').replace(/\D/g,''),10)||0;
+  }
 
-    opciones_nombre = (data1.get("preguntaNombrePropietario") or {}).get("opcionesPregunta", [])
-    primer_apellido = apellidos_propietario.upper().split()[0] if apellidos_propietario.strip() else ""
-    nombre_encontrado = next(
-        (n for n in opciones_nombre if primer_apellido in n.upper()), None
-    )
-    if not nombre_encontrado:
-        raise Exception(f"No se encontró propietario con apellidos '{apellidos_propietario}'. Opciones: {opciones_nombre}")
+  function calcularTotal() {
+    var total = LIQ_IDS.reduce(function(s,id){ return s+parseLiq(id); },0);
+    // Sumar todos los cobros dinámicos existentes
+    document.querySelectorAll('.liq-cobro-valor').forEach(function(el) {
+      total += parseInt((el.value||'0').replace(/\D/g,''),10)||0;
+    });
+    document.getElementById('liq-total').textContent = '$ '+total.toLocaleString('es-CO');
+  }
 
-    r2 = session.post(
-        f"{ANTIOQUIA_API}/ConsultarEstadoCuentaImpAntioquia/validarCuestionarioEstadoCuenta",
-        json={
-            "placa": placa, "tipoDocumento": tipo_documento_id, "numeroDocumento": identificacion,
-            "idEstadoCuenta": referencia,
-            "respuestas": {
-                "respuestaModelo": modelo,
-                "respuestaOrganismoTransito": organismo_transito,
-                "respuestaNombrePropietario": nombre_encontrado
+  function getCobrosActuales() {
+    return document.querySelectorAll('#liq-cobros-wrap .ant-liq-cobro').length;
+  }
+
+  function actualizarBotones() {
+    var wrap = document.getElementById('liq-cobros-wrap');
+    var cobros = wrap.querySelectorAll('.ant-liq-cobro');
+    cobros.forEach(function(cobro, idx) {
+      var btn = cobro.querySelector('.ant-liq-btn-add, .ant-liq-btn-del');
+      if (!btn) return;
+      var esUltimo = idx === cobros.length - 1;
+      if (esUltimo && cobros.length < 3) {
+        btn.className = 'ant-liq-btn-add';
+        btn.textContent = '+';
+        btn.title = 'Agregar otro cobro';
+        btn.onclick = antAgregarCobro;
+      } else {
+        btn.className = 'ant-liq-btn-del';
+        btn.textContent = '×';
+        btn.title = 'Eliminar';
+        btn.onclick = (function(c){ return function(){ antEliminarCobro(c); }; })(cobro);
+      }
+    });
+  }
+
+  window.antAgregarCobro = function() {
+    if (getCobrosActuales() >= 3) return;
+    antCobroSeq++;
+    var n = antCobroSeq;
+    var wrap = document.getElementById('liq-cobros-wrap');
+    var div = document.createElement('div');
+    div.className = 'ant-liq-cobro';
+    div.id = 'liq-cobro-'+n;
+    div.innerHTML =
+      '<div class="ant-cobro-wrap" id="ant-cobro-wrap-'+n+'"><input class="ant-liq-cobro-nombre" id="liq-cobro-nombre-'+n+'" type="text" placeholder="Concepto" autocomplete="off"><div class="ant-cobro-lista" id="ant-cobro-lista-'+n+'"></div></div>' +
+      '<div class="ant-cobro-valor-wrap"><input class="ant-liq-input liq-cobro-valor" id="liq-cobro-valor-'+n+'" type="text" value="0" inputmode="numeric"><div class="ant-chips-wrap" id="ant-cobro-chips-'+n+'"></div></div>' +
+      '<button class="ant-liq-btn-del" title="Eliminar">×</button>';
+    wrap.appendChild(div);
+    document.getElementById('liq-cobro-valor-'+n).addEventListener('input', calcularTotal);
+    antInitCobro(n);
+    antInitCobroChips(n);
+    actualizarBotones();
+  };
+
+  window.antEliminarFila = function(key) {
+    var row = document.getElementById('liq-row-' + key);
+    if (row) row.style.display = 'none';
+    var input = document.getElementById('liq-' + key);
+    if (input) input.value = '0';
+    calcularTotal();
+  };
+
+  window.antEliminarCobro = function(cobro) {
+    if (cobro) cobro.remove();
+    actualizarBotones();
+    calcularTotal();
+  };
+
+  function setLiq(id, valor) {
+    var el = document.getElementById(id);
+    if (el) el.value = Math.round(valor).toLocaleString('es-CO');
+    var rowId = 'liq-row-'+id.replace('liq-','');
+    var row = document.getElementById(rowId);
+    if (row) row.style.display = valor > 0 ? 'grid' : 'none';
+    calcularTotal();
+  }
+
+  function mostrarFilasDefecto() {
+    var municipio  = document.getElementById('ant-municipio').value;
+    var tieneDepto = ANT_MUNICIPIOS.indexOf(municipio) >= 0;
+    var exentoLiq  = exentoDepto();
+    if (tieneDepto && !exentoLiq) {
+      document.getElementById('liq-row-pazsalvo').style.display = 'grid';
+      document.getElementById('liq-pazsalvo').value = '6.000';
+    } else {
+      document.getElementById('liq-row-pazsalvo').style.display = 'none';
+      document.getElementById('liq-pazsalvo').value = '0';
+    }
+    document.getElementById('liq-row-envios').style.display = 'grid';
+    // Honorarios siempre visible
+    document.getElementById('liq-row-honorarios').style.display = 'grid';
+    calcularTotal();
+    if(typeof window.tramyAjustarFijosPredeterminados === 'function'){
+      window.tramyAjustarFijosPredeterminados();
+    }
+  }
+
+  function limpiarLiq() {
+    LIQ_IDS.forEach(function(id) { document.getElementById(id).value = '0'; });
+    document.getElementById('liq-pazsalvo').value  = '6.000';
+    document.getElementById('liq-envios').value    = '18.000';
+    document.getElementById('liq-honorarios').value = window.tramyHonorarioGuardado ? window.tramyHonorarioGuardado() : '0';
+    ['tramite1','tramite2','tramite3','retefuente','depto','municipal',
+     'pazsalvo','envios'].forEach(function(k) {
+      var r = document.getElementById('liq-row-'+k);
+      if (r) r.style.display = 'none';
+    });
+    // Honorarios siempre visible
+    document.getElementById('liq-row-honorarios').style.display = 'grid';
+    // Resetear cobros dinámicos
+    var wrap = document.getElementById('liq-cobros-wrap');
+    if (wrap) {
+      wrap.innerHTML =
+        '<div class="ant-liq-cobro" id="liq-cobro-1">' +
+        '<div class="ant-cobro-wrap" id="ant-cobro-wrap-1"><input class="ant-liq-cobro-nombre" id="liq-cobro-nombre-1" type="text" placeholder="Concepto" autocomplete="off"><div class="ant-cobro-lista" id="ant-cobro-lista-1"></div></div>' +
+        '<div class="ant-cobro-valor-wrap"><input class="ant-liq-input liq-cobro-valor" id="liq-cobro-valor-1" type="text" value="0" inputmode="numeric"><div class="ant-chips-wrap" id="ant-cobro-chips-1"></div></div>' +
+        '<button class="ant-liq-btn-add" id="liq-cobro-add-btn" onclick="antAgregarCobro()" title="Agregar otro cobro">+</button>' +
+        '</div>';
+      antCobrosCount = 1;
+      document.getElementById('liq-cobro-valor-1').addEventListener('input', calcularTotal);
+      antInitCobro(1);
+      antInitCobroChips(1);
+      antCobroSeq = 1;
+      actualizarBotones();
+    }
+    calcularTotal();
+    if(typeof window.tramyAplicarConceptosPredeterminados === 'function'){
+      window.tramyAplicarConceptosPredeterminados();
+      calcularTotal();
+    }
+  }
+
+  LIQ_IDS.forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.addEventListener('input', calcularTotal);
+  });
+  // Listener cobro inicial
+  var ANT_COBRO_OPCIONES = ['Retefuente','Impuesto Departamental','Impuesto Municipal','Paz y Salvo','Envio / Domicilio','4 X 1.000','Camara Comercio','Copias','Liquidacion de Impuesto','Cupl','Parqueadero','Improntas','Reparacion de Documento'];
+
+  var ANT_COBRO_CHIPS = ['3.000','6.000','11.000','18.000','20.000','25.000','30.000','40.000','50.000'];
+
+  function antInitCobroChips(n) {
+    var input = document.getElementById('liq-cobro-valor-'+n);
+    var wrap  = document.getElementById('ant-cobro-chips-'+n);
+    if (!input || !wrap) return;
+    ANT_COBRO_CHIPS.forEach(function(op) {
+      var chip = document.createElement('div');
+      chip.className = 'ant-chip';
+      chip.innerHTML = '$ ' + op + '<span class="ant-chip-check">✓</span>';
+      chip.addEventListener('mousedown', function(e) {
+        e.preventDefault();
+        wrap.querySelectorAll('.ant-chip').forEach(function(c){ c.classList.remove('activo'); });
+        chip.classList.add('activo');
+        input.value = op;
+        wrap.style.display = 'none';
+        calcularTotal();
+      });
+      wrap.appendChild(chip);
+    });
+    input.addEventListener('focus', function(){ wrap.style.display = 'block'; });
+    input.addEventListener('blur', function(){ setTimeout(function(){ wrap.style.display = 'none'; }, 150); });
+    input.addEventListener('input', function() {
+      wrap.querySelectorAll('.ant-chip').forEach(function(c){ c.classList.remove('activo'); });
+      calcularTotal();
+    });
+  }
+
+  function antInitCobro(n) {
+    var input = document.getElementById('liq-cobro-nombre-'+n);
+    var lista = document.getElementById('ant-cobro-lista-'+n);
+    if (!input || !lista) return;
+    var idxActivo = -1;
+
+    function mostrarOpciones(filtro) {
+      lista.innerHTML = '';
+      idxActivo = -1;
+      var items = filtro
+        ? ANT_COBRO_OPCIONES.filter(function(o){ return o.toLowerCase().indexOf(filtro.toLowerCase()) >= 0; })
+        : ANT_COBRO_OPCIONES;
+      if (!items.length) { lista.style.display = 'none'; return; }
+      items.forEach(function(op) {
+        var div = document.createElement('div');
+        div.textContent = op;
+        div.addEventListener('mousedown', function(e) {
+          e.preventDefault();
+          input.value = op;
+          lista.style.display = 'none';
+        });
+        lista.appendChild(div);
+      });
+      lista.style.display = 'block';
+    }
+
+    input.addEventListener('focus', function(){ mostrarOpciones(this.value); });
+    input.addEventListener('input', function(){ mostrarOpciones(this.value); });
+    input.addEventListener('blur', function(){ setTimeout(function(){ lista.style.display = 'none'; }, 150); });
+    input.addEventListener('keydown', function(e) {
+      var items = lista.querySelectorAll('div');
+      if (!items.length || lista.style.display === 'none') return;
+      if (e.key === 'ArrowDown') { idxActivo = Math.min(idxActivo+1, items.length-1); items.forEach(function(el,i){ el.classList.toggle('activo', i===idxActivo); }); e.preventDefault(); }
+      else if (e.key === 'ArrowUp') { idxActivo = Math.max(idxActivo-1, 0); items.forEach(function(el,i){ el.classList.toggle('activo', i===idxActivo); }); e.preventDefault(); }
+      else if (e.key === 'Enter' && idxActivo >= 0) { input.value = items[idxActivo].textContent; lista.style.display = 'none'; e.preventDefault(); }
+      else if (e.key === 'Escape') { lista.style.display = 'none'; }
+    });
+  }
+
+  antInitCobro(1);
+  antInitCobroChips(1);
+  actualizarBotones();
+
+  // Chips honorarios
+  (function() {
+    var opciones = ['40.000','50.000','60.000','65.000','70.000','75.000','80.000','85.000','90.000','100.000','110.000'];
+    var input = document.getElementById('liq-honorarios');
+    var wrap  = document.getElementById('ant-honorarios-chips');
+    if (!input || !wrap) return;
+    opciones.forEach(function(op) {
+      var chip = document.createElement('div');
+      chip.className = 'ant-chip';
+      chip.innerHTML = '$ ' + op + '<span class="ant-chip-check">✓</span>';
+      chip.addEventListener('mousedown', function(e) {
+        e.preventDefault();
+        wrap.querySelectorAll('.ant-chip').forEach(function(c){ c.classList.remove('activo'); });
+        chip.classList.add('activo');
+        input.value = op;
+        wrap.style.display = 'none';
+        calcularTotal();
+      });
+      wrap.appendChild(chip);
+    });
+    input.addEventListener('focus', function(){ wrap.style.display = 'block'; });
+    input.addEventListener('blur', function(){ setTimeout(function(){ wrap.style.display = 'none'; }, 150); });
+    input.addEventListener('input', function() {
+      wrap.querySelectorAll('.ant-chip').forEach(function(c){ c.classList.remove('activo'); });
+      calcularTotal();
+    });
+  })();
+
+  var cobroInicial = document.getElementById('liq-cobro-valor-1');
+  if (cobroInicial) cobroInicial.addEventListener('input', calcularTotal);
+
+  // ── EXENCION ─────────────────────────────────────────────────────────────
+
+  function exentoDepto() {
+    var serv     = (document.getElementById('ant-servicio').value||'').trim().toUpperCase();
+    var cilStr   = (document.getElementById('ant-cilindrada').value||'').trim();
+    var cil      = cilStr ? parseInt(cilStr.replace(/\./g, '').replace(/,/g, ''), 10) : 999; // limpiar puntos y comas antes de parsear
+    var esPublico = serv === 'PUBLICO' || serv === 'PÚBLICO' || serv.normalize('NFD').replace(/[\u0300-\u036f]/g,'') === 'PUBLICO';
+    var esMoto125 = cilStr && cil > 0 && cil <= 125;
+    var clase     = (document.getElementById('ant-clase').value||'').trim().toUpperCase();
+    // "REMOLQUE" como subcadena tambien cubre "SEMIRREMOLQUE"
+    var esMaquinariaORemolque = clase.indexOf('MAQUINARIA') >= 0 || clase.indexOf('REMOLQUE') >= 0;
+    return esPublico || esMoto125 || esMaquinariaORemolque;
+  }
+
+  // ── VISIBILIDAD DE BLOQUES ────────────────────────────────────────────────
+
+  var infoConfirmada = false;
+
+  function ocultarTodo() {
+    ['bloque-tramites','bloque-depto','bloque-municipal'].forEach(function(id) {
+      var bl = document.getElementById(id);
+      bl.classList.remove('visible');
+      bl.style.display = 'none';
+    });
+    document.getElementById('bloque-info').classList.remove('visible');
+    var blLiq = document.getElementById('bloque-liq');
+    blLiq.style.cssText = 'display:none !important';
+    var blRet = document.getElementById('bloque-retefuente');
+    if (blRet) { blRet.style.display = 'none'; blRet.classList.remove('visible'); }
+  }
+
+  function mostrarYExpandirBloques() {
+    var municipio  = antMunicipioActual.toUpperCase();
+    var servicioActual = (document.getElementById('ant-servicio').value || '').normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim().toUpperCase();
+    var esMedellinPublico = (municipio === 'MEDELLIN' && servicioActual === 'PUBLICO');
+    var tieneMun = esMedellinPublico ? true : (municipio !== 'MEDELLIN' && !!MUNICIPIOS_MUNICIPALES[municipio]);
+    var tieneDepto = ANT_MUNICIPIOS.indexOf(municipio) >= 0;
+    var exento     = exentoDepto();
+    var tipodoc    = document.getElementById('ant-tipodoc').value;
+
+    // Departamental — visible pero colapsado
+    if (tieneDepto && !exento) {
+      var blD = document.getElementById('bloque-depto');
+      blD.classList.add('visible'); blD.style.display = 'block';
+      var cD = document.getElementById('contenido-depto');
+      if (cD) cD.style.display = 'none';
+      var chD = document.getElementById('chevron-depto');
+      if (chD) chD.textContent = '▼';
+      document.getElementById('ant-btn-impuesto').style.display = 'flex';
+      document.getElementById('ant-no-depto').style.display = 'none';
+
+      // Por defecto se muestra en $0 en la liquidacion, sin necesidad de
+      // consultar -- si luego se consulta de verdad, ese resultado
+      // reemplaza este valor por defecto (ver setLiq('liq-depto', ...)
+      // en las respuestas de la consulta).
+      var liqRowDeptoDefault = document.getElementById('liq-row-depto');
+      if (liqRowDeptoDefault) {
+        setLiq('liq-depto', 0);
+        liqRowDeptoDefault.style.display = 'grid';
+        var lblDDefault = document.querySelector('#liq-row-depto .ant-liq-nombre');
+        if (lblDDefault) lblDDefault.textContent = 'Impuesto Departamental';
+      }
+    }
+
+    // Municipal — visible pero colapsado
+    if (tieneMun || debeMostrarMensajeOficina()) {
+      var blM = document.getElementById('bloque-municipal');
+      blM.classList.add('visible'); blM.style.display = 'block';
+      var cM = document.getElementById('contenido-municipal');
+      if (cM) cM.style.display = 'none';
+      var chM = document.getElementById('chevron-municipal');
+      if (chM) chM.textContent = '▼';
+
+      // Por defecto se muestra en $0 en la liquidacion, sin necesidad de
+      // consultar (excepto en el caso de "pregunta en la oficina", donde
+      // realmente no se sabe el estado y no corresponde asumir nada).
+      if (tieneMun && !debeMostrarMensajeOficina()) {
+        var liqRowMunDefault = document.getElementById('liq-row-municipal');
+        if (liqRowMunDefault) {
+          setLiq('liq-municipal', 0);
+          liqRowMunDefault.style.display = 'grid';
+          var lblMDefault = document.querySelector('#liq-row-municipal .ant-liq-nombre');
+          if (lblMDefault) lblMDefault.textContent = 'Impuesto Municipal';
+        }
+      }
+
+      if (debeMostrarMensajeOficina()) {
+        document.getElementById('ant-btn-municipal').style.display = 'none';
+        document.getElementById('ant-result-municipal').innerHTML =
+          '<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:7px;padding:14px 16px;color:#856404;font-size:14px;font-weight:700;text-align:center;margin-top:8px;">⚠️ DEBES PREGUNTAR DIRECTAMENTE EN LA OFICINA DE MOVILIDAD</div>';
+      } else if (window._tramyMunicipioAlDiaPorTramite) {
+        // Cualquier tramite reciente (excepto RTM/SOAT/certificado de
+        // tradicion) hecho este mismo año ya implica que el vehiculo
+        // estaba a paz y salvo del impuesto municipal para poder
+        // realizarlo. No hace falta consultar ni mostrar el boton -- pero
+        // igual se deja la fila en la liquidacion en $0, para que quede
+        // constancia de que se reviso y esta al dia (evita que el
+        // cliente pregunte).
+        document.getElementById('ant-btn-municipal').style.display = 'none';
+        document.getElementById('ant-result-municipal').innerHTML =
+          '<div style="background:#dcf5df;border:1px solid #8fd6a0;border-radius:7px;padding:14px 16px;color:#1a5c2e;font-size:14px;font-weight:700;text-align:center;margin-top:8px;">✓ El impuesto municipal está al día.<br>Último trámite realizado el día ' + window._tramyMunicipioAlDiaFechaTexto + '</div>';
+        setLiq('liq-municipal', 0);
+        document.getElementById('liq-row-municipal').style.display = 'grid';
+        var lblMAlDia = document.querySelector('#liq-row-municipal .ant-liq-nombre');
+        if (lblMAlDia) lblMAlDia.textContent = 'Impuesto Municipal';
+      } else {
+        document.getElementById('ant-btn-municipal').style.display = 'flex';
+        document.getElementById('ant-result-municipal').innerHTML = '';
+      }
+    }
+
+    // Tramites — visible pero colapsado
+    var blT = document.getElementById('bloque-tramites');
+    blT.classList.add('visible'); blT.style.display = 'block';
+    var cT = document.getElementById('contenido-tramites');
+    if (cT) cT.style.display = 'none';
+    var chT = document.getElementById('chevron-tramites');
+    if (chT) chT.textContent = '▼';
+
+    // Liquidacion — visible pero colapsada
+    var blL = document.getElementById('bloque-liq');
+    blL.style.cssText = 'display:block !important';
+    var cL = document.getElementById('contenido-liq');
+    if (cL) cL.style.display = 'none';
+    var chL = document.getElementById('chevron-liq');
+    if (chL) chL.textContent = '▼';
+
+    // WhatsApp — visible pero colapsado
+    var blWA = document.getElementById('bloque-wa');
+    if (blWA) { blWA.classList.add('visible'); blWA.style.display = 'block'; }
+    var cWA = document.getElementById('contenido-wa');
+    if (cWA) cWA.style.display = 'none';
+    var chWA = document.getElementById('chevron-wa');
+    if (chWA) chWA.textContent = '▼';
+
+    // Retefuente — visible pero colapsado (solo si no es NIT)
+    if (tipodoc !== 'NIT') {
+      var blR = document.getElementById('bloque-retefuente');
+      blR.classList.add('visible'); blR.style.display = 'block';
+      var cR = document.getElementById('contenido-ret');
+      if (cR) cR.style.display = 'none';
+      var chR = document.getElementById('chevron-ret');
+      if (chR) chR.textContent = '▼';
+      antCargarRetefuente();
+    }
+  }
+
+  function actualizarVisibilidad() {
+    if (!ocrLeido) {
+      ocultarTodo();
+      return;
+    }
+
+    // Paso 2: mostrar solo informacion expandida
+    if (!infoConfirmada) {
+      ocultarTodo();
+      document.getElementById('bloque-info').classList.add('visible');
+      document.getElementById('ant-info-contenido').style.display = 'block';
+      document.getElementById('ant-info-colapsado').style.display = 'none';
+      document.getElementById('ant-info-chevron').textContent = '▲';
+    }
+    // Si ya confirmó, no hacer nada — antConfirmarInfo maneja el siguiente paso
+  }
+
+  // ── LIMPIEZA ─────────────────────────────────────────────────────────────
+
+  function limpiarCampos() {
+    ['ant-placa','ant-placa-edit','ant-modelo','ant-cedula','ant-apellidos',
+     'ant-clase','ant-servicio','ant-cilindrada','ant-carroceria'].forEach(function(id) {
+      var el = document.getElementById(id); if(el) el.value = '';
+    });
+    document.getElementById('ant-limitacion-propiedad').value = '';
+    document.getElementById('ant-placa-letras').textContent  = '---';
+    document.getElementById('ant-placa-numeros').textContent = '---';
+    var pe3 = document.getElementById('ant-placa-editar');
+    if (pe3) pe3.value = '';
+    actualizarColorPlaca();
+    ['ant-marca','ant-linea','ant-capacidad'].forEach(function(id) {
+      document.getElementById(id).value = '';
+    });
+    document.getElementById('ant-tipodoc').value         = 'CC';
+    document.getElementById('ant-municipio-input').value = '';
+    document.getElementById('ant-municipio').value       = '';
+    document.getElementById('ant-result-depto').innerHTML    = '';
+    document.getElementById('ant-result-municipal').innerHTML = '';
+    document.getElementById('ant-preview-wrap').style.display = 'none';
+    document.getElementById('ant-ocr-zone').style.display    = 'block';
+    document.getElementById('ant-ocr-status').style.display  = 'none';
+    if (window.antEliminarSegunda) window.antEliminarSegunda();
+    document.getElementById('ant-wa-preview').style.display  = 'none';
+    ['bloque-info','bloque-tramites','bloque-depto','bloque-municipal'].forEach(function(id) {
+      document.getElementById(id).classList.remove('visible');
+    });
+    antDatosOCR = null; antAvaluo = 0; ocrLeido = false; infoConfirmada = false; antMunicipioActual = '';
+    antRetAvaluo = 0; antRetRetefuente = 0;
+    document.getElementById('ant-ret-estado').textContent   = '';
+    document.getElementById('ant-ret-opciones').innerHTML   = '';
+    document.getElementById('ant-ret-resultado').style.display = 'none';
+    var blRet = document.getElementById('bloque-retefuente');
+    if (blRet) { blRet.style.display = 'none'; blRet.classList.remove('visible'); }
+    document.getElementById('ant-bienvenida').style.display     = 'block';
+    if (window.tramyVehiculosGuardados && window.tramyVehiculosGuardados.length) { var vp2 = document.getElementById('tramyVehiculosPanel'); if (vp2) vp2.style.display = 'block'; }
+    document.getElementById('bloque-liq').style.display         = 'none';
+    limpiarTramites();
+    limpiarLiq();
+  }
+
+  // ── TRAMITES CON AUTOCOMPLETE ─────────────────────────────────────────────
+
+  function getTipo() {
+    var clase = (document.getElementById('ant-clase').value||'').trim().toUpperCase();
+    if (CLASE_A_TIPO[clase]) return CLASE_A_TIPO[clase];
+    // Coincidencia flexible: el valor real puede traer texto adicional
+    // (ej. "CAMIONETA WAGON" en vez de solo "CAMIONETA", como suele pasar
+    // en las Declaraciones Sugeridas de la Gobernacion) -- se busca que
+    // la clase EMPIECE con alguna de las claves conocidas, probando
+    // primero las mas largas para no confundir "CAMIONETA" con
+    // "CAMIONETA CARGA"/"CAMIONETA ESTACAS".
+    var claves = Object.keys(CLASE_A_TIPO).sort(function(a,b){ return b.length - a.length; });
+    for (var i = 0; i < claves.length; i++) {
+      if (clase.indexOf(claves[i]) === 0) return CLASE_A_TIPO[claves[i]];
+    }
+    return '';
+  }
+
+  function limpiarTramites() {
+    [1,2,3,4,5].forEach(function(n) {
+      var inp = document.getElementById('ant-tramite-'+n);
+      inp.value    = '';
+      inp.disabled = true;
+      document.getElementById('ant-tram-lista-'+n).style.display = 'none';
+      document.getElementById('ant-precio-'+n).style.display     = 'none';
+      if (n > 1) document.getElementById('ant-bloque-'+n).style.display = 'none';
+    });
+    tramiteOpciones = [];
+  }
+
+  function cargarTramites() {
+    var municipio = document.getElementById('ant-municipio').value;
+    var tipo      = getTipo();
+    if(typeof window.tramyAplicarHonorarioGuardado === 'function') window.tramyAplicarHonorarioGuardado();
+    if (!municipio || !tipo) { limpiarTramites(); return; }
+    var key = municipio+'|'+tipo;
+    if (cacheTramites[key]) {
+      tramiteOpciones = cacheTramites[key];
+      habilitarTramite(1);
+      autoSeleccionarLevantamientoPrenda();
+      autoSeleccionarTraspasoPropiedad();
+      return;
+    }
+    fetch(ANT_API+'/tramites/filtros?campo=tramite&municipio='+encodeURIComponent(municipio)+'&clase='+encodeURIComponent(tipo))
+      .then(function(r){return r.json();})
+      .then(function(data){
+        cacheTramites[key] = data.valores||[];
+        tramiteOpciones    = cacheTramites[key];
+        habilitarTramite(1);
+        autoSeleccionarLevantamientoPrenda();
+        autoSeleccionarTraspasoPropiedad();
+      })
+      .catch(function(){});
+  }
+
+  // Precarga el tramite "TRASPASO DE PROPIEDAD" por defecto (para Free y
+  // Premium por igual), a menos que el usuario haya apagado esta opcion
+  // desde su panel de configuracion.
+  function autoSeleccionarTraspasoPropiedad() {
+    var settings = (window.tramyProfile && window.tramyProfile.settings) || {};
+    var precargarActivo = settings.tramite_precargado_traspaso !== false; // activo por defecto
+    if (!precargarActivo) return;
+
+    // ¿Ya esta seleccionado en algun slot?
+    for (var i = 1; i <= 5; i++) {
+      var elT = document.getElementById('ant-tramite-'+i);
+      if (elT && (elT.value||'').toUpperCase().includes('TRASPASO DE PROPIEDAD')) return;
+    }
+    var match = (tramiteOpciones||[]).find(function(t){
+      return t.toUpperCase().includes('TRASPASO DE PROPIEDAD');
+    });
+    if (!match) return;
+    for (var n = 1; n <= 5; n++) {
+      var inp = document.getElementById('ant-tramite-'+n);
+      if (inp && !inp.disabled && !inp.value) {
+        seleccionarTramite(n, match);
+        return;
+      }
+    }
+  }
+
+  // Si el vehiculo tiene gravamenes (prenda), agrega automaticamente el
+  // tramite "LEVANTAMIENTO DE PRENDA" en el primer slot vacio disponible.
+  function autoSeleccionarLevantamientoPrenda() {
+    var elGrav = document.getElementById('ant-limitacion-propiedad');
+    if (!elGrav || elGrav.value !== 'SI') return;
+    // ¿Ya esta seleccionado en algun slot?
+    for (var i = 1; i <= 5; i++) {
+      var elT = document.getElementById('ant-tramite-'+i);
+      if (elT && (elT.value||'').toUpperCase().includes('LEVANTAMIENTO DE PRENDA')) return;
+    }
+    // Buscar la opcion real disponible para este municipio/clase
+    var match = (tramiteOpciones||[]).find(function(t){
+      return t.toUpperCase().includes('LEVANTAMIENTO DE PRENDA');
+    });
+    if (!match) return;
+    // Colocar en el primer slot vacio
+    for (var n = 1; n <= 5; n++) {
+      var inp = document.getElementById('ant-tramite-'+n);
+      if (inp && !inp.disabled && !inp.value) {
+        seleccionarTramite(n, match);
+        return;
+      }
+    }
+  }
+
+  function habilitarTramite(n) {
+    var inp = document.getElementById('ant-tramite-'+n);
+    if (inp) inp.disabled = false;
+  }
+
+  function filtrarTramites(n, texto) {
+    var lista = document.getElementById('ant-tram-lista-'+n);
+    var filtro = texto.trim().toUpperCase();
+    var items  = filtro
+      ? tramiteOpciones.filter(function(t){ return t.toUpperCase().includes(filtro); })
+      : tramiteOpciones;
+    lista.innerHTML = '';
+    if (!items.length) { lista.style.display='none'; return; }
+    items.forEach(function(t) {
+      var div = document.createElement('div');
+      div.textContent = t;
+      div.addEventListener('mousedown', function(e){
+        e.preventDefault();
+        seleccionarTramite(n, t);
+      });
+      lista.appendChild(div);
+    });
+    lista.style.display = 'block';
+  }
+
+  function seleccionarTramite(n, valor) {
+    document.getElementById('ant-tramite-'+n).value = valor;
+    document.getElementById('ant-tram-lista-'+n).style.display = 'none';
+    // Mostrar X en tramites 2 y 3
+    var xBtn = document.getElementById('ant-x-'+n);
+    if (xBtn) xBtn.style.display = 'inline-block';
+    consultarTarifaN(n);
+  }
+
+  window.antEliminarTramite = function(n) {
+    document.getElementById('ant-tramite-'+n).value = '';
+    document.getElementById('ant-precio-'+n).style.display = 'none';
+    document.getElementById('ant-bloque-'+n).style.display = 'none';
+    var xBtn = document.getElementById('ant-x-'+n);
+    if (xBtn) xBtn.style.display = 'none';
+    setLiq('liq-tramite'+n, 0);
+    document.getElementById('liq-row-tramite'+n).style.display = 'none';
+    // Si elimina uno, también oculta los siguientes
+    for (var i = n + 1; i <= 5; i++) {
+      var elB = document.getElementById('ant-bloque-'+i);
+      var elT = document.getElementById('ant-tramite-'+i);
+      var elP = document.getElementById('ant-precio-'+i);
+      var elR = document.getElementById('liq-row-tramite'+i);
+      if (elT) elT.value = '';
+      if (elP) elP.style.display = 'none';
+      if (elB) elB.style.display = 'none';
+      setLiq('liq-tramite'+i, 0);
+      if (elR) elR.style.display = 'none';
+    }
+    actualizarLiqTramites();
+    calcularTotal();
+  };
+
+  function iniciarAutocomplete(n) {
+    var inp   = document.getElementById('ant-tramite-'+n);
+    var lista = document.getElementById('ant-tram-lista-'+n);
+    var idxAct = -1;
+
+    inp.addEventListener('focus', function(){ filtrarTramites(n, this.value); });
+    inp.addEventListener('input', function(){
+      filtrarTramites(n, this.value);
+      // Limpiar precio si cambia el texto
+      document.getElementById('ant-precio-'+n).style.display = 'none';
+      setLiq('liq-tramite'+n, 0);
+      actualizarLiqTramites();
+    });
+    inp.addEventListener('keydown', function(e) {
+      var items = lista.querySelectorAll('div');
+      if (!items.length) return;
+      if (e.key==='ArrowDown') { idxAct=Math.min(idxAct+1,items.length-1); items.forEach(function(el,i){el.classList.toggle('activo',i===idxAct);}); e.preventDefault(); }
+      else if (e.key==='ArrowUp') { idxAct=Math.max(idxAct-1,0); items.forEach(function(el,i){el.classList.toggle('activo',i===idxAct);}); e.preventDefault(); }
+      else if (e.key==='Enter'&&idxAct>=0) { seleccionarTramite(n, items[idxAct].textContent); idxAct=-1; e.preventDefault(); }
+      else if (e.key==='Escape') { lista.style.display='none'; }
+    });
+    inp.addEventListener('blur', function(){
+      setTimeout(function(){ lista.style.display='none'; }, 150);
+    });
+  }
+
+  function mostrarSiguiente(n) {
+    if (n < 5) {
+      var tramite = document.getElementById('ant-tramite-'+n).value.trim();
+      if (tramite) {
+        var sig = document.getElementById('ant-bloque-'+(n+1));
+        if (sig) {
+          sig.style.display = 'block';
+          habilitarTramite(n+1);
+        }
+      }
+    }
+  }
+
+  function hayTraspaso() {
+    return [1,2,3,4,5].some(function(n) {
+      return (document.getElementById('ant-tramite-'+n).value||'').toUpperCase().includes('TRASPASO');
+    });
+  }
+
+  function esEmpresa() {
+    // Las empresas (NIT) no pagan retefuente
+    return (document.getElementById('ant-tipodoc').value||'') === 'NIT';
+  }
+
+  function actualizarLiqTramites() {
+    [1,2,3,4,5].forEach(function(n) {
+      var tramite = document.getElementById('ant-tramite-'+n).value;
+      var row     = document.getElementById('liq-row-tramite'+n);
+      var label   = document.getElementById('liq-label-tramite'+n);
+      if (tramite && parseLiq('liq-tramite'+n) > 0) {
+        label.textContent = tramite.length > 38 ? tramite.substring(0,36)+'...' : tramite;
+        row.style.display = 'grid';
+      } else {
+        row.style.display = 'none';
+      }
+    });
+    // Retefuente: visible si hay traspaso Y hay avaluo
+    var refRow = document.getElementById('liq-row-retefuente');
+    if (hayTraspaso() && antAvaluo > 0 && !esEmpresa()) {
+      setLiq('liq-retefuente', Math.round(antAvaluo / 100));
+      refRow.style.display = 'grid';
+    } else {
+      refRow.style.display = 'none';
+    }
+    calcularTotal();
+  }
+
+  function consultarTarifaN(n) {
+    var municipio = document.getElementById('ant-municipio').value;
+    var tipo      = getTipo();
+    var tramite   = document.getElementById('ant-tramite-'+n).value.trim();
+    var precioDiv = document.getElementById('ant-precio-'+n);
+    precioDiv.style.display = 'none';
+    setLiq('liq-tramite'+n, 0);
+    mostrarSiguiente(n);
+    actualizarLiqTramites();
+    if (!tramite || !municipio || !tipo) return;
+    fetch(ANT_API+'/tramites/precio?municipio='+encodeURIComponent(municipio)
+      +'&clase='+encodeURIComponent(tipo)
+      +'&tramite='+encodeURIComponent(tramite)
+      +'&departamento=ANTIOQUIA')
+      .then(function(r){return r.json();})
+      .then(function(data){
+        if (data.precio) {
+          precioDiv.textContent = '$ '+data.precio.toLocaleString('es-CO');
+          precioDiv.style.display = 'block';
+          setLiq('liq-tramite'+n, data.precio);
+          actualizarLiqTramites();
+        }
+      }).catch(function(){});
+  }
+
+  // ── INIT ─────────────────────────────────────────────────────────────────
+
+  window.addEventListener('load', function() {
+
+    ['ant-cedula','ant-modelo'].forEach(function(id) {
+      document.getElementById(id).addEventListener('input', function() {
+        this.value = this.value.replace(/[^0-9]/g,'');
+      });
+    });
+
+    // Sincronizar input placa con visualización (ant-placa-edit legacy)
+    var placaEdit = document.getElementById('ant-placa-edit');
+    var placaHidden = document.getElementById('ant-placa');
+    if (placaEdit) {
+      placaEdit.addEventListener('input', function() {
+        var val = this.value.toUpperCase().replace(/[^A-Z0-9]/g,'');
+        this.value = val;
+        placaHidden.value = val;
+        document.getElementById('ant-placa-letras').textContent  = val.substring(0,3) || '---';
+        document.getElementById('ant-placa-numeros').textContent = val.substring(3)   || '---';
+      });
+    }
+
+    // Input editable de placa (nuevo)
+    var placaEditarEl = document.getElementById('ant-placa-editar');
+    if (placaEditarEl) {
+      placaEditarEl.addEventListener('input', function() {
+        var val = this.value.toUpperCase().replace(/[^A-Z0-9]/g,'');
+        this.value = val;
+        document.getElementById('ant-placa').value = val;
+        document.getElementById('ant-placa-letras').textContent  = val.substring(0,3) || '---';
+        document.getElementById('ant-placa-numeros').textContent = val.substring(3)   || '---';
+      });
+    }
+
+    ['ant-servicio','ant-cilindrada','ant-clase'].forEach(function(id) {
+      document.getElementById(id).addEventListener('input', function() {
+        actualizarVisibilidad(); cargarTramites();
+        actualizarColorPlaca();
+      });
+    });
+
+    document.getElementById('ant-tipodoc').addEventListener('change', function() {
+      actualizarReglasDocumento();
+    });
+
+    document.querySelector('.ant-grid').addEventListener('input', function(e){
+      if (CAMPOS_A_VALIDAR.indexOf(e.target.id) === -1) return;
+      var fila = e.target.closest('.ant-group');
+      if (!fila) return;
+      if (e.target.value && e.target.value.trim()) fila.classList.remove('ant-campo-vacio');
+      else fila.classList.add('ant-campo-vacio');
+    });
+
+    document.getElementById('ant-limitacion-propiedad').addEventListener('change', function() {
+      if (this.value === 'SI') {
+        cargarTramites(); // internamente llama autoSeleccionarLevantamientoPrenda() tras cargar opciones
+      }
+      var filaGrav = this.closest('.ant-group');
+      if (filaGrav) {
+        if (this.value) filaGrav.classList.remove('ant-campo-vacio');
+        else filaGrav.classList.add('ant-campo-vacio');
+      }
+    });
+
+    function actualizarReglasDocumento() {
+      var tipodoc = document.getElementById('ant-tipodoc').value;
+      var rowRet  = document.getElementById('liq-row-retefuente');
+      var blRet   = document.getElementById('bloque-retefuente');
+      if (tipodoc === 'NIT') {
+        // NIT no paga retefuente — ocultar fila en liquidacion y modulo,
+        // y poner el valor en 0 para que no quede sumado invisiblemente al total
+        if (rowRet) rowRet.style.display = 'none';
+        setLiq('liq-retefuente', 0);
+        if (blRet) { blRet.style.display = 'none'; blRet.classList.remove('visible'); }
+      } else {
+        // Todos los demas si pagan retefuente
+        if (blRet && infoConfirmada) {
+          blRet.style.display = 'block'; blRet.classList.add('visible');
+        }
+      }
+      calcularTotal();
+    }
+
+    // Iniciar autocomplete para los 3 tramites
+    [1,2,3,4,5].forEach(function(n){ iniciarAutocomplete(n); });
+
+    LIQ_IDS.forEach(function(id) {
+      var el = document.getElementById(id);
+      if (el) el.addEventListener('input', calcularTotal);
+    });
+
+    // Municipio autocomplete
+    var inputMun  = document.getElementById('ant-municipio-input');
+    var hiddenMun = document.getElementById('ant-municipio');
+    var listaMun  = document.getElementById('ant-mun-lista');
+
+    function mostrarOpciones(filtro) {
+      var items = filtro
+        ? ANT_MUNICIPIOS.filter(function(m){ return m.includes(filtro.toUpperCase()); })
+        : ANT_MUNICIPIOS;
+      listaMun.innerHTML = '';
+      antIdxActivo = -1;
+      if (!items.length) { listaMun.style.display='none'; return; }
+      items.forEach(function(m) {
+        var div = document.createElement('div');
+        div.textContent = m;
+        div.addEventListener('mousedown', function(e){ e.preventDefault(); selMunicipio(m); });
+        listaMun.appendChild(div);
+      });
+      listaMun.style.display = 'block';
+    }
+
+    function selMunicipio(valor) {
+      inputMun.value     = valor;
+      hiddenMun.value    = valor;
+      antMunicipioActual = valor;
+      var placaMun = document.getElementById('ant-placa-municipio');
+      if (placaMun) placaMun.textContent = valor;
+      listaMun.style.display = 'none';
+      actualizarVisibilidad();
+      cargarTramites();
+      var placa = document.getElementById('ant-placa').value.trim().toUpperCase();
+      if (placa && valor) {
+        fetch(ANT_API+'/ocr-guardar-municipio', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({placa: placa, municipio: valor})
+        }).catch(function(){});
+      }
+      mostrarFilasDefecto();
+      marcarCamposVacios();
+      if(typeof window.tramyVerificarDisponibilidadRunt === 'function') window.tramyVerificarDisponibilidadRunt();
+    }
+    window.selMunicipio = selMunicipio;
+
+    inputMun.addEventListener('focus', function(){ mostrarOpciones(this.value); });
+    inputMun.addEventListener('input', function(){
+      hiddenMun.value=''; actualizarVisibilidad(); mostrarOpciones(this.value);
+      var placaMunLive = document.getElementById('ant-placa-municipio');
+      if (placaMunLive) placaMunLive.textContent = this.value.toUpperCase();
+    });
+    inputMun.addEventListener('keydown', function(e) {
+      var items = listaMun.querySelectorAll('div');
+      if (!items.length) return;
+      if (e.key==='ArrowDown') { antIdxActivo=Math.min(antIdxActivo+1,items.length-1); items.forEach(function(el,i){el.classList.toggle('activo',i===antIdxActivo);}); e.preventDefault(); }
+      else if (e.key==='ArrowUp') { antIdxActivo=Math.max(antIdxActivo-1,0); items.forEach(function(el,i){el.classList.toggle('activo',i===antIdxActivo);}); e.preventDefault(); }
+      else if (e.key==='Enter'&&antIdxActivo>=0) { selMunicipio(items[antIdxActivo].textContent); e.preventDefault(); }
+      else if (e.key==='Escape') { listaMun.style.display='none'; }
+    });
+    inputMun.addEventListener('blur', function() {
+      setTimeout(function(){ listaMun.style.display='none'; },150);
+      var val = inputMun.value.toUpperCase();
+      if (ANT_MUNICIPIOS.includes(val)) { inputMun.value=val; hiddenMun.value=val; actualizarVisibilidad(); }
+      else { hiddenMun.value=''; actualizarVisibilidad(); }
+    });
+    document.addEventListener('click', function(e){ if(e.target!==inputMun) listaMun.style.display='none'; });
+
+    // OCR
+    var zona    = document.getElementById('ant-ocr-zone');
+    var fileIn  = document.getElementById('ant-ocr-file');
+    var preview = document.getElementById('ant-ocr-preview');
+    var status  = document.getElementById('ant-ocr-status');
+
+    zona.addEventListener('dragover', function(e){ e.preventDefault(); zona.classList.add('dragover'); });
+    zona.addEventListener('dragleave', function(){ zona.classList.remove('dragover'); });
+    zona.addEventListener('drop', function(e){ e.preventDefault(); zona.classList.remove('dragover'); if(e.dataTransfer.files[0]) cargarImagen(e.dataTransfer.files[0]); });
+    fileIn.addEventListener('change', function(){ if(this.files[0]) cargarImagen(this.files[0]); });
+
+    // Listener para la cámara
+    var camaraIn = document.getElementById('ant-camara-file');
+    camaraIn.addEventListener('change', function(){
+      if(this.files[0]) {
+        document.getElementById('ant-zona-ocr').style.display = 'block';
+        document.getElementById('ant-ocr-zone').style.display = 'block';
+        document.getElementById('ant-preview-wrap').style.display = 'none';
+        cargarImagen(this.files[0]);
+        this.value = '';
+      }
+    });
+
+    var imagenBase64Actual = null;
+    var imagenOriginal     = null;
+    var rotacionActual     = 0;
+    var esArchivoPDF       = false;
+    var imagenBase64Actual2 = null;
+    var imagenOriginal2     = null;
+    var rotacionActual2     = 0;
+
+    function cargarSegundaFoto(file2) {
+      if (!file2) return;
+      var esPDF2 = file2.type === 'application/pdf';
+      if (!file2.type.startsWith('image/') && !esPDF2) return;
+      rotacionActual2 = 0;
+      imagenOriginal2 = null;
+      var reader2 = new FileReader();
+      reader2.onload = function(e) {
+        imagenBase64Actual2 = e.target.result;
+        imagenOriginal2     = e.target.result;
+        document.getElementById('ant-ocr-segunda-placeholder').style.display = 'none';
+        if (esPDF2) {
+          document.getElementById('ant-ocr-preview-2').style.display = 'none';
+          document.getElementById('ant-ocr-preview-pdf-nombre-2').textContent = file2.name;
+          document.getElementById('ant-ocr-preview-pdf-2').style.display = 'block';
+          document.getElementById('ant-btn-girar-segunda').style.display = 'none';
+        } else {
+          document.getElementById('ant-ocr-preview-pdf-2').style.display = 'none';
+          document.getElementById('ant-ocr-preview-2').src = e.target.result;
+          document.getElementById('ant-ocr-preview-2').style.display = 'block';
+          document.getElementById('ant-btn-girar-segunda').style.display = 'block';
+        }
+      };
+      reader2.readAsDataURL(file2);
+    }
+
+    document.getElementById('ant-ocr-file-2').addEventListener('change', function(){
+      cargarSegundaFoto(this.files[0]);
+    });
+
+    var zonaSegunda = document.getElementById('ant-ocr-segunda-slot');
+    zonaSegunda.addEventListener('dragover', function(e){ e.preventDefault(); zonaSegunda.classList.add('dragover'); });
+    zonaSegunda.addEventListener('dragleave', function(){ zonaSegunda.classList.remove('dragover'); });
+    zonaSegunda.addEventListener('drop', function(e){
+      e.preventDefault();
+      zonaSegunda.classList.remove('dragover');
+      if (e.dataTransfer.files[0]) cargarSegundaFoto(e.dataTransfer.files[0]);
+    });
+
+    window.antEliminarSegunda = function() {
+      imagenBase64Actual2 = null;
+      imagenOriginal2     = null;
+      rotacionActual2     = 0;
+      document.getElementById('ant-ocr-file-2').value = '';
+      document.getElementById('ant-ocr-segunda-placeholder').style.display = 'flex';
+      document.getElementById('ant-btn-girar-segunda').style.display = 'none';
+      document.getElementById('ant-ocr-preview-2').style.display = 'none';
+      document.getElementById('ant-ocr-preview-2').src = '';
+      document.getElementById('ant-ocr-preview-pdf-2').style.display = 'none';
+    };
+
+    function cargarImagen(file) {
+      var esPDF = file.type === 'application/pdf';
+      if (!file.type.startsWith('image/') && !esPDF) { mostrarStatus('err','Solo imagenes JPG, PNG, WEBP o archivos PDF'); return; }
+      limpiarCampos();
+      rotacionActual = 0;
+      imagenOriginal = null;
+      esArchivoPDF   = esPDF;
+
+      if (esPDF) {
+        var readerPdf = new FileReader();
+        readerPdf.onload = function(e) {
+          imagenBase64Actual = e.target.result;
+          mostrarPreviewPDF(file.name);
+        };
+        readerPdf.readAsDataURL(file);
+        return;
+      }
+
+      var reader = new FileReader();
+      reader.onload = function(e) {
+        var img = new Image();
+        img.onload = function() {
+          // Auto-rotar si está vertical
+          if (img.height > img.width) rotacionActual = 90;
+          imagenBase64Actual = e.target.result;
+          mostrarPreviewConRotacion();
+        };
+        img.src = e.target.result;
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function mostrarPreviewPDF(nombreArchivo) {
+      document.getElementById('ant-ocr-preview').style.display = 'none';
+      var pdfBox = document.getElementById('ant-ocr-preview-pdf');
+      pdfBox.style.display = 'block';
+      document.getElementById('ant-ocr-preview-pdf-nombre').textContent = nombreArchivo || 'documento.pdf';
+      // Girar no aplica a PDF (se lee tal cual, con todas sus páginas)
+      document.getElementById('ant-btn-girar-primera').style.display = 'none';
+      document.getElementById('ant-ocr-zone').style.display = 'none';
+      document.getElementById('ant-preview-wrap').style.display = 'block';
+      document.getElementById('ant-ocr-status').style.display = 'none';
+    }
+
+    function mostrarPreviewConRotacion() {
+      var img = new Image();
+      img.onload = function() {
+        // Guardar imagen original sin rotar para que girar siempre parta de cero
+        if (!imagenOriginal) imagenOriginal = imagenBase64Actual;
+        var canvas = document.createElement('canvas'), ctx = canvas.getContext('2d');
+        var rad = rotacionActual * Math.PI / 180;
+        if (rotacionActual === 90 || rotacionActual === 270) {
+          canvas.width = img.height; canvas.height = img.width;
+        } else {
+          canvas.width = img.width; canvas.height = img.height;
+        }
+        ctx.translate(canvas.width/2, canvas.height/2);
+        ctx.rotate(rad);
+        ctx.drawImage(img, -img.width/2, -img.height/2);
+        var imagenRotada = canvas.toDataURL('image/jpeg', 0.9);
+        // Mostrar preview (restaurar UI en caso de que el archivo anterior fuera un PDF)
+        var previewEl = document.getElementById('ant-ocr-preview');
+        previewEl.style.display = 'block';
+        previewEl.src = imagenRotada;
+        document.getElementById('ant-ocr-preview-pdf').style.display = 'none';
+        document.getElementById('ant-btn-girar-primera').style.display = 'block';
+        // Guardar imagen rotada para el OCR
+        imagenBase64Actual = imagenRotada;
+        // Mostrar panel de orientación
+        document.getElementById('ant-ocr-zone').style.display = 'none';
+        document.getElementById('ant-preview-wrap').style.display = 'block';
+        document.getElementById('ant-ocr-status').style.display = 'none';
+      };
+      img.src = imagenBase64Actual;
+    }
+
+    var imagenOriginal = null; // guarda siempre la imagen sin ninguna rotación
+
+    window.antGirarImagen = function() {
+      rotacionActual = (rotacionActual + 90) % 360;
+      var img = new Image();
+      img.onload = function() {
+        var canvas = document.createElement('canvas'), ctx = canvas.getContext('2d');
+        var rad = rotacionActual * Math.PI / 180;
+        if (rotacionActual === 90 || rotacionActual === 270) {
+          canvas.width = img.height; canvas.height = img.width;
+        } else {
+          canvas.width = img.width; canvas.height = img.height;
+        }
+        ctx.translate(canvas.width/2, canvas.height/2);
+        ctx.rotate(rad);
+        ctx.drawImage(img, -img.width/2, -img.height/2);
+        var imagenRotada = canvas.toDataURL('image/jpeg', 0.9);
+        document.getElementById('ant-ocr-preview').src = imagenRotada;
+        imagenBase64Actual = imagenRotada;
+      };
+      // Siempre desde la imagen original sin rotación acumulada
+      img.src = imagenOriginal;
+    };
+
+    window.antGirarImagen2 = function() {
+      rotacionActual2 = (rotacionActual2 + 90) % 360;
+      var img2 = new Image();
+      img2.onload = function() {
+        var canvas = document.createElement('canvas'), ctx = canvas.getContext('2d');
+        var rad = rotacionActual2 * Math.PI / 180;
+        if (rotacionActual2 === 90 || rotacionActual2 === 270) {
+          canvas.width = img2.height; canvas.height = img2.width;
+        } else {
+          canvas.width = img2.width; canvas.height = img2.height;
+        }
+        ctx.translate(canvas.width/2, canvas.height/2);
+        ctx.rotate(rad);
+        ctx.drawImage(img2, -img2.width/2, -img2.height/2);
+        var imagenRotada2 = canvas.toDataURL('image/jpeg', 0.9);
+        document.getElementById('ant-ocr-preview-2').src = imagenRotada2;
+        imagenBase64Actual2 = imagenRotada2;
+      };
+      // Siempre desde la imagen original sin rotación acumulada
+      img2.src = imagenOriginal2;
+    };
+
+    window.antContinuarOCR = function() {
+      document.getElementById('ant-preview-wrap').style.display = 'none';
+      procesarImagen(imagenBase64Actual, imagenBase64Actual2);
+    };
+
+    window.antEliminarImagen = function() {
+      imagenBase64Actual = null;
+      rotacionActual = 0;
+      esArchivoPDF = false;
+      document.getElementById('ant-preview-wrap').style.display = 'none';
+      document.getElementById('ant-ocr-zone').style.display = 'block';
+      document.getElementById('ant-ocr-status').style.display = 'none';
+      document.getElementById('ant-ocr-preview').style.display = 'block';
+      document.getElementById('ant-ocr-preview').src = '';
+      document.getElementById('ant-ocr-preview-pdf').style.display = 'none';
+      document.getElementById('ant-btn-girar-primera').style.display = 'block';
+      document.getElementById('ant-ocr-file').value = '';
+      document.getElementById('ant-camara-file').value = '';
+      window.antEliminarSegunda();
+    };
+
+    // Mostrar solo bloque-info al terminar de confirmar la foto
+    window.antMostrarSoloInfo = function() {
+      document.getElementById('bloque-info').classList.add('visible');
+      ['bloque-tramites','bloque-depto','bloque-municipal'].forEach(function(id) {
+        document.getElementById(id).classList.remove('visible');
+      });
+      document.getElementById('bloque-liq').style.display = 'none';
+      // Expandir info
+      document.getElementById('ant-info-contenido').style.display = 'block';
+      document.getElementById('ant-info-colapsado').style.display = 'none';
+    };
+
+    var CAMPOS_A_VALIDAR = ['ant-placa-editar','ant-municipio-input','ant-cedula','ant-apellidos',
+      'ant-clase','ant-marca','ant-linea','ant-modelo','ant-cilindrada','ant-servicio','ant-capacidad',
+      'ant-limitacion-propiedad'];
+
+    function marcarCamposVacios() {
+      CAMPOS_A_VALIDAR.forEach(function(id) {
+        var el = document.getElementById(id);
+        if (!el) return;
+        var fila = el.closest('.ant-group');
+        if (!fila) return;
+        if (!el.value || !el.value.trim()) {
+          fila.classList.add('ant-campo-vacio');
+        } else {
+          fila.classList.remove('ant-campo-vacio');
+        }
+      });
+    }
+
+    window.aplicarDatosLeidos = function(data) {
+      var scrollGuardado = window.scrollY;
+      var tipodocMap = (function(t) {
+        if (!t) return 'CC';
+        t = t.toUpperCase().replace(/[.\s]/g,'');
+        if (t==='CC') return 'CC';
+        if (t==='NIT') return 'NIT';
+        if (t==='CE') return 'CE';
+        if (t==='TI') return 'TI';
+        if (t==='RC') return 'RC';
+        if (t==='PPT') return 'PPT';
+        return 'CC';
+      })(data.tipo_documento);
+
+      if (data.placa) {
+        document.getElementById('ant-placa').value = data.placa;
+        var pe = document.getElementById('ant-placa-edit');
+        if (pe) pe.value = data.placa;
+        var pe2 = document.getElementById('ant-placa-editar');
+        if (pe2) pe2.value = data.placa;
+        document.getElementById('ant-placa-letras').textContent  = data.placa.substring(0,3) || '---';
+        document.getElementById('ant-placa-numeros').textContent = data.placa.substring(3)   || '---';
+      }
+      if (data.marca)      document.getElementById('ant-marca').value      = data.marca;
+      if (data.linea)      document.getElementById('ant-linea').value      = data.linea;
+      if (data.modelo)     document.getElementById('ant-modelo').value     = data.modelo;
+      if (data.clase)      document.getElementById('ant-clase').value      = data.clase;
+      if (data.servicio) {
+        var servicioVal = data.servicio.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase();
+        document.getElementById('ant-servicio').value = servicioVal;
+        actualizarColorPlaca();
+      }
+      if (data.capacidad)  document.getElementById('ant-capacidad').value  = data.capacidad;
+      if (data.cilindrada) document.getElementById('ant-cilindrada').value = data.cilindrada;
+      if (data.carroceria) document.getElementById('ant-carroceria').value = data.carroceria;
+      if (data.cedula)     document.getElementById('ant-cedula').value     = data.cedula;
+      if (data.apellidos)  document.getElementById('ant-apellidos').value  = data.apellidos;
+      if (!data.limitacion_propiedad) {
+        document.getElementById('ant-limitacion-propiedad').value = '';
+      } else if (/^\s*(ningun[ao]?|\*+)\s*$/i.test(data.limitacion_propiedad)) {
+        document.getElementById('ant-limitacion-propiedad').value = 'NO';
+      } else {
+        document.getElementById('ant-limitacion-propiedad').value = 'SI';
+      }
+      document.getElementById('ant-tipodoc').value = tipodocMap;
+      actualizarReglasDocumento();
+
+      if (!data.desde_cache) antDatosOCR = data;
+      ocrLeido = true;
+
+      document.getElementById('ant-bienvenida').style.display = 'none';
+      var vp2327 = document.getElementById('tramyVehiculosPanel'); if (vp2327) vp2327.style.display = 'none';
+      document.getElementById('ant-zona-ocr').style.display = 'none';
+      var elInfoTop = document.getElementById('bloque-info-top');
+      if (elInfoTop) elInfoTop.style.display = 'none';
+      var elZonaRunt = document.getElementById('ant-zona-runt');
+      if (elZonaRunt) elZonaRunt.style.display = 'none';
+
+      if (data.municipio) {
+        // Se quitan tildes -- el sistema guarda los municipios sin tilde
+        // en todas sus listas (ej. "MEDELLIN"), pero algunos documentos
+        // (como la Declaracion Sugerida) los traen bien escritos CON
+        // tilde ("MEDELLÍN"), y esa diferencia rompia las comparaciones
+        // exactas en varios lados (Impuesto Departamental, honorarios, etc).
+        var municipioLimpio = data.municipio.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase().trim();
+        document.getElementById('ant-municipio-input').value = municipioLimpio;
+        document.getElementById('ant-municipio').value       = municipioLimpio;
+        antMunicipioActual = municipioLimpio;
+        var placaMunAplicar = document.getElementById('ant-placa-municipio');
+        if (placaMunAplicar) placaMunAplicar.textContent = municipioLimpio;
+      }
+
+      actualizarVisibilidad();
+      cargarTramites();
+
+      var detectados = [data.placa,data.marca,data.modelo,data.cedula].filter(Boolean).length;
+      if (data.paz_salvo_antioquia_detectado) {
+        var elStatus = document.getElementById('ant-ocr-status');
+        elStatus.className = 'ant-ocr-status ok';
+        elStatus.innerHTML = '✓ Se detectó el recibo de pago de Impuesto Departamental — este vehículo quedó marcado como paz y salvo para el año actual.';
+        elStatus.style.display = 'block';
+      } else {
+        document.getElementById('ant-ocr-status').style.display = 'none';
+      }
+      marcarCamposVacios();
+      window.scrollTo(0, scrollGuardado);
+      if(typeof window.tramyVerificarDisponibilidadRunt === 'function') window.tramyVerificarDisponibilidadRunt();
+      return detectados;
+    };
+
+    function procesarImagen(imagenBase64, imagenBase64_2) {
+      mostrarStatus('procesando','Leyendo tarjeta de propiedad...');
+      var cuerpoPeticion = {imagen: imagenBase64, municipio: document.getElementById('ant-municipio').value};
+      if (imagenBase64_2) cuerpoPeticion.imagen2 = imagenBase64_2;
+      fetch(ANT_API+'/ocr-tarjeta', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(cuerpoPeticion)
+      })
+      .then(function(r){return r.json();})
+      .then(function(data) {
+        if (data.error) { mostrarStatus('err','Error: '+data.error); return; }
+        var detectados = aplicarDatosLeidos(data);
+        if (detectados === 0) {
+          mostrarStatus('err', 'No se pudieron detectar datos. Completa manualmente.');
+        }
+      })
+      .catch(function(err){ mostrarStatus('err','Error: '+err.message); });
+    }
+
+    function mostrarStatus(tipo, msg) {
+      status.className = 'ant-ocr-status '+tipo;
+      status.innerHTML = msg; status.style.display='block';
+    }
+
+    // Impuesto Departamental
+    document.getElementById('ant-btn-impuesto').addEventListener('click', function() {
+      var placa     = document.getElementById('ant-placa').value.trim().toUpperCase();
+      var cedula    = document.getElementById('ant-cedula').value.trim();
+      var modelo    = document.getElementById('ant-modelo').value.trim();
+      var municipio = antMunicipioActual.toUpperCase();
+      var apellidos = document.getElementById('ant-apellidos').value.trim().toUpperCase();
+      var tipodoc   = document.getElementById('ant-tipodoc').value.trim().toUpperCase();
+      var btn       = document.getElementById('ant-btn-impuesto');
+      var resultado = document.getElementById('ant-result-depto');
+
+      if (!placa||!cedula||!modelo||!municipio||!apellidos) {
+        resultado.innerHTML='<div class="ant-alert error">Por favor completa todos los datos del vehiculo.</div>';
+        return;
+      }
+
+
+      // ── PASO 1: Consultar vigencias (rapido) ──────────────────────────────
+      btn.disabled = true;
+      resultado.innerHTML = '<div class="ant-loading"><div class="ant-spinner-ring"></div><span>Consultando vigencias en la Gobernación de Antioquia...</span></div>';
+
+      fetch(ANT_API+'/consultar/antioquia/vigencias?placa='+encodeURIComponent(placa)
+        +'&identificacion='+encodeURIComponent(cedula)
+        +'&modelo='+encodeURIComponent(modelo)
+        +'&municipio_transito='+encodeURIComponent(municipio)
+        +'&apellidos_propietario='+encodeURIComponent(apellidos)
+        +'&tipo_documento='+encodeURIComponent(tipodoc))
+        .then(function(r){ return r.json(); })
+        .then(function(data) {
+          btn.disabled = false;
+          if (data.error) {
+            resultado.innerHTML = '<div class="ant-alert error">'+data.error+'</div>';
+            return;
+          }
+
+          var info = data.placa_info || {};
+          var infoHtml = info.marca
+            ? '<div class="ant-info"><div class="ant-info-item"><label>Placa</label><span>'+data.placa+'</span></div>'
+              +'<div class="ant-info-item"><label>Marca</label><span>'+info.marca+' '+(info.linea||'')+'</span></div>'
+              +'<div class="ant-info-item"><label>Modelo</label><span>'+(info.modelo||'')+'</span></div>'
+              +'<div class="ant-info-item"><label>Propietario</label><span>'+(info.propietario||info.nombrePropietario||'')+'</span></div></div>' : '';
+
+          // Paz y salvo
+          if (data.sin_deuda) {
+            if (data.avaluo) {
+              antAvaluo = data.avaluo;
+              if (hayTraspaso() && !esEmpresa()) {
+                setLiq('liq-retefuente', Math.round(data.avaluo/100));
+                document.getElementById('liq-row-retefuente').style.display = 'grid';
+              }
+              var blRet = document.getElementById('bloque-retefuente');
+              if (blRet) { blRet.style.display='none'; blRet.classList.remove('visible'); }
             }
-        },
-        timeout=60
-    )
-    validacion = r2.json()
-    if validacion.get("codigo") != 1:
-        raise Exception(f"Cuestionario inválido: {validacion.get('descripcion')}")
-
-    try:
-        token_captcha2 = resolver_turnstile_2captcha(ANTIOQUIA_SITE_KEY, ANTIOQUIA_URL)
-    except Exception as e:
-        raise Exception(f"Error resolviendo segundo captcha: {e}")
-    session.headers.update({"captcha": token_captcha2})
-
-    token_cuestionario = session.cookies.get("token_cuestionario")
-    if not token_cuestionario:
-        raise Exception("No se pudo obtener el token de sesión.")
-
-    r3 = session.post(
-        f"{ANTIOQUIA_API}/ConsultarEstadoCuentaImpAntioquia/consultarEstadoCuentaVehiculoHomePublico",
-        json={"placa": placa, "informacionDeclarante": {
-            "idsolicitante": identificacion, "idTipoIdentificacion": tipo_documento_id
-        }},
-        headers={"Cookie": f"token_cuestionario={token_cuestionario}"},
-        timeout=60
-    )
-    return session, token_cuestionario, r3.json()
-
-
-def _consultar_vigencia_antioquia(vigencia, session, token_cuestionario,
-                                   placa, identificacion, tipo_documento_id,
-                                   doc_abreviatura, doc_nombre,
-                                   celular, email, direccion, municipio, municipio_cod, departamento_cod):
-    """
-    Consulta el costo de una vigencia específica.
-    Costo: 2 Turnstiles adicionales.
-    """
-    try:
-        token_prop = resolver_turnstile_2captcha(ANTIOQUIA_SITE_KEY, ANTIOQUIA_URL)
-    except Exception as e:
-        raise Exception(f"Error resolviendo captcha vigencia {vigencia}: {e}")
-    session.headers.update({"captcha": token_prop})
-
-    r4 = session.post(
-        f"{ANTIOQUIA_API}/UsuariosPortalAntioquia/consultarPropietarioVehiculo",
-        json={"tipoDoc": doc_abreviatura, "nroDoc": identificacion, "placa": placa, "vigencia": vigencia},
-        headers={"Cookie": f"token_cuestionario={token_cuestionario}"},
-        timeout=60
-    )
-    propietario = r4.json().get("propietario", {})
-
-    session.post(f"{ANTIOQUIA_API}/TablasTipo/obtenerTablasPropietario", json={},
-                 headers={"Cookie": f"token_cuestionario={token_cuestionario}"}, timeout=60)
-    session.get(f"{ANTIOQUIA_API}/UtilImpuestos/obtenerDescripcionPPST",
-                headers={"Cookie": f"token_cuestionario={token_cuestionario}"}, timeout=60)
-    session.post(f"{ANTIOQUIA_API}/Pagos/parametrosPago", json={},
-                 headers={"Cookie": f"token_cuestionario={token_cuestionario}"}, timeout=60)
-    session.get(f"{ANTIOQUIA_API}/UtilImpuestos/obtenerVigenciaMinimaAutodeclarar",
-                headers={"Cookie": f"token_cuestionario={token_cuestionario}"}, timeout=60)
-
-    try:
-        token_decl = resolver_turnstile_2captcha(ANTIOQUIA_SITE_KEY, ANTIOQUIA_URL)
-    except Exception as e:
-        raise Exception(f"Error resolviendo captcha declaración vigencia {vigencia}: {e}")
-    session.headers.update({"captcha": token_decl})
-    session.cookies.clear()
-
-    es_nit = (str(tipo_documento_id) == "2")
-    if es_nit:
-        declarante = {
-            "idsolicitante": identificacion,
-            "idtipodocumento": doc_abreviatura,
-            "desctipodocument": doc_nombre,
-            "nombres": propietario.get("nameOrg1", ""),
-            "apellidos": "",
-            "celular": celular,
-            "telefono": propietario.get("celphone", celular),
-            "email": email,
-            "direccion": direccion, "municipio": municipio,
-            "departamento": "ANTIOQUIA", "nivreclamacion": 0, "procedimiento": ""
-        }
-    else:
-        declarante = {
-            "idsolicitante": identificacion,
-            "idtipodocumento": doc_abreviatura,
-            "desctipodocument": doc_nombre,
-            "nombres": propietario.get("nameFirst", ""),
-            "apellidos": propietario.get("nameLast", ""),
-            "celular": celular, "telefono": celular, "email": email,
-            "direccion": direccion, "municipio": municipio,
-            "departamento": "ANTIOQUIA", "nivreclamacion": 0, "procedimiento": ""
-        }
-
-    r5 = session.post(
-        f"{ANTIOQUIA_API}/LiquidacionAntioquia/crearDeclaracionImpuestoAnt",
-        json={
-            "formularioLiquidacion": "",
-            "declarante": declarante,
-            "iIdliqIm": 0,
-            "informacionComplementaria": {
-                "idTipoDocumento": int(tipo_documento_id),
-                "distribucionDepartamento": departamento_cod,
-                "distribucionMunicipio": municipio_cod,
-                "direccionCompleta": direccion,
-                "nombreDistribucionDepartamento": "ANTIOQUIA",
-                "nombreDistribucionMunicipio": municipio,
-                "tipoCanalLiquidacion": 2, "tipoOpcionLiquidacion": 1
-            },
-            "placa": placa,
-            "vigencia": [{"persl": vigencia}]
-        },
-        timeout=60
-    )
-    return r5.json()
-
-
-def _antioquia_construir_documento(tipo_documento_id, doc_abreviatura, doc_nombre):
-    """Arma el objeto 'documento' que pide el endpoint de aceptacion de
-    terminos, con la misma forma que se ve en el request real capturado."""
-    es_nit = (str(tipo_documento_id) == "2")
-    return {
-        "idDocumentoIdentidad": int(tipo_documento_id),
-        "tipoPersona": "J" if es_nit else "N",
-        "abreviatura": doc_abreviatura,
-        "nombreDocumento": doc_nombre,
-    }
-
-
-def _antioquia_aceptar_terminos_liquidacion(session, identificacion, tipo_documento_id,
-                                              doc_abreviatura, doc_nombre):
-    """Acepta las 3 casillas (tratamiento de datos, terminos y condiciones,
-    firma digital) que en el sitio real hay que marcar antes de que se
-    habilite el boton de imprimir/descargar la declaracion sugerida."""
-    body = {
-        "numeroDocumento": str(identificacion),
-        "documento": _antioquia_construir_documento(tipo_documento_id, doc_abreviatura, doc_nombre),
-    }
-    r = session.post(
-        f"{ANTIOQUIA_API}/AceptacionTerminoCondiciones/insertAceptaTerminosLiquidacion",
-        json=body, timeout=60
-    )
-    if r.status_code not in (200, 204):
-        raise Exception(f"Error aceptando terminos de liquidacion: {r.status_code} {r.text[:300]}")
-
-
-def _antioquia_descargar_pdf_liquidacion(session, formulario_liquidacion):
-    """Pide el PDF de la declaracion sugerida ya generada. El servidor lo
-    devuelve codificado en base64 dentro de un campo 'archivo'."""
-    r = session.post(
-        f"{ANTIOQUIA_API}/LiquidacionAntioquia/gestionarImprimirLiquidacion",
-        json=formulario_liquidacion, timeout=60
-    )
-    if r.status_code != 200:
-        raise Exception(f"Error descargando PDF de liquidacion: {r.status_code} {r.text[:300]}")
-    data = r.json()
-    archivo_b64 = data.get("archivo")
-    if not archivo_b64:
-        raise Exception(f"La respuesta no trajo el campo 'archivo': {json.dumps(data)[:300]}")
-    return base64.b64decode(archivo_b64)
-
-
-def _extraer_caja_traccion_declaracion(pdf_bytes):
-    """Extrae 'Caja' (transmision) y 'Traccion' directamente del texto del
-    PDF de la Declaracion Sugerida -- la Gobernacion los incluye ahi
-    aunque no vengan en la respuesta JSON de la consulta (crearDeclaracion
-    ImpuestoAnt), asi que en vez de perseguirlos por la API los leemos del
-    mismo documento que ya generamos.
-
-    IMPORTANTE: el orden en que aparecen las etiquetas D.21/D.22 varia
-    segun la plantilla (a veces "D.21 CAJA ... D.22 TRACCION", otras veces
-    al reves, y hasta el nombre de la etiqueta cambia). Por eso, en vez de
-    depender de la posicion, se buscan directamente los VALORES conocidos
-    (MT/AT/CVT para caja, 4X2/4X4 para traccion) dentro de una ventana de
-    texto alrededor de esas etiquetas.
-
-    Si no los encuentra (formato distinto, o el vehiculo no tiene esos
-    datos), se devuelven vacios -- el instructivo oficial permite dejarlos
-    en blanco de todas formas."""
-    try:
-        import io, re
-        from pypdf import PdfReader
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        texto = ""
-        for pagina in reader.pages:
-            texto += (pagina.extract_text() or "") + "\n"
-        texto_norm = texto.upper()
-
-        idx21 = texto_norm.find("D.21")
-        idx22 = texto_norm.find("D.22")
-        indices = [i for i in (idx21, idx22) if i != -1]
-        ventana = texto_norm[max(0, min(indices) - 60): min(indices) + 100] if indices else texto_norm
-
-        match_traccion = re.search(r'\b(4X[24])', ventana)
-        match_caja = re.search(r'\b(MT|AT|CVT|TM|TA)\b', ventana)
-
-        return {
-            "traccion": match_traccion.group(1) if match_traccion else "",
-            "caja": match_caja.group(1) if match_caja else ""
-        }
-    except Exception as e:
-        print(f"No se pudo extraer caja/traccion del PDF de declaracion: {e}", flush=True)
-    return {"traccion": "", "caja": ""}
-
-
-def antioquia_generar_pdf_declaracion(placa, identificacion, tipo_documento_abrev, vigencia,
-                                       modelo, municipio_transito, apellidos_propietario,
-                                       celular="3000000000", email="consulta@consulta.com",
-                                       direccion="CRA", municipio="MEDELLIN",
-                                       municipio_cod=5001000, departamento_cod=5):
-    """Flujo completo para obtener el PDF de la declaracion sugerida (el que
-    se lleva al banco), TODO dentro de la misma sesion (el numero de
-    liquidacion que genera el sitio solo es valido dentro de la sesion que
-    lo creo, no se puede reutilizar en una sesion nueva).
-    Devuelve una tupla (pdf_bytes, data_vig) -- data_vig es la respuesta
-    cruda de la liquidacion (avaluo, impuesto, sanciones, intereses, etc.),
-    util para reutilizar esos mismos datos en la declaracion manual sin
-    tener que volver a consultar."""
-    tipo_documento_id = ANTIOQUIA_TIPO_DOC_MAP.get(tipo_documento_abrev.upper(), "1")
-    tipo_doc_info = ANTIOQUIA_TIPOS_DOCUMENTO.get(tipo_documento_id, ANTIOQUIA_TIPOS_DOCUMENTO["1"])
-    doc_abreviatura = tipo_doc_info["abreviatura"]
-    doc_nombre = tipo_doc_info["nombre"]
-
-    if tipo_documento_id == "2":
-        identificacion = str(identificacion) + str(_calcular_digito_nit(identificacion))
-
-    # 1. Nueva sesion (igual que cualquier consulta normal)
-    session, token_cuestionario, _data3 = _sesion_antioquia(
-        placa, identificacion, tipo_documento_id,
-        modelo, municipio_transito, apellidos_propietario
-    )
-
-    # 2. Crear la declaracion sugerida para la vigencia pedida (misma sesion)
-    data_vig = _consultar_vigencia_antioquia(
-        vigencia, session, token_cuestionario,
-        placa, identificacion, tipo_documento_id,
-        doc_abreviatura, doc_nombre,
-        celular, email, direccion, municipio, municipio_cod, departamento_cod
-    )
-    formulario_liquidacion = data_vig.get("formularioLiquidacion")
-    if not formulario_liquidacion:
-        raise Exception(f"No se pudo generar la declaracion: {json.dumps(data_vig, ensure_ascii=False)[:300]}")
-
-    # 3. Aceptar las 3 casillas (misma sesion)
-    _antioquia_aceptar_terminos_liquidacion(session, identificacion, tipo_documento_id,
-                                              doc_abreviatura, doc_nombre)
-
-    # 4. Descargar el PDF ya generado (misma sesion)
-    # El sitio espera este valor como NUMERO en el JSON, no como texto
-    # entre comillas -- por eso se convierte antes de enviarlo.
-    pdf_bytes = _antioquia_descargar_pdf_liquidacion(session, int(formulario_liquidacion))
-    return pdf_bytes, data_vig
-
-
-def _antioquia_calcular_validez_pdf(vigencia):
-    """La declaracion sugerida de una vigencia VENCIDA solo sirve el mismo
-    dia en que se genero (los intereses suben a diario). La de la vigencia
-    ACTUAL (el año en curso) es distinta: sirve durante toda la ventana de
-    pronto pago -- del 1 de enero al 30 de abril, o del 1 de mayo al 31 de
-    julio -- y desde el 1 de agosto en adelante se comporta igual que una
-    vigencia vencida (valida solo el mismo dia)."""
-    hoy = datetime.now().date()
-    anio_actual = hoy.year
-
-    if int(vigencia) == anio_actual:
-        if hoy.month <= 4:
-            return date(anio_actual, 4, 30)
-        elif hoy.month <= 7:
-            return date(anio_actual, 7, 31)
-    return hoy  # vigencias vencidas, o vigencia actual desde agosto en adelante
-
-
-def _cache_declaracion_buscar(placa, vigencia):
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT url FROM cache_declaraciones_antioquia
-            WHERE placa = %s AND vigencia = %s AND valido_hasta >= CURRENT_DATE
-        """, (placa.upper(), int(vigencia)))
-        row = cur.fetchone()
-        cur.close(); conn.close()
-        return row[0] if row else None
-    except Exception as e:
-        print(f"Error buscando cache de declaracion: {e}")
-        return None
-
-
-def _cache_declaracion_guardar(placa, vigencia, url):
-    try:
-        valido_hasta = _antioquia_calcular_validez_pdf(vigencia)
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO cache_declaraciones_antioquia (placa, vigencia, url, valido_hasta)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (placa, vigencia) DO UPDATE SET url = EXCLUDED.url,
-                valido_hasta = EXCLUDED.valido_hasta, creado_en = NOW()
-        """, (placa.upper(), int(vigencia), url, valido_hasta))
-        conn.commit()
-        cur.close(); conn.close()
-    except Exception as e:
-        print(f"Error guardando cache de declaracion: {e}")
-
-
-def antioquia_generar_todas_declaraciones(placa, identificacion, tipo_documento_abrev, vigencias,
-                                           modelo, municipio_transito, apellidos_propietario,
-                                           celular="3000000000", email="consulta@consulta.com",
-                                           direccion="CRA", municipio="MEDELLIN",
-                                           municipio_cod=5001000, departamento_cod=5, job_id=None,
-                                           ignorar_cache=False):
-    """Genera (o reutiliza del cache, si sigue vigente) el PDF de cada
-    vigencia adeudada. Cada vigencia es INDEPENDIENTE: si una falla (a
-    veces la Gobernacion tiene problemas puntuales con alguna), las demas
-    igual se entregan, y solo habria que reintentar la que fallo.
-    Si 'ignorar_cache' es True (ej. porque se dieron datos reales del
-    cliente para el PDF final), se ignora cualquier PDF ya cacheado y se
-    genera uno nuevo -- para no entregar por error una version vieja con
-    datos de relleno.
-    Devuelve una lista de dicts: {vigencia, ok, url, error}."""
-    placa = placa.upper()
-    resultados = []
-
-    for vigencia in vigencias:
-        url_cache = None if ignorar_cache else _cache_declaracion_buscar(placa, vigencia)
-        if url_cache:
-            resultados.append({"vigencia": vigencia, "ok": True, "url": url_cache})
-            if job_id:
-                job_actualizar(job_id, f"Vigencia {vigencia}: usando declaración ya generada hoy...",
-                                datos_parciales=resultados)
-            continue
-
-        if job_id:
-            job_actualizar(job_id, f"Generando declaración de la vigencia {vigencia}...",
-                            datos_parciales=resultados)
-        try:
-            pdf_bytes, _data_vig = antioquia_generar_pdf_declaracion(
-                placa, identificacion, tipo_documento_abrev, vigencia,
-                modelo, municipio_transito, apellidos_propietario,
-                celular, email, direccion, municipio, municipio_cod, departamento_cod
-            )
-            id_unico = uuid.uuid4().hex[:8]
-            ruta = f"/tmp/decl_{placa}_{vigencia}_{id_unico}.pdf"
-            with open(ruta, "wb") as f:
-                f.write(pdf_bytes)
-
-            url = subir_a_r2(ruta, f"declaraciones/{placa}_{vigencia}_{id_unico}.pdf",
-                              nombre_descarga=f"Declaracion_{placa}_{vigencia}.pdf")
-            os.remove(ruta)
-            _cache_declaracion_guardar(placa, vigencia, url)
-            resultados.append({"vigencia": vigencia, "ok": True, "url": url})
-        except Exception as e:
-            print(f"Error generando declaracion vigencia {vigencia} para {placa}: {e}", flush=True)
-            resultados.append({"vigencia": vigencia, "ok": False, "error": str(e)})
-
-        if job_id:
-            job_actualizar(job_id, f"Vigencia {vigencia} lista.", datos_parciales=resultados)
-
-    return resultados
-
-
-def consultar_antioquia(page, placa, identificacion, tipo_documento_abrev,
-                        modelo, municipio_transito, apellidos_propietario,
-                        celular="3000000000", email="consulta@consulta.com",
-                        direccion="CRA", municipio="MEDELLIN",
-                        municipio_cod=5001000, departamento_cod=5, job_id=None):
-    """
-    Proceso completo para Antioquia.
-    Retorna (registros, total, avaluo, estado_vehiculo, excede_limite).
-    """
-    LIMITE = ANTIOQUIA_LIMITE_VIGENCIAS
-
-    # Resolver tipo de documento
-    tipo_documento_id = ANTIOQUIA_TIPO_DOC_MAP.get(tipo_documento_abrev.upper(), "1")
-    tipo_doc_info     = ANTIOQUIA_TIPOS_DOCUMENTO.get(tipo_documento_id, ANTIOQUIA_TIPOS_DOCUMENTO["1"])
-    doc_abreviatura   = tipo_doc_info["abreviatura"]
-    doc_nombre        = tipo_doc_info["nombre"]
-
-    # Si es NIT, calcular y agregar dígito de verificación
-    if tipo_documento_id == "2":
-        identificacion = str(identificacion) + str(_calcular_digito_nit(identificacion))
-
-    if job_id:
-        job_actualizar(job_id, "Estoy ingresando a la página de la Gobernación de Antioquia...")
-    print(f"\n  → Consultando primer bloque de datos ({placa})...")
-    session0, token0, data3 = _sesion_antioquia(
-        placa, identificacion, tipo_documento_id,
-        modelo, municipio_transito, apellidos_propietario
-    )
-
-    estado_veh          = data3.get("estadoCuenta", {})
-    vigencias_adeudadas = data3.get("listaVigenciasAdeudas", [])
-    avaluo              = estado_veh.get("avaluoComercial", 0) or 0
-    print(f"  → Vigencias adeudadas encontradas: {len(vigencias_adeudadas)}")
-    if job_id:
-        if not vigencias_adeudadas:
-            job_actualizar(job_id, "Este vehículo está a paz y salvo con la Gobernación de Antioquia.")
-        else:
-            job_actualizar(job_id, f"Encontré {len(vigencias_adeudadas)} año(s) con impuesto pendiente. Consultando valores...")
-
-    # Paz y salvo — solo retornar si el avaluo es confiable (> 0)
-    if not vigencias_adeudadas:
-        if not avaluo or avaluo == 0:
-            raise Exception("No se pudo obtener información completa del vehículo. Por favor intente de nuevo.")
-        return [], 0, avaluo, estado_veh, False
-
-    total_vigencias       = len(vigencias_adeudadas)
-    vigencias_a_consultar = sorted(vigencias_adeudadas, key=lambda x: x["vigencia"], reverse=True)
-    excede_limite         = total_vigencias > LIMITE
-    if excede_limite:
-        vigencias_a_consultar = vigencias_a_consultar[:LIMITE]
-
-    registros         = []
-    total_suma        = 0
-    avaluo_actual     = 0
-    retefuente_actual = 0
-    MAX_INTENTOS      = 2
-
-    # Vigencias actualmente adeudadas según el portal
-    anios_adeudados = set(str(v.get("vigencia")) for v in vigencias_a_consultar)
-
-    # Limpiar del caché las vigencias que ya fueron pagadas
-    try:
-        conn_c = get_db_conn()
-        cur_c  = conn_c.cursor()
-        cur_c.execute("""
-            SELECT vigencia FROM cache_impuestos_antioquia
-            WHERE placa = %s AND estado = 'CON_DEUDA'
-              AND (expira_en IS NULL OR expira_en >= NOW())
-        """, (placa.upper(),))
-        anios_en_cache = set(str(r[0]) for r in cur_c.fetchall())
-        cur_c.close(); conn_c.close()
-        for anio_pagado in (anios_en_cache - anios_adeudados):
-            cache_antioquia_eliminar_vigencia(placa, anio_pagado)
-    except Exception as e:
-        print(f"  → Error limpiando caché: {e}")
-
-    for v in vigencias_a_consultar:
-        anio = v.get("vigencia")
-        if job_id:
-            job_actualizar(job_id, f"Estoy consultando el impuesto del año {anio}...")
-        print(f"\n  → Consultando vigencia {anio}...")
-
-        total_pagar  = None
-        avaluo_vig   = 0
-
-        # Intentar desde caché primero
-        cache_vig = cache_antioquia_buscar_vigencia(placa, anio)
-        if cache_vig:
-            total_pagar = cache_vig['total_pagar']
-            avaluo_vig  = cache_vig['avaluo']
-            print(f"  ✔ Vigencia {anio} desde caché: ${total_pagar:,}")
-        else:
-            for intento in range(1, MAX_INTENTOS + 1):
-                if intento > 1:
-                    print(f"  ↺ Reintentando vigencia {anio}...")
-                try:
-                    session_v, token_v, _ = _sesion_antioquia(
-                        placa, identificacion, tipo_documento_id,
-                        modelo, municipio_transito, apellidos_propietario
-                    )
-                    data_vig = _consultar_vigencia_antioquia(
-                        anio, session_v, token_v,
-                        placa, identificacion, tipo_documento_id,
-                        doc_abreviatura, doc_nombre,
-                        celular, email, direccion, municipio, municipio_cod, departamento_cod
-                    )
-                    _msg    = data_vig.get("mensaje") or data_vig.get("descripcion")
-                    _codigo = data_vig.get("codigo")
-                    if _codigo and _codigo != 1 and _msg:
-                        print(f"  ✖ Error servidor vigencia {anio}: {_msg}")
-
-                    total_pagar = data_vig.get("totalPagar")
-                    avaluo_vig  = data_vig.get("avaluoComercial", 0) or 0
-                    if total_pagar is not None:
-                        print(f"  ✔ Vigencia {anio}: ${total_pagar:,}")
-                        # Guardar en caché
-                        try:
-                            cache_antioquia_guardar_deuda(placa, [{
-                                'vigencia': anio,
-                                'total_pagar': total_pagar,
-                            }], avaluo_vig or avaluo)
-                            print(f"  → Caché guardado exitosamente para {placa} vigencia {anio}")
-                        except Exception as ce:
-                            print(f"  ✖ Error guardando caché vigencia {anio}: {ce}")
-                        break
-                except Exception as e:
-                    print(f"  ✖ Error vigencia {anio} intento {intento}: {e}")
-
-        if not avaluo_actual and avaluo_vig:
-            avaluo_actual     = avaluo_vig
-            retefuente_actual = round(avaluo_vig / 100)
-
-        if total_pagar is not None:
-            total_suma += total_pagar
-
-        registros.append({
-            "vigencia":       str(anio),
-            "estado":         "Pendiente de pago",
-            "total_vigencia": total_pagar,
-        })
-
-        if job_id and total_pagar is not None:
-            job_actualizar(job_id,
-                f"Año {anio}: impuesto es ${total_pagar:,}. Continuando...",
-                datos_parciales=list(registros))
-
-    print(f"\n  ✔ ¡Consulta Antioquia finalizada!")
-    return registros, total_suma, avaluo_actual or avaluo, estado_veh, excede_limite
-
-
-
-def consultar_medellin(page, placa, identificacion, modelo, apellidos_propietario,
-                       celular="3208578787", email="consulta@juridicox.com",
-                       direccion="CRA 20 20 20"):
-    """Consulta impuesto municipal de Medellín (servicio público) con valores reales incluyendo intereses."""
-    import re as _re
-
-    url = "https://www.medellin.gov.co/irj/portal/medellin/pago-impuesto-circulacion-transito"
-    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-
-    # Esperar popup de validación
-    page.wait_for_selector("#popupValidacion", timeout=30000)
-
-    # Cerrar popup de imagen si aparece
-    try:
-        cerrar = page.locator(".divCerrarPopup")
-        if cerrar.is_visible(timeout=3000):
-            cerrar.click()
-            page.wait_for_timeout(500)
-    except Exception:
-        pass
-
-    # Paso 0 — popup validación: servicio público + Medellín
-    page.locator("input[name='tipoVehiculo'][value='publico']").check()
-    page.wait_for_timeout(500)
-    page.wait_for_selector("#matriculaLugar", timeout=5000)
-    page.locator("input[name='lugarMatricula'][value='medellin']").check()
-    page.wait_for_timeout(500)
-    page.wait_for_function("() => !document.getElementById('btnContinuar').disabled", timeout=5000)
-    page.locator("#btnContinuar").click()
-
-    # Paso 1 — llenar placa y documento
-    page.wait_for_selector("#placa", timeout=15000)
-    page.locator("#placa").fill(placa.upper())
-    page.locator("#id").fill(identificacion)
-    page.locator("button.boton_consulta").click()
-
-    # Esperar tabla de vigencias
-    page.wait_for_selector("#cont_paso1 table tbody tr", timeout=30000)
-
-    body_text = page.inner_text("body").lower()
-    if "no se encuentra matriculado" in body_text or "no está matriculado" in body_text:
-        raise Exception("Este vehículo no está matriculado en la Secretaría de Movilidad de Medellín.")
-    if "no presenta deuda" in body_text or "no adeuda" in body_text or "paz y salvo" in body_text:
-        return [], 0
-
-    # Seleccionar todos los checkboxes de vigencias
-    try:
-        page.locator(".sel_todo").click(timeout=3000)
-    except Exception:
-        pass
-    page.wait_for_timeout(500)
-    # Si no quedaron todos marcados, marcarlos uno a uno
-    checkboxes = page.locator("#cont_paso1 input[type='checkbox']").all()
-    for cb in checkboxes:
-        try:
-            if not cb.is_checked():
-                cb.check()
-        except Exception:
-            pass
-    page.wait_for_timeout(500)
-    # Verificar que hay checkboxes marcados antes de continuar
-    marcados = page.locator("#cont_paso1 input[type='checkbox']:checked").count()
-    btn = page.locator("button.boton_continuar").first
-    disabled = btn.get_attribute("disabled")
-    # Forzar click aunque esté deshabilitado
-    btn.evaluate("el => el.click()")
-    page.wait_for_timeout(1000)
-
-    # Paso 2a — modelo y propietario
-    page.wait_for_selector("#modelo_veh", timeout=15000)
-    modelo_str = str(modelo).strip()[:4].zfill(4)
-    page.locator("#modelo_veh").fill(modelo_str)
-
-    # Seleccionar propietario — primera opción disponible si no hay match por apellido
-    try:
-        opciones = page.locator("#nombres_props option.valorSel").all()
-        valor_sel = opciones[0].get_attribute("value") if opciones else None
-        for op in opciones:
-            texto = (op.inner_text() or "").upper()
-            if apellidos_propietario and apellidos_propietario.split()[0].upper() in texto:
-                valor_sel = op.get_attribute("value")
-                break
-        if valor_sel:
-            page.locator("#nombres_props").select_option(valor_sel)
-    except Exception:
-        pass
-
-    # Forzar click en boton_validar ignorando validación HTML5
-    page.locator("button.boton_validar").evaluate("el => el.click()")
-    page.wait_for_timeout(1500)
-
-    # Paso 2b — datos de contacto del propietario
-    page.wait_for_selector("#correo", timeout=15000)
-    page.locator("#correo").fill(email)
-    page.locator("#celular").fill(celular)
-    try:
-        page.locator("#telefono").fill("6042379933")
-    except Exception:
-        pass
-
-    # Dirección — abrir popup y llenar
-    try:
-        page.locator("#direccion").click()
-        page.wait_for_selector("#tipo_via", state="visible", timeout=5000)
-        page.locator("#tipo_via").select_option("CARRERA")
-        page.locator("#numero1").fill("20")
-        page.locator("#numero2").fill("20")
-        page.locator("#numero3").fill("20")
-        # Guardar dirección con evaluate para bypass validación
-        page.locator("button.boton_dir").evaluate("el => el.click()")
-        page.wait_for_timeout(1000)
-        # Verificar que la dirección quedó guardada
-        dir_val = page.locator("#direccion").input_value()
-    except Exception as e:
-        # Si falla el popup, inyectar la dirección directamente
-        try:
-            page.evaluate("document.getElementById('direccion').removeAttribute('readonly')")
-            page.locator("#direccion").fill("CARRERA 20 20 20")
-        except Exception:
-            pass
-
-    # Departamento y municipio
-    try:
-        page.locator("#departamento").select_option("05")
-        page.wait_for_timeout(500)
-        page.locator("#municipio").select_option("000000005001")
-        page.wait_for_timeout(500)
-    except Exception as e:
-        pass
-
-    # Guardar datos del propietario — bypass validación HTML5
-    # Intentar el botón de guardar del form info_propietario
-    try:
-        page.locator("button[form='info_propietario']").first.evaluate("el => el.click()")
-    except Exception:
-        # Si no existe, buscar boton_continuar o cualquier submit visible
-        try:
-            page.locator(".divContBotones button:not(.boton_cancelar)").first.evaluate("el => el.click()")
-        except Exception as e2:
-            pass
-    page.wait_for_timeout(1500)
-
-    # Esperar tabla del paso 3 con valores reales
-    page.wait_for_selector("#cont_paso3 table tbody tr", timeout=30000)
-
-    # Extraer total general del tfoot
-    total = 0
-    try:
-        tfoot_text = page.locator("#cont_paso3 table tfoot").inner_text()
-        total_match = _re.search(r'\$([\d\.]+)', tfoot_text)
-        if total_match:
-            total = int(total_match.group(1).replace('.', ''))
-    except Exception:
-        pass
-
-    # Extraer vigencias con valores reales (impuesto + intereses + total por vigencia)
-    registros = []
-    filas = page.locator("#cont_paso3 table tbody tr").all()
-    for fila in filas:
-        texto = fila.inner_text().strip()
-        if not texto:
-            continue
-        anio = _re.search(r'\b(20\d{2}|19\d{2})\b', texto)
-        # Buscar "Total a pagar" que es la última columna
-        valores = _re.findall(r'\$([\d\.]+)', texto)
-        if anio and valores:
-            try:
-                # El último valor es "Total a pagar" por vigencia
-                total_vigencia = int(valores[-1].replace('.', ''))
-                impuesto = int(valores[-3].replace('.', '')) if len(valores) >= 3 else 0
-                interes = int(valores[-2].replace('.', '')) if len(valores) >= 2 else 0
-                if total_vigencia > 0:
-                    registros.append({
-                        'vigencia': anio.group(),
-                        'estado': 'Pendiente de pago',
-                        'impuesto_base': impuesto,
-                        'interes_mora': interes,
-                        'total_vigencia': total_vigencia
+            resultado.innerHTML = infoHtml
+              + '<div class="ant-alert success">'+data.placa+' esta a paz y salvo con la Gobernacion de Antioquia.</div>'
+              + (data.avaluo ? '<div class="ant-extra"><span>Retefuente (1%)</span><strong>$'+Math.round(data.avaluo/100).toLocaleString('es-CO')+'</strong></div>' : '');
+
+            // Aunque no haya ninguna vigencia adeudada, se deja la fila
+            // del departamental en $0 en la liquidacion -- para que
+            // quede constancia de que se consulto y esta al dia (evita
+            // que el cliente pregunte si debe impuestos).
+            var liqRowDeptoPaz = document.getElementById('liq-row-depto');
+            if (liqRowDeptoPaz) {
+              setLiq('liq-depto', 0);
+              liqRowDeptoPaz.style.display = 'grid';
+              var lblDPaz = document.querySelector('#liq-row-depto .ant-liq-nombre');
+              if (lblDPaz) lblDPaz.textContent = 'Impuesto Departamental';
+            }
+            return;
+          }
+
+          // Hay vigencias — mostrar tabla con botón para consultar valores
+          var vigencias = data.vigencias || [];
+          var filasHtml = vigencias.map(function(v) {
+            return '<tr><td>'+v.vigencia+'</td><td>Pendiente de pago</td><td style="text-align:right;color:#888;">Pendiente...</td></tr>';
+          }).join('');
+
+          resultado.innerHTML = infoHtml
+            + '<table class="ant-table"><thead><tr><th>Vigencia</th><th>Estado</th><th style="text-align:right">Valor</th></tr></thead>'
+            + '<tbody id="ant-tbody-vigencias">'+filasHtml+'</tbody></table>'
+            + '<button id="ant-btn-valores" class="ant-btn ant-btn-primary" style="margin-top:12px;width:100%;">Consultar valores de cada vigencia</button>'
+            + '<div id="ant-prog-wrap" style="display:none;margin-top:12px;">'
+            + '<div class="ant-progreso-wrap"><div class="ant-progreso-msg" id="ant-prog-msg">Iniciando...</div>'
+            + '<div class="ant-progreso-barra-bg"><div class="ant-progreso-barra" id="ant-prog-barra" style="width:5%"></div></div></div>'
+            + '</div>';
+
+          // ── PASO 2: Consultar valores (asincrono) ─────────────────────────
+          document.getElementById('ant-btn-valores').addEventListener('click', function() {
+            var btnVal = this;
+            btnVal.disabled = true;
+            document.getElementById('ant-prog-wrap').style.display = 'block';
+            var antProgresoPorc = 5;
+
+            var aniosVigencias = vigencias.map(function(v){ return v.vigencia; }).join(',');
+            fetch(ANT_API+'/consultar?placa='+encodeURIComponent(placa)
+              +'&municipio=antioquia&identificacion='+encodeURIComponent(cedula)
+              +'&modelo='+encodeURIComponent(modelo)
+              +'&municipio_transito='+encodeURIComponent(municipio)
+              +'&apellidos_propietario='+encodeURIComponent(apellidos)
+              +'&tipo_documento='+encodeURIComponent(tipodoc)
+              +'&vigencias='+encodeURIComponent(aniosVigencias))
+              .then(function(r){ return r.json(); })
+              .then(function(resp) {
+                if (resp.error) {
+                  btnVal.disabled = false;
+                  document.getElementById('ant-prog-msg').textContent = 'Error: '+resp.error;
+                  return;
+                }
+
+                // Respuesta desde caché — sin polling
+                if (resp.desde_cache && !resp.job_id) {
+                  btnVal.disabled = false;
+                  document.getElementById('ant-prog-wrap').style.display = 'none';
+                  var d = resp;
+                  if (d.avaluo) {
+                    antAvaluo = d.avaluo;
+                    if (hayTraspaso() && !esEmpresa()) {
+                      setLiq('liq-retefuente', Math.round(d.avaluo/100));
+                      document.getElementById('liq-row-retefuente').style.display = 'grid';
+                    }
+                    var blRet = document.getElementById('bloque-retefuente');
+                    if (blRet) { blRet.style.display='none'; blRet.classList.remove('visible'); }
+                  }
+                  setLiq('liq-depto', d.total || 0);
+                  document.getElementById('liq-row-depto').style.display = 'grid';
+                  var nVig = (d.registros || []).filter(function(r){ return r.total_vigencia > 0; }).length;
+                  var lblD = document.querySelector('#liq-row-depto .ant-liq-nombre');
+                  if (lblD) {
+                    lblD.textContent = nVig > 0
+                      ? 'Impuesto Departamental (' + nVig + ' vigencia' + (nVig > 1 ? 's' : '') + ')'
+                      : 'Impuesto Departamental';
+                  }
+                  var tbody = document.getElementById('ant-tbody-vigencias');
+                  if (tbody && d.registros) {
+                    tbody.innerHTML = d.registros.map(function(r) {
+                      return '<tr><td>'+r.vigencia+'</td><td>'+r.estado+'</td><td style="text-align:right">'
+                        +(r.total_vigencia ? '$'+r.total_vigencia.toLocaleString('es-CO') : 'Ver con asesor')+'</td></tr>';
+                    }).join('');
+                  }
+                  var totalHtml = (d.total ? '<div class="ant-total-bar"><span>Total vigencias</span><span>$'+d.total.toLocaleString('es-CO')+'</span></div>' : '')
+                    + (d.avaluo ? '<div class="ant-extra"><span>Retefuente (1%)</span><strong>$'+Math.round(d.avaluo/100).toLocaleString('es-CO')+'</strong></div>' : '');
+                  var btnValEl = document.getElementById('ant-btn-valores');
+                  if (btnValEl) btnValEl.remove();
+                  resultado.innerHTML += totalHtml;
+                  window._tramyUltimaConsultaAntioquia = {
+                    vigenciasConDeuda: (d.registros || []).filter(function(r){ return r.total_vigencia > 0; }).map(function(r){ return r.vigencia; }),
+                    placa: placa, cedula: cedula, tipodoc: tipodoc, modelo: modelo, municipio: municipio, apellidos: apellidos
+                  };
+                  if(typeof window.tramyActualizarLinksSecciones === 'function'){
+                    window.tramyActualizarLinksSecciones(placa, window._tramyUltimaConsultaAntioquia.vigenciasConDeuda);
+                  }
+                  return;
+                }
+
+                var jobId = resp.job_id;
+                var timer = setInterval(function() {
+                  fetch(ANT_API+'/consultar/estado?job_id='+jobId)
+                    .then(function(r){ return r.json(); })
+                    .then(function(estado) {
+                      // Actualizar barra y mensaje
+                      if (estado.mensaje) {
+                        antProgresoPorc = Math.min(antProgresoPorc + 10, 90);
+                        var msgEl = document.getElementById('ant-prog-msg');
+                        var barEl = document.getElementById('ant-prog-barra');
+                        if (msgEl) msgEl.textContent = estado.mensaje;
+                        if (barEl) barEl.style.width = antProgresoPorc + '%';
+                      }
+
+                      if (estado.estado === 'listo') {
+                        clearInterval(timer);
+                        btnVal.disabled = false;
+                        document.getElementById('ant-prog-wrap').style.display = 'none';
+                        var d = estado.resultado;
+                        if (!d) return;
+
+                        // Rellenar valores en la tabla
+                        if (d.avaluo) {
+                          antAvaluo = d.avaluo;
+                          if (hayTraspaso() && !esEmpresa()) {
+                            setLiq('liq-retefuente', Math.round(d.avaluo/100));
+                            document.getElementById('liq-row-retefuente').style.display = 'grid';
+                          }
+                          var blRet = document.getElementById('bloque-retefuente');
+                          if (blRet) { blRet.style.display='none'; blRet.classList.remove('visible'); }
+                        }
+                        setLiq('liq-depto', d.total || 0);
+                        document.getElementById('liq-row-depto').style.display = 'grid';
+                        var nVig = (d.registros || []).filter(function(r){ return r.total_vigencia > 0; }).length;
+                        var lblD = document.querySelector('#liq-row-depto .ant-liq-nombre');
+                        if (lblD) {
+                          lblD.textContent = nVig > 0
+                            ? 'Impuesto Departamental (' + nVig + ' vigencia' + (nVig > 1 ? 's' : '') + ')'
+                            : 'Impuesto Departamental';
+                        }
+
+                        // Actualizar filas de la tabla con los valores reales
+                        var tbody = document.getElementById('ant-tbody-vigencias');
+                        if (tbody && d.registros) {
+                          tbody.innerHTML = d.registros.map(function(r) {
+                            return '<tr><td>'+r.vigencia+'</td><td>'+r.estado+'</td><td style="text-align:right">'
+                              +(r.total_vigencia ? '$'+r.total_vigencia.toLocaleString('es-CO') : 'Ver con asesor')+'</td></tr>';
+                          }).join('');
+                        }
+
+                        // Agregar total y retefuente debajo de la tabla
+                        var totalHtml = (d.total ? '<div class="ant-total-bar"><span>Total vigencias</span><span>$'+d.total.toLocaleString('es-CO')+'</span></div>' : '')
+                          + (d.avaluo ? '<div class="ant-extra"><span>Retefuente (1%)</span><strong>$'+Math.round(d.avaluo/100).toLocaleString('es-CO')+'</strong></div>' : '')
+                          + (d.excede_limite ? '<div class="ant-warning">'+d.mensaje_limite+'</div>' : '');
+
+                        var btnValEl = document.getElementById('ant-btn-valores');
+                        if (btnValEl) btnValEl.remove();
+                        resultado.innerHTML += totalHtml;
+                        window._tramyUltimaConsultaAntioquia = {
+                          vigenciasConDeuda: (d.registros || []).filter(function(r){ return r.total_vigencia > 0; }).map(function(r){ return r.vigencia; }),
+                          placa: placa, cedula: cedula, tipodoc: tipodoc, modelo: modelo, municipio: municipio, apellidos: apellidos
+                        };
+                        if(typeof window.tramyActualizarLinksSecciones === 'function'){
+                          window.tramyActualizarLinksSecciones(placa, window._tramyUltimaConsultaAntioquia.vigenciasConDeuda);
+                        }
+
+                        // Mostrar bloque municipal si aplica (colapsado)
+                        var _munUp = antMunicipioActual ? antMunicipioActual.toUpperCase() : '';
+                        var _servUp = (document.getElementById('ant-servicio').value||'').normalize('NFD').replace(/[̀-ͯ]/g,'').trim().toUpperCase();
+                        var _esMedPublico = (_munUp === 'MEDELLIN' && _servUp === 'PUBLICO');
+                        var _tieneMunAqui = (_munUp !== 'MEDELLIN') ? !!MUNICIPIOS_MUNICIPALES[_munUp] : _esMedPublico;
+                        if (antMunicipioActual && _tieneMunAqui) {
+                          var blMun = document.getElementById('bloque-municipal');
+                          blMun.classList.add('visible'); blMun.style.display = 'block';
+                          document.getElementById('ant-result-municipal').innerHTML = '';
+                          var contMun = document.getElementById('contenido-municipal');
+                          if (contMun) contMun.style.display = 'none';
+                          var chevMun = document.getElementById('chevron-municipal');
+                          if (chevMun) chevMun.textContent = '▼';
+                        }
+
+                      } else if (estado.estado === 'error') {
+                        clearInterval(timer);
+                        btnVal.disabled = false;
+                        document.getElementById('ant-prog-msg').textContent = 'Error: '+(estado.error||estado.mensaje);
+                      }
                     })
-            except ValueError:
-                pass
-
-    if not total and registros:
-        total = sum(r['total_vigencia'] for r in registros)
-
-    return registros, total
-
-# ============================================================
-#  MAPA DE MUNICIPIOS
-# ============================================================
-MUNICIPIOS = {
-    "envigado":    consultar_envigado,
-    "sabaneta":    consultar_sabaneta,
-    "itagui":      consultar_itagui,
-    "bello":       consultar_bello,
-    "laestrella":  consultar_laestrella,
-    "la estrella": consultar_laestrella,
-    "medellin":    consultar_medellin,
-    "medellín":    consultar_medellin,
-}
-
-
-@app.route("/consultar", methods=["GET"])
-def consultar():
-    import traceback
-    placa     = request.args.get("placa", "").upper().strip()
-    municipio = request.args.get("municipio", "").lower().strip()
-    if not placa or not municipio:
-        return jsonify({"error": "Debes proporcionar placa y municipio."}), 400
-    if municipio not in MUNICIPIOS and municipio != "antioquia":
-        return jsonify({"error": f"Municipio '{municipio}' no reconocido.", "opciones": list(MUNICIPIOS.keys()) + ["antioquia"]}), 400
-
-    identificacion     = request.args.get("identificacion", "").strip()
-    tipo_documento     = request.args.get("tipo_documento", "CC").strip().upper() or "CC"
-    modelo             = request.args.get("modelo", "").strip()
-    municipio_transito = request.args.get("municipio_transito", "").upper().strip()
-    apellidos          = request.args.get("apellidos_propietario", "").upper().strip()
-    celular            = request.args.get("celular", "3000000000").strip()
-    email              = request.args.get("email", "consulta@consulta.com").strip()
-    direccion          = request.args.get("direccion", "CRA").strip()
-    mun_declarante     = request.args.get("municipio_declarante", "MEDELLIN").strip().upper()
-    municipio_cod      = int(request.args.get("municipio_cod", 5001000))
-    departamento_cod   = int(request.args.get("departamento_cod", 5))
-
-    if municipio == "antioquia":
-        if not identificacion or not modelo or not municipio_transito or not apellidos:
-            return jsonify({"error": "Para Antioquia debes proporcionar: identificacion, modelo, municipio_transito, apellidos_propietario."}), 400
-
-    # Municipios síncronos
-    if municipio != "antioquia":
-        # Verificar cache antes de lanzar Playwright -- si ya sabemos que esta
-        # a paz y salvo este año, no hace falta volver a consultar la pagina
-        # del municipio (evita una consulta lenta e innecesaria).
-        cache_hit_mun = cache_municipal_buscar(placa, municipio)
-        if cache_hit_mun:
-            print(f"  → Cache hit municipal para {placa} en {municipio} — respondiendo sin Playwright")
-            return jsonify({
-                "placa":       placa,
-                "municipio":   municipio,
-                "registros":   [],
-                "total":       0,
-                "sin_deuda":   True,
-                "verificado":  True,
-                "placa_vista": cache_hit_mun["placa_vista"],
-                "fecha_pago":  cache_hit_mun["fecha_pago"],
-                "marca":       cache_hit_mun["marca"],
-                "valor_pago":  cache_hit_mun["valor_pago"],
-                "desde_cache": True,
-            })
-
-        resultado       = {}
-        error_container = {}
-
-        def ejecutar_mun():
-            try:
-                with sync_playwright() as playwright:
-                    browser = playwright.chromium.launch(headless=True, args=[
-                        "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-                        "--single-process", "--no-zygote", "--disable-setuid-sandbox"
-                    ])
-                    context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                    page = context.new_page()
-                    if municipio not in ["bello", "sabaneta", "laestrella"]:
-                        bloquear_recursos(page)
-                    funcion = MUNICIPIOS[municipio]
-                    if municipio == "medellin":
-                        registros, total = funcion(page, placa,
-                            identificacion=identificacion,
-                            modelo=modelo,
-                            apellidos_propietario=apellidos,
-                            celular=celular,
-                            email=email)
-                    else:
-                        registros, total = funcion(page, placa)
-                    resultado['registros'] = registros
-                    resultado['total']     = total
-                    context.close(); browser.close()
-            except Exception as e:
-                error_container['error'] = str(e)
-                print(traceback.format_exc(), flush=True)
-
-        hilo = threading.Thread(target=ejecutar_mun)
-        hilo.start()
-        hilo.join(timeout=620)
-
-        if hilo.is_alive():
-            return jsonify({"error": "La consulta tardo demasiado. Intenta de nuevo."}), 504
-        if error_container:
-            return jsonify({"error": error_container['error']}), 500
-        registros_mun   = resultado.get('registros', [])
-        total_mun       = resultado.get('total', 0)
-        fecha_pago_mun  = ""
-        marca_pago_mun  = ""
-        valor_pago_mun  = ""
-        placa_vista_mun = ""
-
-        # Extraer datos de paz y salvo si el municipio los devuelve
-        if registros_mun and registros_mun[0].get('paz_y_salvo'):
-            r0              = registros_mun[0]
-            fecha_pago_mun  = r0.get('fecha_pago', '')
-            marca_pago_mun  = r0.get('marca', '')
-            valor_pago_mun  = r0.get('valor_pago', '')
-            placa_vista_mun = r0.get('placa_info', '')
-            registros_mun   = []
-            total_mun       = 0
-        # Extraer último pago de registros con deuda (si viene en el primer registro)
-        elif registros_mun and registros_mun[0].get('fecha_ultimo_pago'):
-            r0              = registros_mun[0]
-            fecha_pago_mun  = r0.get('fecha_ultimo_pago', '')
-            marca_pago_mun  = r0.get('marca_ultimo_pago', '')
-            valor_pago_mun  = r0.get('valor_ultimo_pago', '')
-            placa_vista_mun = r0.get('placa_ultimo_pago', '')
-
-        # Reintento automático si paz y salvo sin evidencia de verificación
-        # (posible falso positivo: la página no cargó los datos reales del vehículo).
-        # Se considera "verificado" cuando trajo placa y/o marca vistas en la página.
-        verificado_mun = bool(placa_vista_mun or marca_pago_mun)
-        if total_mun == 0 and not verificado_mun and municipio in ("envigado", "sabaneta", "itagui", "bello"):
-            resultado2    = {}
-            error2        = {}
-            funcion_reint = MUNICIPIOS[municipio]
-            def _reintento():
-                try:
-                    with sync_playwright() as pw2:
-                        b2 = pw2.chromium.launch(headless=True, args=[
-                            "--no-sandbox","--disable-dev-shm-usage","--disable-gpu",
-                            "--single-process","--no-zygote","--disable-setuid-sandbox"
-                        ])
-                        ctx2  = b2.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                        pg2   = ctx2.new_page()
-                        bloquear_recursos(pg2)
-                        r2, t2 = funcion_reint(pg2, placa)
-                        resultado2['registros'] = r2
-                        resultado2['total']     = t2
-                        ctx2.close(); b2.close()
-                except Exception as e2:
-                    error2['error'] = str(e2)
-            import threading as _th2
-            hilo2 = _th2.Thread(target=_reintento)
-            hilo2.start()
-            hilo2.join(timeout=120)
-            if not error2 and resultado2:
-                r2 = resultado2.get('registros', [])
-                t2 = resultado2.get('total', 0)
-                fp2 = ""; mp2 = ""; vp2 = ""; pv2 = ""
-                if r2 and r2[0].get('paz_y_salvo'):
-                    fp2 = r2[0].get('fecha_pago', '')
-                    mp2 = r2[0].get('marca', '')
-                    vp2 = r2[0].get('valor_pago', '')
-                    pv2 = r2[0].get('placa_info', '')
-                    r2  = []
-                    t2  = 0
-                elif r2 and r2[0].get('fecha_ultimo_pago'):
-                    fp2 = r2[0].get('fecha_ultimo_pago', '')
-                    mp2 = r2[0].get('marca_ultimo_pago', '')
-                    vp2 = r2[0].get('valor_ultimo_pago', '')
-                    pv2 = r2[0].get('placa_ultimo_pago', '')
-                # Si el reintento también da paz y salvo verificado → confirmado
-                # Si el reintento da deuda → el primero era falso positivo
-                registros_mun   = r2
-                total_mun       = t2
-                fecha_pago_mun  = fp2
-                marca_pago_mun  = mp2
-                valor_pago_mun  = vp2
-                placa_vista_mun = pv2
-                verificado_mun  = bool(pv2 or mp2)
-
-        # Guardar en cache si quedo confirmado a paz y salvo -- asi no se
-        # vuelve a consultar este municipio para esta placa el resto del año.
-        if verificado_mun and total_mun == 0 and not registros_mun:
-            cache_municipal_guardar_paz_salvo(
-                placa, municipio, fecha_pago_mun, marca_pago_mun, valor_pago_mun, placa_vista_mun
-            )
-
-        return jsonify({
-            "placa":       placa,
-            "municipio":   municipio,
-            "registros":   registros_mun,
-            "total":       total_mun,
-            "sin_deuda":   total_mun == 0 and not registros_mun,
-            "verificado":  verificado_mun,
-            "placa_vista": placa_vista_mun,
-            "fecha_pago":  fecha_pago_mun,
-            "marca":       marca_pago_mun,
-            "valor_pago":  valor_pago_mun,
+                    .catch(function(){});
+                }, 3000);
+              })
+              .catch(function(){
+                btnVal.disabled = false;
+                document.getElementById('ant-prog-msg').textContent = 'Error de conexion.';
+              });
+          });
         })
+        .catch(function(){
+          btn.disabled = false;
+          resultado.innerHTML = '<div class="ant-alert error">Error de conexion.</div>';
+        });
+    });
+    // Impuesto Municipal
+    document.getElementById('ant-btn-municipal').addEventListener('click', function() {
+      var placa     = document.getElementById('ant-placa').value.trim().toUpperCase();
+      var municipio = document.getElementById('ant-municipio').value;
+      var resultado = document.getElementById('ant-result-municipal');
+      var btn       = this;
 
-    # Antioquia — verificar caché de vigencias antes de lanzar Playwright
-    # El snippet pasa las vigencias adeudadas que ya conoce del paso 1
-    vigencias_param = request.args.get("vigencias", "").strip()
-    if vigencias_param:
-        anios_solicitados = [a.strip() for a in vigencias_param.split(",") if a.strip()]
-        registros_cache = []
-        avaluo_cache    = 0
-        total_cache     = 0
-        todos_cacheados = True
+      if (!placa||!municipio) {
+        resultado.innerHTML='<div class="ant-alert error">Ingresa la placa y selecciona el municipio.</div>'; return;
+      }
 
-        for anio in anios_solicitados:
-            cv = cache_antioquia_buscar_vigencia(placa, anio)
-            if cv:
-                registros_cache.append({
-                    "vigencia":       str(anio),
-                    "estado":         "Pendiente de pago",
-                    "total_vigencia": cv['total_pagar'],
-                })
-                total_cache  += cv['total_pagar']
-                if not avaluo_cache:
-                    avaluo_cache = cv['avaluo']
-            else:
-                todos_cacheados = False
-                break
+      var municipioApi = (municipio === 'MEDELLIN') ? 'medellin' : MUNICIPIOS_MUNICIPALES[municipio];
+      btn.disabled=true;
+      resultado.innerHTML='<div class="ant-loading"><div class="ant-spinner-ring"></div><span>Consultando impuesto municipal...</span></div>';
 
-        if todos_cacheados and registros_cache:
-            print(f"  → Cache hit completo para {placa} — respondiendo sin Playwright")
-            return jsonify({
-                "placa":      placa,
-                "municipio":  "antioquia",
-                "placa_info": {},
-                "registros":  registros_cache,
-                "total":      total_cache,
-                "avaluo":     avaluo_cache,
-                "retefuente": round(avaluo_cache / 100) if avaluo_cache else 0,
-                "sin_deuda":  False,
-                "desde_cache": True,
-            })
+      var urlMun = ANT_API+'/consultar?placa='+encodeURIComponent(placa)+'&municipio='+encodeURIComponent(municipioApi);
+      if (municipioApi === 'medellin') {
+        var cedula   = document.getElementById('ant-cedula').value || '';
+        var modelo   = document.getElementById('ant-modelo').value || '';
+        var apellidos = document.getElementById('ant-apellidos').value || '';
+        urlMun += '&identificacion='+encodeURIComponent(cedula)
+               +  '&modelo='+encodeURIComponent(modelo)
+               +  '&apellidos_propietario='+encodeURIComponent(apellidos)
+               +  '&tipo_documento='+encodeURIComponent(document.getElementById('ant-tipodoc').value||'CC');
+      }
+      fetch(urlMun)
+        .then(function(r){return r.json();})
+        .then(function(data){
+          btn.disabled=false;
+          if (data.error){resultado.innerHTML='<div class="ant-alert error">'+data.error+'</div>';return;}
 
-    # Antioquia — sistema asíncrono
-    job_id = str(uuid.uuid4())[:12]
-    job_actualizar(job_id, "Iniciando consulta...", "procesando")
+          setLiq('liq-municipal', data.total || 0);
+          document.getElementById('liq-row-municipal').style.display='grid';
+          var nVigM = (data.registros || []).length;
+          var lblM = document.querySelector('#liq-row-municipal .ant-liq-nombre');
+          if (lblM) {
+            lblM.textContent = nVigM > 0
+              ? 'Impuesto Municipal (' + nVigM + ' vigencia' + (nVigM > 1 ? 's' : '') + ')'
+              : 'Impuesto Municipal';
+          }
 
-    def ejecutar_antioquia():
-        try:
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=True, args=[
-                    "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-                    "--single-process", "--no-zygote", "--disable-setuid-sandbox"
-                ])
-                context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                page = context.new_page()
-                registros, total, avaluo, estado_veh, excede = consultar_antioquia(
-                    page, placa, identificacion, tipo_documento,
-                    modelo, municipio_transito, apellidos,
-                    celular, email, direccion, mun_declarante,
-                    municipio_cod, departamento_cod, job_id=job_id
-                )
-                context.close(); browser.close()
-
-            respuesta = {
-                "placa":      placa,
-                "municipio":  "antioquia",
-                "placa_info": {
-                    "marca":       estado_veh.get("marca", ""),
-                    "linea":       estado_veh.get("linea", ""),
-                    "modelo":      estado_veh.get("modelo", ""),
-                    "propietario": estado_veh.get("nombrePropietario", ""),
-                },
-                "registros":  registros,
-                "total":      total,
-                "avaluo":     avaluo,
-                "retefuente": round(avaluo / 100) if avaluo else 0,
-                "sin_deuda":  len(registros) == 0,
+          if (data.sin_deuda) {
+            var msgPaz = data.placa+' está a paz y salvo en el Tránsito de '+municipio+'.';
+            var detalles = [];
+            if (data.placa_vista) detalles.push('Placa verificada: <strong>'+data.placa_vista+'</strong>');
+            if (data.marca)       detalles.push('Marca: <strong>'+data.marca+'</strong>');
+            if (data.fecha_pago)  detalles.push('Fecha pago: <strong>'+data.fecha_pago+'</strong>');
+            if (data.valor_pago)  detalles.push('Valor pago: <strong>'+data.valor_pago+'</strong>');
+            if (detalles.length) msgPaz += '<br><small>'+detalles.join(' · ')+'</small>';
+            if (!data.verificado) {
+              // No se pudo confirmar placa/marca del vehículo consultado: posible falso positivo
+              msgPaz += '<br><small style="color:#b45309">⚠ No se pudo verificar placa/marca en la página de origen. '
+                      + 'Revisa manualmente antes de confiar en este resultado (posible falso positivo).</small>';
             }
-            if excede:
-                respuesta["excede_limite"]  = True
-                respuesta["mensaje_limite"] = f"El límite de consulta es de {ANTIOQUIA_LIMITE_VIGENCIAS} vigencias. Comunícate con un asesor de la Gobernación de Antioquia al 6044444666."
-            job_terminar(job_id, respuesta)
-        except Exception as e:
-            print(traceback.format_exc(), flush=True)
-            msg = str(e)
-            if any(x in msg.lower() for x in ["net::err", "connection"]):
-                msg = "No se pudo conectar al portal de Antioquia. Intenta más tarde."
-            job_error(job_id, msg)
+            resultado.innerHTML='<div class="ant-alert '+(data.verificado ? 'success' : 'warning')+'">'+msgPaz+'</div>';
+            return;
+          }
 
-    threading.Thread(target=ejecutar_antioquia, daemon=True).start()
-    return jsonify({"job_id": job_id, "estado": "procesando"})
-
-
-@app.route("/consultar/antioquia/vigencias", methods=["GET"])
-def consultar_antioquia_vigencias():
-    """PASO 1 — Rápido (2 captchas). Devuelve lista de vigencias sin valores."""
-    import traceback
-    placa              = request.args.get("placa", "").upper().strip()
-    identificacion     = request.args.get("identificacion", "").strip()
-    tipo_documento     = request.args.get("tipo_documento", "CC").strip().upper()
-    modelo             = request.args.get("modelo", "").strip()
-    municipio_transito = request.args.get("municipio_transito", "").upper().strip()
-    apellidos          = request.args.get("apellidos_propietario", "").upper().strip()
-
-    if not all([placa, identificacion, modelo, municipio_transito, apellidos]):
-        return jsonify({"error": "Faltan datos requeridos"}), 400
-
-    # Verificar caché primero
-    cache = cache_antioquia_buscar(placa)
-    if cache and cache['estado'] == 'PAZ_Y_SALVO':
-        print(f"  → Cache hit PAZ_Y_SALVO para {placa}")
-        return jsonify({
-            "placa":       placa,
-            "sin_deuda":   True,
-            "avaluo":      cache.get('avaluo', 0),
-            "retefuente":  cache.get('retefuente', 0),
-            "vigencias":   [],
-            "placa_info":  {},
-            "desde_cache": True,
+          var _ultPago = '';
+          if (data.placa_vista || data.marca || data.fecha_pago || data.valor_pago) {
+            var _det = [];
+            if (data.placa_vista) _det.push('Placa vista: <strong>'+data.placa_vista+'</strong>');
+            if (data.marca)       _det.push('Marca: <strong>'+data.marca+'</strong>');
+            if (data.fecha_pago)  _det.push('Último pago: <strong>'+data.fecha_pago+'</strong>');
+            if (data.valor_pago)  _det.push('Valor: <strong>'+data.valor_pago+'</strong>');
+            _ultPago = '<div class="ant-info-item" style="grid-column:1/-1"><label>Último pago</label><span>'+_det.join(' · ')+'</span></div>';
+          }
+          resultado.innerHTML='<div class="ant-info">'
+            +'<div class="ant-info-item"><label>Placa</label><span>'+data.placa+'</span></div>'
+            +'<div class="ant-info-item"><label>Municipio</label><span>'+municipio+'</span></div>'
+            +(data.registros&&data.registros[0]&&data.registros[0].tipo_vehiculo?'<div class="ant-info-item"><label>Tipo</label><span>'+data.registros[0].tipo_vehiculo+'</span></div>':'')
+            +_ultPago
+            +'</div>'
+            +'<table class="ant-table"><thead><tr><th>Anio</th><th>Descripcion</th><th style="text-align:right">Valor</th></tr></thead><tbody>'
+            +(data.registros||[]).map(function(r){
+              return '<tr><td>'+r.vigencia+'</td><td>'+(r.descripcion||'Sistematizacion')+'</td><td style="text-align:right">$'+r.total_vigencia.toLocaleString('es-CO')+'</td></tr>';
+            }).join('')+'</tbody></table>'
+            +'<div class="ant-total-bar"><span>Total adeudado</span><span>$'+data.total.toLocaleString('es-CO')+'</span></div>';
         })
+        .catch(function(){btn.disabled=false;resultado.innerHTML='<div class="ant-alert error">Error de conexion.</div>';});
+    });
 
+  }); // end load
 
-    resultado       = {}
-    error_container = {}
+  // ── FUNCIONES GLOBALES ────────────────────────────────────────────────────
 
-    def ejecutar():
-        try:
-            tipo_documento_id = ANTIOQUIA_TIPO_DOC_MAP.get(tipo_documento, "1")
-            if tipo_documento_id == "2":
-                ident = str(identificacion) + str(_calcular_digito_nit(identificacion))
-            else:
-                ident = identificacion
-            session0, token0, data3 = _sesion_antioquia(
-                placa, ident, tipo_documento_id,
-                modelo, municipio_transito, apellidos
-            )
-            estado_veh          = data3.get("estadoCuenta", {})
-            vigencias_adeudadas = data3.get("listaVigenciasAdeudas", [])
-            avaluo              = estado_veh.get("avaluoComercial", 0) or 0
-            resultado['vigencias']  = vigencias_adeudadas
-            resultado['avaluo']     = avaluo
-            resultado['estado_veh'] = estado_veh
-            resultado['sin_deuda']  = len(vigencias_adeudadas) == 0
-            # Guardar en caché si está a paz y salvo
-            if not vigencias_adeudadas and avaluo and avaluo > 0:
-                cache_antioquia_guardar_paz_salvo(placa, avaluo, estado_veh)
-                # Se guardan tambien TODOS los datos (historial de
-                # declaraciones, procesos fiscales, bloqueos, novedades)
-                # para poder generar el documento Estado de Cuenta despues.
-                guardar_estado_cuenta_antioquia(placa, data3)
-        except Exception as e:
-            error_container['error'] = str(e)
-            print(traceback.format_exc(), flush=True)
+  // ── RETEFUENTE ───────────────────────────────────────────────────────────
+  var antRetAvaluo     = 0;
+  var antRetRetefuente = 0;
 
-    hilo = threading.Thread(target=ejecutar)
-    hilo.start()
-    hilo.join(timeout=120)
+  function antCargarRetefuente() {
+    var marca      = (document.getElementById('ant-marca').value || '').trim().toUpperCase();
+    var linea      = (document.getElementById('ant-linea').value || '').trim().toUpperCase();
+    var clase      = (document.getElementById('ant-clase').value || '').trim().toUpperCase();
+    var carroceria = (document.getElementById('ant-carroceria').value || '').trim().toUpperCase();
+    var modelo     = (document.getElementById('ant-modelo').value || '').trim();
+    var cil        = (document.getElementById('ant-cilindrada').value || '').trim();
+    var cap        = (document.getElementById('ant-capacidad').value || '').trim();
+    var capLimpiaFetch = cap.replace(/\./g, '').replace(/,/g, '');  // 5.610 -> 5610
 
-    if hilo.is_alive():
-        return jsonify({"error": "La consulta tardó demasiado. Intenta de nuevo."}), 504
-    if error_container:
-        return jsonify({"error": error_container['error']}), 500
-
-    estado_veh = resultado.get('estado_veh', {})
-    avaluo     = resultado.get('avaluo', 0)
-    vigencias  = resultado.get('vigencias', [])
-
-    return jsonify({
-        "placa":      placa,
-        "sin_deuda":  resultado.get('sin_deuda', True),
-        "avaluo":     avaluo,
-        "retefuente": round(avaluo / 100) if avaluo else 0,
-        "vigencias":  vigencias,
-        "placa_info": {
-            "marca":       estado_veh.get("marca", ""),
-            "linea":       estado_veh.get("linea", ""),
-            "modelo":      estado_veh.get("modelo", ""),
-            "propietario": estado_veh.get("nombrePropietario", ""),
+    // Llenar datos del vehículo en el módulo retefuente
+    var setDato = function(id, val) {
+      var el = document.getElementById(id);
+      if (el) { el.textContent = val; el.style.display = val ? '' : 'none'; }
+    };
+    setDato('ret-dato-clase',  clase);
+    setDato('ret-dato-marca',  marca);
+    setDato('ret-dato-linea',  linea);
+    setDato('ret-dato-modelo', modelo);
+    setDato('ret-dato-cil',    cil ? cil + 'cc' : '');
+    // Limpiar puntos de miles antes de parsear (5.610 -> 5610)
+    var capLimpia = cap ? cap.replace(/\./g, '').replace(/,/g, '') : '';
+    var capNum = parseInt(capLimpia) || 0;
+    var capDisplay = '';
+    if (cap) {
+        if (capNum >= 100) {
+            capDisplay = capNum.toLocaleString('es-CO') + ' Kg · — pasajeros';
+        } else {
+            capDisplay = '— Kg · ' + capNum + ' pasajeros';
         }
-    })
+    }
+    setDato('ret-dato-cap', capDisplay);
+
+    if (!marca || !clase || !modelo) return;
+
+    var estado = document.getElementById('ant-ret-estado');
+    var opcDiv = document.getElementById('ant-ret-opciones');
+    estado.textContent = 'Buscando...';
+    opcDiv.innerHTML   = '';
+    document.getElementById('ant-ret-resultado').style.display = 'none';
+
+    var cilindrada = (document.getElementById('ant-cilindrada').value || '').trim();
+    var cilNum = cilindrada ? parseInt(cilindrada) : 999;
+    var esBajoCil = (clase === 'MOTOCICLETA' || clase === 'MOTOCARRO') && cilNum > 0 && cilNum <= 125;
+
+    if (esBajoCil) {
+      // ── MÓDULO BAJO CILINDRAJE (SIBGA 2024) ──────────────────────────────
+      estado.textContent = 'Buscando...';
+      var modeloNum = parseInt(modelo) || 2020;
+
+      fetch(ANT_API + '/sibga/opciones?marca=' + encodeURIComponent(marca)
+        + '&linea=' + encodeURIComponent(linea)
+        + '&modelo=' + modeloNum)
+        .then(function(r){ return r.json(); })
+        .then(function(data) {
+          if (data.error || !data.opciones || !data.opciones.length) {
+            estado.textContent = 'No se encontraron resultados para esta marca.';
+            return;
+          }
+          estado.textContent = 'Se encontraron ' + data.opciones.length + ' opciones. Selecciona la que corresponde:';
+          opcDiv.innerHTML = '';
+          data.opciones.forEach(function(op) {
+            var div = document.createElement('div');
+            div.className = 'ant-ret-opcion';
+            div.innerHTML =
+              '<div class="ant-ret-opcion-nombre">' + op.linea +
+                (op.cilindraje ? ' — ' + op.cilindraje + 'cc' : '') +
+              '</div>' +
+              '<div class="ant-ret-opcion-valor">Avalúo: $' + op.avaluo.toLocaleString('es-CO') + '</div>';
+            div.addEventListener('click', function() {
+              document.querySelectorAll('.ant-ret-opcion').forEach(function(el){ el.classList.remove('seleccionada'); });
+              div.classList.add('seleccionada');
+              antRetAvaluo     = op.avaluo;
+              antRetRetefuente = op.retefuente;
+              document.getElementById('ant-ret-linea-sel').textContent  = op.linea;
+              document.getElementById('ant-ret-avaluo').textContent     = '$' + op.avaluo.toLocaleString('es-CO');
+              document.getElementById('ant-ret-retefuente').textContent = '$' + op.retefuente.toLocaleString('es-CO');
+              document.getElementById('ant-ret-resultado').style.display = 'block';
+            });
+            opcDiv.appendChild(div);
+          });
+        })
+        .catch(function(e){ estado.textContent = 'Error de conexión.'; });
+
+    } else {
+      // ── MÓDULO NORMAL (retefuente_2026) ──────────────────────────────────
+      var capacidad = (document.getElementById('ant-capacidad') ? document.getElementById('ant-capacidad').value : '') || '';
+      fetch(ANT_API + '/retefuente/opciones?marca=' + encodeURIComponent(marca)
+        + '&linea=' + encodeURIComponent(linea)
+        + '&clase=' + encodeURIComponent(clase)
+        + '&carroceria=' + encodeURIComponent(carroceria)
+        + '&modelo=' + encodeURIComponent(modelo)
+        + '&cilindraje=' + encodeURIComponent((cilindrada||'').replace(/\./g,'').replace(/,/g,''))
+        + '&capacidad=' + encodeURIComponent(capacidad.replace(/\./g,'').replace(/,/g,'')))
+        .then(function(r){ return r.json(); })
+        .then(function(data) {
+          if (data.error) { estado.textContent = 'Error: ' + data.error; return; }
+          if (!data.opciones || data.opciones.length === 0) {
+            estado.textContent = 'No se encontraron resultados para esta marca y clase.';
+            return;
+          }
+          estado.textContent = 'Se encontraron ' + data.opciones.length + ' opciones. Selecciona la que corresponde:';
+          opcDiv.innerHTML = '';
+          data.opciones.forEach(function(op) {
+            var div = document.createElement('div');
+            div.className = 'ant-ret-opcion';
+            div.innerHTML =
+              '<div class="ant-ret-opcion-nombre">' + op.linea + (op.cilindraje ? ' — ' + op.cilindraje + 'cc' : '') +
+                (op.tonelaje_kg ? ' · ' + op.tonelaje_kg.toLocaleString('es-CO') + ' Kg · — pax' : '') +
+                (!op.tonelaje_kg && op.pasajeros ? ' · — Kg · ' + op.pasajeros + ' pasajeros' : '') +
+                (!op.tonelaje_kg && !op.pasajeros ? '' : '') +
+              '</div>' +
+              '<div class="ant-ret-opcion-valor">Avalúo: $' + op.avaluo.toLocaleString('es-CO') + '</div>';
+            div.addEventListener('click', function() {
+              document.querySelectorAll('.ant-ret-opcion').forEach(function(el){ el.classList.remove('seleccionada'); });
+              div.classList.add('seleccionada');
+              antRetAvaluo     = op.avaluo;
+              antRetRetefuente = op.retefuente;
+              document.getElementById('ant-ret-linea-sel').textContent = op.linea;
+              document.getElementById('ant-ret-avaluo').textContent    = '$' + op.avaluo.toLocaleString('es-CO');
+              document.getElementById('ant-ret-retefuente').textContent = '$' + op.retefuente.toLocaleString('es-CO');
+              document.getElementById('ant-ret-resultado').style.display = 'block';
+            });
+            opcDiv.appendChild(div);
+          });
+        })
+        .catch(function(e){ estado.textContent = 'Error de conexión.'; });
+    }
+  }
+
+  window.antUsarRetefuente = function() {
+    if (!antRetRetefuente) return;
+    if (esEmpresa()) return; // las empresas no pagan retefuente
+    setLiq('liq-retefuente', antRetRetefuente);
+    document.getElementById('liq-row-retefuente').style.display = 'grid';
+    antAvaluo = antRetAvaluo;
+    calcularTotal();
+    // Cerrar bloque retefuente
+    document.getElementById('contenido-ret').style.display = 'none';
+    document.getElementById('chevron-ret').textContent = '▼';
+  };
+
+  // Recalcular numeración de pasos según bloques visibles
+  window.antToggleAyuda = function(id) {
+    var panel = document.getElementById(id);
+    if (!panel) return;
+    panel.style.display = panel.style.display === 'block' ? 'none' : 'block';
+  };
+
+  function recalcularPasos() {
+    var orden = [
+      {id:'bloque-info',       titulo:'titulo-info',       nombre:'INFORMACION'},
+      {id:'bloque-depto',      titulo:'titulo-depto',      nombre:'IMPUESTO DEPARTAMENTAL'},
+      {id:'bloque-municipal',  titulo:'titulo-municipal',  nombre:'IMPUESTO MUNICIPAL'},
+      {id:'bloque-tramites',   titulo:'titulo-tramites',   nombre:'TRAMITES'},
+      {id:'bloque-retefuente', titulo:'titulo-ret',        nombre:'RETEFUENTE'},
+      {id:'bloque-liq',        titulo:'titulo-liq',        nombre:'LIQUIDACION'},
+      {id:'bloque-wa',         titulo:'titulo-wa',         nombre:'ENVIAR LIQUIDACION POR WHATSAPP'},
+    ];
+    var paso = 1;
+    orden.forEach(function(b) {
+      var bl  = document.getElementById(b.id);
+      var tit = document.getElementById(b.titulo);
+      if (!bl || !tit) return;
+      var visible = bl.style.display !== 'none' && bl.style.cssText.indexOf('display: none') < 0;
+      if (visible) {
+        tit.textContent = 'PASO ' + paso + ' — ' + b.nombre;
+        paso++;
+      }
+    });
+  }
+
+  window.antToggleInfoTop = function() {
+    var contenido = document.getElementById('contenido-info-top');
+    var chevron   = document.getElementById('chevron-info-top');
+    if (!contenido) return;
+    var visible = contenido.style.display !== 'none';
+    contenido.style.display = visible ? 'none' : 'block';
+    if (chevron) chevron.textContent = visible ? '▼' : '▲';
+    // Si se expande, hacer scroll hacia el bloque
+    if (!visible) {
+      var bloque = document.getElementById('bloque-'+id);
+      if (bloque) antScrollTo(bloque);
+    }
+  };
 
 
-@app.route("/consultar-runt-vehiculo", methods=["GET"])
-def consultar_runt_vehiculo_endpoint():
-    """Consulta el RUNT (Placa y Propietario) para una placa + cedula.
-    Es una consulta con su propio costo de 2Captcha, independiente de las
-    consultas de impuestos -- por eso se guarda directo en la tabla
-    'vehiculos' cada vez que se llama, sin verificar cache primero (los
-    datos del RUNT cambian con cada tramite, a diferencia del estado de
-    paz y salvo que dura todo el año)."""
-    placa  = request.args.get("placa", "").upper().strip()
-    cedula = request.args.get("cedula", "").strip()
-    tipo_documento = request.args.get("tipo_documento", "CC").strip().upper() or "CC"
-    user_id = request.args.get("user_id", "").strip()  # id del usuario en Supabase (opcional)
+  function antScrollTo(el) {
+    if (!el) return;
+    setTimeout(function() {
+      var top = el.getBoundingClientRect().top + window.scrollY - 56;
+      document.documentElement.scrollTop = top;
+    }, 100);
+  }
+  window.antToggleBloque = function(id) {
+    var contenido = document.getElementById('contenido-'+id);
+    var chevron   = document.getElementById('chevron-'+id);
+    if (!contenido) return;
+    var visible = contenido.style.display !== 'none';
 
-    if not placa or not cedula:
-        return jsonify({"error": "Debes proporcionar placa y cedula."}), 400
+    // Colapsar todos los bloques y sus ayudas primero
+    var todos = ['depto','municipal','tramites','ret','liq'];
+    todos.forEach(function(bid) {
+      var c = document.getElementById('contenido-'+bid);
+      var ch = document.getElementById('chevron-'+bid);
+      var ay = document.getElementById('ayuda-'+bid);
+      if (c) c.style.display = 'none';
+      if (ch) ch.textContent = '▼';
+      if (ay) ay.style.display = 'none';
+    });
+    // Colapsar también info
+    var cInfo = document.getElementById('ant-info-contenido');
+    var chInfo = document.getElementById('ant-info-chevron');
+    if (cInfo) cInfo.style.display = 'none';
+    if (chInfo) chInfo.textContent = '▼';
 
-    # Limite: no se puede forzar una nueva consulta al RUNT para la misma
-    # placa si ya se hizo una en los ultimos 3 dias -- en ese caso hay que
-    # usar el dato ya guardado en cache (vehiculo-runt-guardado).
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT leido_en FROM vehiculos WHERE placa = %s AND fuente = 'RUNT'
-        """, (placa,))
-        row = cur.fetchone()
-        cur.close(); conn.close()
-        if row and row[0]:
-            transcurrido = datetime.now() - row[0]
-            if transcurrido < timedelta(days=3):
-                faltan = timedelta(days=3) - transcurrido
-                horas_faltantes = int(faltan.total_seconds() // 3600)
-                return jsonify({
-                    "error": f"Esta placa ya se consultó en el RUNT hace menos de 3 días. "
-                             f"Debes usar el dato ya guardado; podrás forzar una nueva consulta "
-                             f"en aproximadamente {horas_faltantes} horas.",
-                    "limite_activo": True,
-                    "horas_restantes": horas_faltantes
-                }), 429
-    except Exception as e:
-        print(f"Error verificando limite de consulta RUNT: {e}", flush=True)
-        # Si falla la verificacion, se deja continuar (no se bloquea por un
-        # problema tecnico ajeno al limite en si).
+    // Si estaba cerrado, abrirlo. Si estaba abierto, dejarlo cerrado.
+    if (!visible) {
+      contenido.style.display = 'block';
+      if (chevron) chevron.textContent = '▲';
+      var bloqueId = id === 'ret' ? 'bloque-retefuente' : 'bloque-'+id;
+      var bloque = document.getElementById(bloqueId);
+      if (bloque) antScrollTo(bloque);
+    }
+  };
 
-    job_id = str(uuid.uuid4())[:12]
-    job_actualizar(job_id, "Iniciando consulta RUNT...", "procesando")
-
-    def ejecutar():
-        try:
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=True, args=[
-                    "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-                    "--single-process", "--no-zygote", "--disable-setuid-sandbox"
-                ])
-                context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-                    viewport={"width": 390, "height": 844},
-                )
-                page = context.new_page()
-                datos = consultar_runt_vehiculo(page, placa, cedula, tipo_documento, job_id=job_id)
-                context.close(); browser.close()
-
-            if not datos.get("placa"):
-                job_error(job_id, "No se pudo leer la placa en el resultado. Verifica los datos o intenta de nuevo.")
-                return
-
-            guardar_vehiculo_runt(datos)
-            if user_id:
-                guardar_mi_consulta(user_id, datos["placa"], cedula)
-            datos["leido_en"] = (datetime.now() - timedelta(hours=5)).strftime("%Y-%m-%d %H:%M")
-            job_terminar(job_id, datos)
-        except Exception as e:
-            import traceback
-            print(traceback.format_exc(), flush=True)
-            job_error(job_id, str(e))
-
-    hilo = threading.Thread(target=ejecutar)
-    hilo.start()
-
-    return jsonify({"job_id": job_id})
-
-
-def guardar_mi_consulta(user_id, placa, cedula):
-    """Registra que este usuario en particular consulto esta placa (y
-    cedula), para el historial personal de 'Mis vehiculos consultados'."""
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO mis_consultas (user_id, placa, cedula, actualizado_en)
-            VALUES (%s, %s, %s, NOW())
-            ON CONFLICT (user_id, placa, cedula) DO UPDATE SET actualizado_en = NOW()
-        """, (user_id, placa, cedula))
-        conn.commit()
-        cur.close(); conn.close()
-        return True, None
-    except Exception as e:
-        print(f"Error guardando mi_consulta: {e}")
-        return False, str(e)
-
-
-@app.route("/guardar-vehiculo-ocr", methods=["POST"])
-def guardar_vehiculo_ocr():
-    """Guarda lo leido por OCR de una tarjeta de propiedad. Si esa placa ya
-    tenia datos de una consulta al RUNT, el RUNT prevalece: no se
-    sobrescriben marca/linea/modelo/etc, ni la fuente ni la fecha de
-    lectura -- solo se actualizan los campos que el RUNT NUNCA trae
-    (tipo de documento, cedula, nombre del propietario, municipio, y la
-    limitacion a la propiedad tal como la leyo el OCR)."""
-    data = request.get_json(silent=True) or {}
-    placa = (data.get("placa") or "").upper().strip()
-    if not placa:
-        return jsonify({"error": "Debes proporcionar placa."}), 400
-
-    user_id = (data.get("user_id") or "").strip()
-    cedula  = (data.get("cedula") or "").strip()
-
-    campos_ocr_siempre = ["municipio", "propietario_tipo_documento", "propietario_cedula", "propietario_nombre", "ocr_limitacion_propiedad"]
-    campos_ocr_si_no_hay_runt = ["clase", "marca", "linea", "modelo", "cilindrada", "servicio", "carroceria"]
-
-    valores = {
-        "municipio": data.get("municipio"),
-        "propietario_tipo_documento": data.get("tipo_documento"),
-        "propietario_cedula": cedula,
-        "propietario_nombre": data.get("apellidos"),
-        "ocr_limitacion_propiedad": data.get("limitacion_propiedad"),
-        "clase": data.get("clase"),
-        "marca": data.get("marca"),
-        "linea": data.get("linea"),
-        "modelo": data.get("modelo"),
-        "cilindrada": data.get("cilindrada"),
-        "servicio": data.get("servicio"),
-        "carroceria": data.get("carroceria"),
+  window.antToggleInfo = function() {
+    var contenido = document.getElementById('ant-info-contenido');
+    var chevron   = document.getElementById('ant-info-chevron');
+    var visible   = contenido.style.display !== 'none';
+    // Al expandir info, colapsar todos los demás bloques
+    if (!visible) {
+      ['depto','municipal','tramites','ret','liq'].forEach(function(bid) {
+        var c = document.getElementById('contenido-'+bid);
+        var ch = document.getElementById('chevron-'+bid);
+        if (c && c.style.display !== 'none') {
+          c.style.display = 'none';
+          if (ch) ch.textContent = '▼';
+        }
+      });
+    }
+    contenido.style.display = visible ? 'none' : 'block';
+    document.getElementById('ant-info-colapsado').style.display = 'none';
+    chevron.textContent = visible ? '▼' : '▲';
+    if (!visible) {
+      var bloqueInfo = document.getElementById('bloque-info');
+      if (bloqueInfo) antScrollTo(bloqueInfo);
     }
 
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-
-        todas_columnas = campos_ocr_siempre + campos_ocr_si_no_hay_runt
-        cols_sql = ", ".join(["placa"] + todas_columnas + ["fuente", "leido_en"])
-        vals_sql = ", ".join(["%s"] * (len(todas_columnas) + 3))
-        params = [placa] + [valores[c] for c in todas_columnas] + ["OCR", datetime.now()]
-
-        set_siempre = ", ".join(f"{c}=EXCLUDED.{c}" for c in campos_ocr_siempre)
-        set_condicional = ", ".join(
-            f"{c}=CASE WHEN vehiculos.fuente='RUNT' THEN vehiculos.{c} ELSE EXCLUDED.{c} END"
-            for c in campos_ocr_si_no_hay_runt
-        )
-
-        cur.execute(f"""
-            INSERT INTO vehiculos ({cols_sql})
-            VALUES ({vals_sql})
-            ON CONFLICT (placa) DO UPDATE SET
-                {set_siempre}, {set_condicional},
-                fuente = CASE WHEN vehiculos.fuente='RUNT' THEN 'RUNT' ELSE 'OCR' END,
-                leido_en = CASE WHEN vehiculos.fuente='RUNT' THEN vehiculos.leido_en ELSE EXCLUDED.leido_en END
-        """, params)
-        conn.commit()
-        cur.close(); conn.close()
-
-        if user_id:
-            guardar_mi_consulta(user_id, placa, cedula)
-
-        return jsonify({"ok": True})
-    except Exception as e:
-        print(f"Error guardando vehiculo OCR: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/combinar-pdfs", methods=["POST"])
-def combinar_pdfs_endpoint():
-    """Toma varias URLs de PDFs YA generados (ej. de /generar-pdf-declaracion)
-    y las une en un solo PDF de varias paginas -- pensado para el boton
-    'Combinar PDFs' en el frontend, una vez ya se generaron los individuales.
-    No vuelve a consultar nada ni gasta captchas, solo descarga y pega."""
-    datos = request.get_json(silent=True) or {}
-    urls = datos.get("urls", [])
-    placa = (datos.get("placa") or "declaraciones").upper().strip()
-
-    if not urls or len(urls) < 2:
-        return jsonify({"error": "Se necesitan al menos 2 URLs para combinar"}), 400
-
-    rutas_temp = []
-    try:
-        writer = PdfWriter()
-        for i, url in enumerate(urls):
-            resp = requests.get(url, timeout=30)
-            if resp.status_code != 200:
-                raise Exception(f"No se pudo descargar {url}")
-            ruta = f"/tmp/combinar_{i}_{uuid.uuid4().hex[:6]}.pdf"
-            with open(ruta, "wb") as f:
-                f.write(resp.content)
-            rutas_temp.append(ruta)
-            writer.append(ruta)
-
-        id_unico = uuid.uuid4().hex[:8]
-        ruta_combinado = f"/tmp/combinado_{placa}_{id_unico}.pdf"
-        with open(ruta_combinado, "wb") as f:
-            writer.write(f)
-        writer.close()
-
-        url_final = subir_a_r2(ruta_combinado, f"declaraciones/combinado_{placa}_{id_unico}.pdf",
-                                nombre_descarga=f"Declaracion_{placa}_combinado.pdf")
-        os.remove(ruta_combinado)
-        for ruta in rutas_temp:
-            os.remove(ruta)
-
-        return jsonify({"ok": True, "url": url_final})
-    except Exception as e:
-        for ruta in rutas_temp:
-            if os.path.exists(ruta):
-                os.remove(ruta)
-        import traceback
-        print(traceback.format_exc(), flush=True)
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/generar-pdf-declaracion", methods=["GET"])
-def generar_pdf_declaracion_endpoint():
-    """Genera el/los PDF(s) de la declaracion sugerida (pago en banco) EN
-    SEGUNDO PLANO -- con varias vigencias (cada una con sus propios
-    captchas) el proceso puede tardar varios minutos, y una sola peticion
-    tan larga corre el riesgo de que el navegador (o algun proxy en el
-    camino) la corte con 'Failed to fetch' aunque el servidor siga
-    trabajando bien. Por eso, igual que la consulta de impuestos, esto
-    responde de inmediato con un job_id para consultar el avance en
-    /consultar/estado."""
-    placa = request.args.get("placa", "").upper().strip()
-    identificacion = request.args.get("identificacion", "").strip()
-    tipo_documento = request.args.get("tipo_documento", "CC").strip()
-    vigencias_raw = request.args.get("vigencia", "").strip()
-    modelo = request.args.get("modelo", "").strip()
-    municipio_transito = request.args.get("municipio_transito", "").strip()
-    apellidos_propietario = request.args.get("apellidos_propietario", "").strip()
-    # Opcionales -- para que el PDF quede diligenciado con los datos reales
-    # del cliente que va a pagar, en vez de los datos de relleno. Si no se
-    # envian, se usan los valores por defecto de siempre.
-    celular_raw = request.args.get("celular", "").strip()
-    email_raw = request.args.get("email", "").strip()
-    direccion_raw = request.args.get("direccion", "").strip()
-    municipio_raw = request.args.get("municipio", "").strip()
-    municipio_cod_raw = request.args.get("municipio_cod", "").strip()
-    departamento_cod_raw = request.args.get("departamento_cod", "").strip()
-
-    celular = celular_raw or "3000000000"
-    email = email_raw or "consulta@consulta.com"
-    direccion = direccion_raw or "CRA"
-    municipio_residencia = municipio_raw or "MEDELLIN"
-    municipio_cod = int(municipio_cod_raw) if municipio_cod_raw.isdigit() else 5001000
-    departamento_cod = int(departamento_cod_raw) if departamento_cod_raw.isdigit() else 5
-
-    # Si se dieron datos reales, no se reutiliza un PDF cacheado (podria
-    # tener los datos de relleno de una consulta anterior).
-    tiene_datos_reales = bool(celular_raw or email_raw or direccion_raw or municipio_raw)
-
-    if not all([placa, identificacion, vigencias_raw, modelo, municipio_transito, apellidos_propietario]):
-        return jsonify({"error": "Faltan parametros: placa, identificacion, vigencia, modelo, municipio_transito, apellidos_propietario"}), 400
-
-    vigencias = [v.strip() for v in vigencias_raw.split(",") if v.strip()]
-    job_id = str(uuid.uuid4())
-    job_actualizar(job_id, "Iniciando...", "procesando")
-
-    def ejecutar_declaraciones():
-        try:
-            resultados = antioquia_generar_todas_declaraciones(
-                placa, identificacion, tipo_documento, vigencias,
-                modelo, municipio_transito, apellidos_propietario,
-                celular=celular, email=email, direccion=direccion,
-                municipio=municipio_residencia, municipio_cod=municipio_cod,
-                departamento_cod=departamento_cod,
-                ignorar_cache=tiene_datos_reales,
-                job_id=job_id
-            )
-            job_terminar(job_id, {"resultados": resultados})
-        except Exception as e:
-            import traceback
-            print(traceback.format_exc(), flush=True)
-            job_error(job_id, str(e))
-
-    threading.Thread(target=ejecutar_declaraciones, daemon=True).start()
-    return jsonify({"job_id": job_id, "estado": "procesando"})
-
-
-@app.route("/generar-declaracion-manual", methods=["GET"])
-def generar_declaracion_manual_endpoint():
-    """Genera la Declaracion Manual (formulario FO-M8-P6-008) diligenciada,
-    combinando: datos del vehiculo ya guardados en Tramy (tabla vehiculos),
-    los datos del propietario que escribe el usuario, y la liquidacion
-    privada + caja/traccion que se obtienen de una consulta real a la
-    Gobernacion (la misma consulta que usa la Declaracion Sugerida).
-    Se ejecuta en segundo plano por el mismo motivo que las demas consultas
-    a la Gobernacion: puede tardar por los captchas."""
-    placa = request.args.get("placa", "").upper().strip()
-    identificacion = request.args.get("identificacion", "").strip()
-    tipo_documento = request.args.get("tipo_documento", "CC").strip()
-    vigencia = request.args.get("vigencia", "").strip()
-    modelo = request.args.get("modelo", "").strip()
-    municipio_transito = request.args.get("municipio_transito", "").strip()
-    apellidos_propietario = request.args.get("apellidos_propietario", "").strip()
-    nombres_propietario = request.args.get("nombres_propietario", "").strip()
-
-    celular = request.args.get("celular", "").strip() or "3000000000"
-    email = request.args.get("email", "").strip() or "consulta@consulta.com"
-    direccion = request.args.get("direccion", "").strip() or "CRA"
-    municipio_residencia = request.args.get("municipio", "").strip() or "MEDELLIN"
-    municipio_cod = request.args.get("municipio_cod", "").strip()
-    municipio_cod = int(municipio_cod) if municipio_cod.isdigit() else 5001000
-    departamento_cod = request.args.get("departamento_cod", "").strip()
-    departamento_cod = int(departamento_cod) if departamento_cod.isdigit() else 5
-
-    if not all([placa, identificacion, vigencia, modelo, municipio_transito, apellidos_propietario]):
-        return jsonify({"error": "Faltan parametros: placa, identificacion, vigencia, modelo, municipio_transito, apellidos_propietario"}), 400
-
-    job_id = str(uuid.uuid4())
-    job_actualizar(job_id, "Iniciando...", "procesando")
-
-    def ejecutar():
-        try:
-            job_actualizar(job_id, "Consultando datos guardados del vehículo...")
-            conn = get_db_conn()
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM vehiculos WHERE placa = %s", (placa,))
-            fila = cur.fetchone()
-            vehiculo = {}
-            if fila:
-                columnas = [desc[0] for desc in cur.description]
-                vehiculo = dict(zip(columnas, fila))
-            cur.close(); conn.close()
-
-            job_actualizar(job_id, "Consultando liquidación en la Gobernación (puede tardar por el captcha)...")
-            pdf_sugerida_bytes, data_vig = antioquia_generar_pdf_declaracion(
-                placa, identificacion, tipo_documento, vigencia,
-                modelo, municipio_transito, apellidos_propietario,
-                celular=celular, email=email, direccion=direccion,
-                municipio=municipio_residencia, municipio_cod=municipio_cod,
-                departamento_cod=departamento_cod
-            )
-
-            job_actualizar(job_id, "Extrayendo Caja y Tracción del documento...")
-            caja_traccion = _extraer_caja_traccion_declaracion(pdf_sugerida_bytes)
-
-            datos = {
-                "vigencia": vigencia,
-                "nombre_completo": nombres_propietario,
-                "apellidos": apellidos_propietario,
-                "celular": celular if celular != "3000000000" else "",
-                "telefono": "",
-                "email": email if email != "consulta@consulta.com" else "",
-                "direccion": direccion if direccion != "CRA" else "",
-                "municipio_residencia": municipio_residencia,
-                "departamento_residencia": "ANTIOQUIA",
-                "numero_documento": identificacion,
-                "tipo_documento": tipo_documento,
-
-                "placa": placa,
-                "marca": vehiculo.get("marca", ""),
-                "linea": vehiculo.get("linea", ""),
-                "modelo": modelo,
-                "clase": vehiculo.get("clase", ""),
-                "carroceria": vehiculo.get("carroceria", ""),
-                "puertas": vehiculo.get("puertas", ""),
-                "cilindraje": vehiculo.get("cilindrada", ""),
-                "capacidad_carga": vehiculo.get("capacidad_carga", ""),
-                "capacidad_pasajeros": vehiculo.get("capacidad_pasajeros", ""),
-                "municipio_matricula": municipio_transito,
-                "departamento_matricula": "ANTIOQUIA",
-                "blindado": bool(vehiculo.get("info_blindaje")),
-                "importado": False,
-                "caja": caja_traccion.get("caja", ""),
-                "traccion": caja_traccion.get("traccion", ""),
-
-                # Liquidacion privada -- ver nota de mapeo mas abajo
-                "avaluo": data_vig.get("avaluoComercial", 0),
-                "impuesto": data_vig.get("impuesto", 0),
-                "sanciones": data_vig.get("sancion", 0),
-                "descuentos": data_vig.get("descuentoSancion", 0),
-                "total_cargo_5": data_vig.get("totalCargo", 0),
-                "total_cargo_6": data_vig.get("totalCargo", 0),
-                "intereses_mora": data_vig.get("interesesMora", 0),
-                "pagos_anteriores": data_vig.get("pagosAnteriores", 0),
-                "descuento_interes": data_vig.get("descuentoInteresesMora", 0),
-                "saldo_favor": data_vig.get("saldoFavor", 0),
-                # OJO: se usa "saldoPagar", NO "totalPagar" -- este ultimo
-                # incluye el costo de $25.900 del servicio de declaracion
-                # sugerida, que no aplica a la declaracion manual.
-                "total_pagar": data_vig.get("saldoPagar", 0),
-            }
-
-            job_actualizar(job_id, "Generando el documento...")
-            id_unico = uuid.uuid4().hex[:8]
-            ruta_pdf = f"/tmp/decl_manual_{placa}_{vigencia}_{id_unico}.pdf"
-            generar_declaracion_manual_pdf(datos, ruta_pdf)
-
-            url = subir_a_r2(ruta_pdf, f"declaraciones-manuales/{placa}_{vigencia}_{id_unico}.pdf",
-                              nombre_descarga=f"Declaracion_Manual_{placa}_{vigencia}.pdf")
-            os.remove(ruta_pdf)
-
-            job_terminar(job_id, {"url": url})
-        except Exception as e:
-            import traceback
-            print(traceback.format_exc(), flush=True)
-            job_error(job_id, str(e))
-
-    threading.Thread(target=ejecutar, daemon=True).start()
-    return jsonify({"job_id": job_id, "estado": "procesando"})
-
-
-@app.route("/generar-fun", methods=["POST"])
-def generar_fun_endpoint():
-    """Genera el FUN diligenciado con los datos recibidos, lo sube a R2, y
-    devuelve el enlace de descarga. Recibe todo por POST (no se re-consulta
-    la base de datos) porque el frontend ya tiene en pantalla justo los
-    datos que el usuario confirmo -- incluyendo cosas que no vivimos en
-    'vehiculos' (tramite elegido, datos del comprador, etc.)."""
-    datos = request.get_json(silent=True) or {}
-    placa = (datos.get("placa") or "SINPLACA").upper().strip()
-
-    if not os.path.exists(FUN_PLANTILLA):
-        return jsonify({"error": "No se encontro la plantilla AppJX.xlsm en el servidor."}), 500
-
-    id_doc = str(uuid.uuid4())[:10]
-    ruta_pdf_local = f"/tmp/FUN_{placa}_{id_doc}.pdf"
-
-    try:
-        generar_fun(datos, ruta_pdf_local)
-        nombre_remoto = f"fun/{placa}_{id_doc}.pdf"
-        url = subir_a_r2(ruta_pdf_local, nombre_remoto)
-        os.remove(ruta_pdf_local)
-        return jsonify({"ok": True, "url": url})
-    except Exception as e:
-        import traceback
-        print(traceback.format_exc(), flush=True)
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/envigado-citas-disponibles", methods=["GET"])
-def envigado_citas_disponibles_endpoint():
-    """Revisa en vivo las dos sedes de Envigado (Vegas y City Plaza) para
-    los proximos dias, y devuelve solo las fechas que SI tienen horarios
-    disponibles."""
-    dias = request.args.get("dias", "14")
-    dias = int(dias) if dias.isdigit() else 14
-    try:
-        resultados = envigado_revisar_citas_disponibles(dias_adelante=dias)
-        con_citas = [r for r in resultados if r["cantidad_horarios"] > 0]
-        return jsonify({
-            "ok": True,
-            "hay_citas": len(con_citas) > 0,
-            "disponibles": con_citas,
-            "verificado_en": datetime.now().isoformat() + "Z"  # UTC -- el navegador lo convierte solo a hora local
-        })
-    except Exception as e:
-        import traceback
-        print(traceback.format_exc(), flush=True)
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/envigado-citas-iniciar-monitoreo", methods=["GET"])
-def envigado_citas_iniciar_monitoreo_endpoint():
-    """Arranca una sesion de monitoreo CONSTANTE de citas disponibles en
-    Envigado -- revisa cada 30 segundos, durante maximo 2 horas (o hasta
-    que se detenga manualmente). Util para la ventana de tiempo del dia
-    en la que se sabe que pueden abrir citas nuevas."""
-    if _envigado_citas_monitoreo_estado["activo"]:
-        return jsonify({
-            "ok": False,
-            "error": "Ya hay una sesión de monitoreo de citas corriendo.",
-            "fin_esperado": _envigado_citas_monitoreo_estado["fin_esperado"]
-        }), 409
-
-    duracion_minutos = request.args.get("minutos", "120")
-    duracion_minutos = int(duracion_minutos) if duracion_minutos.isdigit() else 120
-    duracion_minutos = min(duracion_minutos, 120)  # tope maximo de 2 horas
-    duracion_segundos = duracion_minutos * 60
-
-    _envigado_citas_monitoreo_estado["activo"] = True
-    _envigado_citas_monitoreo_estado["inicio"] = datetime.now().isoformat() + "Z"  # UTC
-    _envigado_citas_monitoreo_estado["fin_esperado"] = (datetime.now() + timedelta(seconds=duracion_segundos)).isoformat() + "Z"  # UTC
-    _envigado_citas_monitoreo_estado["detener"] = False
-
-    threading.Thread(
-        target=_envigado_polling_citas,
-        kwargs={"duracion_segundos": duracion_segundos},
-        daemon=True
-    ).start()
-
-    return jsonify({
-        "ok": True,
-        "mensaje": f"Monitoreo de citas iniciado, revisando cada 30 segundos por {duracion_minutos} minutos (o hasta que lo detengas).",
-        "fin_esperado": _envigado_citas_monitoreo_estado["fin_esperado"]
-    })
-
-
-@app.route("/envigado-citas-detener-monitoreo", methods=["GET"])
-def envigado_citas_detener_monitoreo_endpoint():
-    """Detiene la sesion de monitoreo constante de citas antes de que se
-    cumpla el tiempo maximo. Puede tardar hasta 30 segundos en detenerse
-    del todo (revisa la bandera en cada ciclo)."""
-    if not _envigado_citas_monitoreo_estado["activo"]:
-        return jsonify({"ok": False, "error": "No hay ningún monitoreo de citas corriendo en este momento."}), 409
-    _envigado_citas_monitoreo_estado["detener"] = True
-    return jsonify({"ok": True, "mensaje": "Deteniendo el monitoreo de citas..."})
-
-
-@app.route("/envigado-citas-estado-monitoreo", methods=["GET"])
-def envigado_citas_estado_monitoreo_endpoint():
-    """Indica si hay una sesion de monitoreo constante de citas activa."""
-    return jsonify({
-        "ok": True,
-        "activo": _envigado_citas_monitoreo_estado["activo"],
-        "inicio": _envigado_citas_monitoreo_estado["inicio"],
-        "fin_esperado": _envigado_citas_monitoreo_estado["fin_esperado"],
-    })
-
-
-@app.route("/envigado-citas-ultimo-resultado", methods=["GET"])
-def envigado_citas_ultimo_resultado_endpoint():
-    """Devuelve el ultimo resultado GUARDADO (sin volver a consultar la
-    API en vivo) -- para el aviso rapido que se muestra al entrar a
-    Liquidacion, sin tener que esperar una consulta en vivo cada vez."""
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT sede, fecha_dia, cantidad_horarios, verificado_en
-            FROM envigado_citas_disponibles
-            WHERE cantidad_horarios > 0
-            ORDER BY verificado_en DESC
-        """)
-        filas = cur.fetchall()
-        cur.close(); conn.close()
-        disponibles = [
-            {"sede": f[0], "fecha": f[1], "cantidad_horarios": f[2], "verificado_en": f[3].isoformat() + "Z"}
-            for f in filas
-        ]
-        return jsonify({"ok": True, "hay_citas": len(disponibles) > 0, "disponibles": disponibles})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/envigado-turnos-iniciar-monitoreo", methods=["GET"])
-def envigado_turnos_iniciar_monitoreo_endpoint():
-    """Arranca una sesion de monitoreo de maximo 2 horas (configurable),
-    que revisa el monitor de turnos de Envigado cada pocos segundos y va
-    guardando cada llamado nuevo que aparezca -- se puede detener antes
-    manualmente. Los DATOS que va capturando (toda la lista, y los que
-    coincidan con los numeros vigilados) quedan guardados en la base de
-    datos todo el dia, sin importar si la sesion de vigilancia ya termino
-    o si se inicia una sesion nueva despues -- solo se renuevan al dia
-    siguiente. Se puede vigilar hasta 10 numeros de cita a la vez."""
-    if _envigado_monitoreo_estado["activo"]:
-        return jsonify({
-            "ok": False,
-            "error": "Ya hay una sesión de monitoreo corriendo.",
-            "fin_esperado": _envigado_monitoreo_estado["fin_esperado"]
-        }), 409
-
-    duracion_minutos = request.args.get("minutos", "120")
-    duracion_minutos = int(duracion_minutos) if duracion_minutos.isdigit() else 120
-    duracion_minutos = min(duracion_minutos, 120)  # tope maximo de 2 horas
-    duracion_segundos = duracion_minutos * 60
-
-    numeros_raw = request.args.get("numeros", "").strip()
-    numeros_vigilados = [n.strip() for n in numeros_raw.split(",") if n.strip()][:10]
-
-    _envigado_monitoreo_estado["activo"] = True
-    _envigado_monitoreo_estado["inicio"] = datetime.now().isoformat() + "Z"  # UTC
-    _envigado_monitoreo_estado["fin_esperado"] = (datetime.now() + timedelta(seconds=duracion_segundos)).isoformat() + "Z"  # UTC
-    _envigado_monitoreo_estado["numeros_vigilados"] = numeros_vigilados
-    _envigado_monitoreo_estado["detener"] = False
-
-    threading.Thread(
-        target=_envigado_polling_turnos,
-        kwargs={"duracion_segundos": duracion_segundos, "numeros_vigilados": numeros_vigilados},
-        daemon=True
-    ).start()
-
-    return jsonify({
-        "ok": True,
-        "mensaje": f"Monitoreo iniciado por {duracion_minutos} minutos (o hasta que lo detengas).",
-        "fin_esperado": _envigado_monitoreo_estado["fin_esperado"]
-    })
-
-
-@app.route("/envigado-turnos-detener-monitoreo", methods=["GET"])
-def envigado_turnos_detener_monitoreo_endpoint():
-    """Detiene la sesion de monitoreo activa antes de que se cumplan las
-    2 horas. El hilo revisa esta bandera en cada ciclo (cada 8 segundos),
-    asi que puede tardar hasta ese tiempo en detenerse del todo."""
-    if not _envigado_monitoreo_estado["activo"]:
-        return jsonify({"ok": False, "error": "No hay ningún monitoreo corriendo en este momento."}), 409
-    _envigado_monitoreo_estado["detener"] = True
-    return jsonify({"ok": True, "mensaje": "Deteniendo el monitoreo..."})
-
-
-@app.route("/envigado-turnos-estado-monitoreo", methods=["GET"])
-def envigado_turnos_estado_monitoreo_endpoint():
-    """Indica si hay una sesion de monitoreo activa en este momento."""
-    return jsonify({
-        "ok": True,
-        "activo": _envigado_monitoreo_estado["activo"],
-        "inicio": _envigado_monitoreo_estado["inicio"],
-        "fin_esperado": _envigado_monitoreo_estado["fin_esperado"],
-        "numeros_vigilados": _envigado_monitoreo_estado["numeros_vigilados"],
-    })
-
-
-@app.route("/envigado-turnos-capturados", methods=["GET"])
-def envigado_turnos_capturados_endpoint():
-    """Devuelve los turnos capturados, mas recientes primero. Por defecto
-    solo los de hoy."""
-    limite = request.args.get("limite", "100")
-    limite = int(limite) if limite.isdigit() else 100
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT nro_atencion, nombre_usuario, nombre_taquilla, nombre_servicio, detectado_en
-            FROM envigado_turnos_llamados
-            WHERE detectado_en::date = CURRENT_DATE
-            ORDER BY detectado_en DESC
-            LIMIT %s
-        """, (limite,))
-        filas = cur.fetchall()
-        cur.close(); conn.close()
-        turnos = [
-            {"nro_atencion": f[0], "nombre_usuario": f[1], "taquilla": f[2],
-             "servicio": f[3], "detectado_en": f[4].isoformat() + "Z"}
-            for f in filas
-        ]
-        return jsonify({"ok": True, "turnos": turnos})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/envigado-turnos-vigilados-hoy", methods=["GET"])
-def envigado_turnos_vigilados_hoy_endpoint():
-    """Devuelve los turnos que coincidieron con algun numero vigilado,
-    capturados HOY -- persistente en base de datos, asi que sobrevive a
-    que se refresque la pagina o se inicie una sesion de monitoreo nueva
-    mas tarde en el mismo dia. Se renueva solo al pasar la medianoche
-    (deja de aparecer, ya que el filtro es por el dia de hoy)."""
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT nro_atencion, nombre_usuario, nombre_taquilla, nombre_servicio, detectado_en
-            FROM envigado_turnos_llamados
-            WHERE fue_vigilado = TRUE AND detectado_en::date = CURRENT_DATE
-            ORDER BY detectado_en DESC
-        """)
-        filas = cur.fetchall()
-        cur.close(); conn.close()
-        encontrados = [
-            {"nro_atencion": f[0], "nombre_usuario": f[1], "taquilla": f[2],
-             "servicio": f[3], "detectado_en": f[4].isoformat() + "Z"}
-            for f in filas
-        ]
-        return jsonify({"ok": True, "encontrados": encontrados})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/generar-estado-cuenta", methods=["GET"])
-def generar_estado_cuenta_endpoint():
-    """Genera el documento Estado de Cuenta a partir de los datos ya
-    guardados (de la ultima vez que esta placa salio a paz y salvo). No
-    requiere consulta en vivo ni captcha -- responde directo."""
-    placa = request.args.get("placa", "").upper().strip()
-    if not placa:
-        return jsonify({"error": "Debes proporcionar la placa."}), 400
-
-    if not os.path.exists(FUN_PLANTILLA):
-        return jsonify({"error": "No se encontro la plantilla AppJX.xlsm en el servidor."}), 500
-
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT estado_cuenta_json, lista_detalle_pagos, lista_proceso_fiscal,
-                   lista_bloqueo, novedades, actualizado_en
-            FROM estado_cuenta_antioquia WHERE placa = %s
-        """, (placa,))
-        fila = cur.fetchone()
-        cur.close(); conn.close()
-
-        if not fila:
-            return jsonify({"error": "No tenemos datos de Estado de Cuenta guardados para esta placa. Debes consultar primero el impuesto departamental (y que el vehículo esté a paz y salvo) antes de poder generar este documento."}), 404
-
-        datos = {
-            "estado_veh": fila[0] or {},
-            "lista_detalle_pagos": fila[1] or [],
-            "lista_proceso_fiscal": fila[2] or [],
-            "lista_bloqueo": fila[3] or [],
-            "novedades": fila[4] or [],
-            # Fecha real en que se consulto y se obtuvo este numero de
-            # certificado -- NO la fecha en que se genera el documento,
-            # ya que el certificado es unico de esa consulta puntual.
-            "fecha_consulta": fila[5],
+    // Mostrar/ocultar placa mini y zona OCR
+    var placaMini = document.getElementById('ant-placa-mini');
+    if (infoConfirmada) {
+      if (placaMini) placaMini.style.display = visible ? 'block' : 'none';
+      var zonaOcr = document.getElementById('ant-zona-ocr');
+      if (!visible && zonaOcr) zonaOcr.style.display = 'none';
+    }
+  };
+
+  window.antConfirmarInfo = function() {
+    var placa     = document.getElementById('ant-placa').value.trim().toUpperCase();
+    var municipio = document.getElementById('ant-municipio').value;
+
+    infoConfirmada = true;
+
+    // Llevar la placa a las demas secciones (Revision, Ejecucion,
+    // Utilidades) por la URL, para que todo el trabajo quede ligado al
+    // mismo vehiculo sin tener que volver a escribir los datos.
+    if(typeof window.tramyActualizarLinksSecciones === 'function'){
+      window.tramyActualizarLinksSecciones(placa);
+    }
+
+    // Guardar este vehiculo en la lista del usuario logueado (si aplica),
+    // para poder elegirlo de una lista la proxima vez sin repetir el OCR.
+    if(typeof window.tramyGuardarVehiculo === 'function'){
+      window.tramyGuardarVehiculo({
+        placa:      placa,
+        municipio:  municipio,
+        tipo_documento: document.getElementById('ant-tipodoc').value,
+        cedula:     document.getElementById('ant-cedula').value.trim(),
+        apellidos:  document.getElementById('ant-apellidos').value.trim(),
+        clase:      document.getElementById('ant-clase').value.trim(),
+        marca:      document.getElementById('ant-marca').value.trim(),
+        linea:      document.getElementById('ant-linea').value.trim(),
+        modelo:     document.getElementById('ant-modelo').value.trim(),
+        cilindrada: document.getElementById('ant-cilindrada').value.trim(),
+        servicio:   document.getElementById('ant-servicio').value.trim(),
+        capacidad:  document.getElementById('ant-capacidad').value.trim(),
+        carroceria: document.getElementById('ant-carroceria').value.trim(),
+        limitacion_propiedad: document.getElementById('ant-limitacion-propiedad').value
+      });
+    }
+
+    // 1. Guardar en cache
+    if (placa && municipio) {
+      fetch(ANT_API+'/ocr-guardar-municipio', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({placa: placa, municipio: municipio})
+      }).catch(function(){});
+    }
+
+    // 2. Colapsar informacion y ocultar zona OCR/bienvenida
+    document.getElementById('ant-info-contenido').style.display = 'none';
+    document.getElementById('ant-info-chevron').textContent = '▼';
+    // Ocultar zona OCR, botones de entrada, bienvenida, saludo y bloque-info-top
+    ['ant-zona-ocr', 'ant-bienvenida', 'ant-info-expandido'].forEach(function(id) {
+      var el = document.getElementById(id);
+      if (el) el.style.display = 'none';
+    });
+    var elSaludo = document.getElementById('ant-saludo');
+    if (elSaludo) elSaludo.style.display = 'none';
+    var elInfoTop = document.getElementById('bloque-info-top');
+    if (elInfoTop) elInfoTop.style.display = 'none';
+    // Ocultar botones de entrada (tomar foto, subir, manual)
+    var entradaBtns = document.querySelector('.ant-entrada-btns');
+    if (entradaBtns) entradaBtns.style.display = 'none';
+    var camaraFile = document.getElementById('ant-camara-file');
+    if (camaraFile) camaraFile.style.display = 'none';
+
+    // Mostrar placa mini encima del wrap
+    var placaMini = document.getElementById('ant-placa-mini');
+    if (placaMini) placaMini.style.display = 'block';
+    var plcLetras  = document.getElementById('ant-placa-letras');
+    var plcNumeros = document.getElementById('ant-placa-numeros');
+    var plcMun     = document.getElementById('ant-placa-municipio');
+    var colLetras  = document.getElementById('ant-placa-col-letras');
+    var colNumeros = document.getElementById('ant-placa-col-numeros');
+    var colMun     = document.getElementById('ant-placa-col-municipio');
+    if (colLetras && plcLetras)   colLetras.textContent  = plcLetras.textContent;
+    if (colNumeros && plcNumeros) colNumeros.textContent = plcNumeros.textContent;
+    if (colMun && plcMun)         colMun.textContent     = plcMun.textContent;
+
+    // 3. Ocultar mensaje OCR
+    document.getElementById('ant-ocr-status').style.display = 'none';
+
+    // Actualizar título del bloque-info con placa y municipio (permanente)
+    var tituloInfo = document.getElementById('titulo-info');
+    if (tituloInfo && placa) {
+      tituloInfo.textContent = 'PASO 1 — INFORMACION ' + placa + (municipio ? ' ' + municipio : '') + ' - EDITAR';
+    }
+
+    // 4. Mostrar todos los bloques expandidos
+    mostrarYExpandirBloques();
+    cargarTramites();
+    mostrarFilasDefecto();
+    recalcularPasos();
+    setTimeout(function() {
+      window.scrollTo({top: 0, behavior: 'smooth'});
+    }, 150);
+  };
+
+  window.antEnviarWA = function() {
+    var canvas = document.getElementById('ant-canvas-liq');
+    var ctx    = canvas.getContext('2d');
+    var W      = 800;
+    var filas  = [];
+
+    [1,2,3,4,5].forEach(function(n) {
+      var row = document.getElementById('liq-row-tramite'+n);
+      if (row && row.style.display !== 'none') {
+        var label = document.getElementById('liq-label-tramite'+n);
+        var val   = parseLiq('liq-tramite'+n);
+        filas.push({label: label ? label.textContent : 'Tramite '+n, valor: val});
+      }
+    });
+
+    var rowRef = document.getElementById('liq-row-retefuente');
+    if (rowRef && rowRef.style.display !== 'none') {
+      var vRef = parseLiq('liq-retefuente');
+      filas.push({label:'Retefuente (1% avaluo)', valor: vRef});
+    }
+
+    // Impuesto Departamental y Municipal -- SIEMPRE se incluyen en el
+    // mensaje de WhatsApp, aunque esten en $0 (asi el cliente ve que se
+    // revisaron y no pregunta si esta al dia de impuestos).
+    ['liq-depto', 'liq-municipal'].forEach(function(id) {
+      var rowEl = document.getElementById('liq-row-' + id.replace('liq-', ''));
+      if (!rowEl || rowEl.style.display === 'none') return;
+      var v = parseLiq(id);
+      var spanNombre = rowEl.querySelector('.ant-liq-nombre');
+      var label = (spanNombre && spanNombre.textContent.trim()) ? spanNombre.textContent.trim() : id;
+      filas.push({label: label, valor: v});
+    });
+
+    var itemsFijos = [
+      {id:'liq-pazsalvo',  rowId:'liq-row-pazsalvo',  label:'Paz y Salvo'},
+      {id:'liq-envios',    rowId:'liq-row-envios',     label:'Envios y/o Domicilios'},
+      {id:'liq-honorarios',rowId:'liq-row-honorarios', label:'Honorarios'}
+    ];
+    // Si el concepto esta agregado (fila visible), se incluye siempre en
+    // el mensaje -- no tiene sentido agregarlo sin querer mostrarlo.
+    itemsFijos.forEach(function(c) {
+      var rowEl = document.getElementById(c.rowId);
+      if (!rowEl || rowEl.style.display === 'none') return;
+      var v = parseLiq(c.id);
+      var spanNombre = rowEl.querySelector('.ant-liq-nombre');
+      var label = (spanNombre && spanNombre.textContent.trim())
+        ? spanNombre.textContent.trim()
+        : (c.label || c.id);
+      filas.push({label: label, valor: v});
+    });
+    // Cobros dinámicos -- se recorren TODAS las filas que existan en el
+    // DOM (igual que hace calcularTotal), en vez de depender de
+    // antCobrosCount, que nunca se incrementaba al agregar filas nuevas
+    // y por eso el mensaje de WhatsApp solo traia la primera fila aunque
+    // el total si sumara bien las demas.
+    document.querySelectorAll('#liq-cobros-wrap .ant-liq-cobro').forEach(function(fila) {
+      var cobroNombreEl = fila.querySelector('.ant-liq-cobro-nombre');
+      var cobroValEl    = fila.querySelector('.liq-cobro-valor');
+      if (cobroValEl && cobroNombreEl && cobroNombreEl.value.trim()) {
+        var cobroVal = parseInt((cobroValEl.value||'0').replace(/\D/g,''),10)||0;
+        filas.push({label: cobroNombreEl.value.trim(), valor: cobroVal});
+      }
+    });
+
+    if (filas.length === 0) { alert('No hay items en la liquidacion.'); return; }
+
+    var total    = filas.reduce(function(s,f){return s+f.valor;},0);
+    var placa    = (document.getElementById('ant-placa').value||'').toUpperCase()||'SIN PLACA';
+    var municipio = antMunicipioActual || '';
+    var fecha    = new Date().toLocaleDateString('es-CO',{day:'2-digit',month:'long',year:'numeric'});
+
+    // Obtener nombres de tramites seleccionados
+    var tramitesNombres = [];
+    [1,2,3,4,5].forEach(function(n) {
+      var inp = document.getElementById('ant-tramite-'+n);
+      if (inp && inp.value.trim()) tramitesNombres.push(inp.value.trim());
+    });
+    var tituloTramites = tramitesNombres.length > 0 ? tramitesNombres.join(' + ') : 'Liquidacion';
+    var tituloCompleto = 'Tramy ' + tituloTramites + (municipio ? ' - ' + municipio : '');
+
+    // Generar texto y enviar por WhatsApp
+    var cedula  = document.getElementById('ant-cedula').value.trim();
+    var tipodoc = document.getElementById('ant-tipodoc').value;
+    var tituloTramitesTexto = tramitesNombres.length > 0 ? tramitesNombres.join(' + ') : 'LIQUIDACION';
+    var tituloLiq = '*TRAMITE ' + tituloTramitesTexto + (municipio ? ' ' + municipio : '') + ' ' + placa + ' ' + tipodoc + ' ' + cedula + '*';
+    var lineasLiq = filas.map(function(f){ return '- ' + f.label + ': $' + f.valor.toLocaleString('es-CO'); }).join('\n');
+
+    // Helper: revisar si algún trámite contiene alguna de las palabras clave
+    function tramiteContiene(palabras) {
+      return [1,2,3,4,5].some(function(n) {
+        var v = (document.getElementById('ant-tramite-'+n).value || '').toUpperCase();
+        return palabras.some(function(p){ return v.includes(p.toUpperCase()); });
+      });
+    }
+
+    var munReq    = antMunicipioActual.toUpperCase();
+    var esDepto   = (munReq === 'DEPARTAMENTAL' || munReq === 'GIRARDOTA');
+    var servicioVal = (document.getElementById('ant-servicio').value || '').normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim().toUpperCase();
+    var claseVal    = (document.getElementById('ant-clase').value || '').trim().toUpperCase();
+    var capVal      = (document.getElementById('ant-capacidad').value || '').trim();
+    var esPublico   = servicioVal === 'PUBLICO';
+    var esPasajeros = ['BUS','BUSETA','MICROBUS','TAXI','COLECTIVO'].some(function(c){ return claseVal.includes(c); })
+                   || (claseVal.includes('MOTOCARRO') && (capVal === '4' || capVal === '4 PASAJEROS'));
+
+    var necesitaGenerales = false;
+    var requisitosEspeciales = '';
+
+    // TRASPASO DE PROPIEDAD
+    if (tramiteContiene(['TRASPASO DE PROPIEDAD'])) {
+      necesitaGenerales = true;
+      requisitosEspeciales += '\n- Contrato de compraventa\n- Copia documento de identidad Comprador\n- Improntas';
+      if (esPublico && esPasajeros) {
+        requisitosEspeciales += '\n- Sesion de derechos emitido por la empresa afiliadora';
+      }
+    }
+
+    // TRASLADO DE CUENTA
+    if (tramiteContiene(['TRASLADO DE CUENTA'])) {
+      necesitaGenerales = true;
+      requisitosEspeciales += '\n- Improntas';
+    }
+
+    // LEVANTAMIENTO DE PRENDA
+    if (tramiteContiene(['LEVANTAMIENTO DE PRENDA'])) {
+      necesitaGenerales = true;
+      requisitosEspeciales += '\n- Registro del levantamiento de prenda en la plataforma RUNT\n- Improntas';
+    }
+
+    // INSCRIPCION DE PRENDA
+    if (tramiteContiene(['INSCRIPCION DE PRENDA'])) {
+      necesitaGenerales = true;
+      requisitosEspeciales += '\n- Registro de inscripcion de prenda en la plataforma RUNT\n- Improntas';
+    }
+
+    // RADICADO DE CUENTA
+    if (tramiteContiene(['RADICADO DE CUENTA'])) {
+      necesitaGenerales = true;
+      requisitosEspeciales += '\n- Improntas';
+    }
+
+    // DUPLICADO DE PLACAS
+    if (tramiteContiene(['DUPLICADO DE PLACAS'])) {
+      necesitaGenerales = true;
+      requisitosEspeciales += '\n- Contrato de mandato adicional (para reclamar las placas)\n- Copia documento de identidad Propietario adicional (para reclamar las placas)';
+      if (esDepto) requisitosEspeciales += '\n- Improntas';
+    }
+
+    // DUPLICADO DE LICENCIA DE TRANSITO
+    if (tramiteContiene(['DUPLICADO DE LICENCIA DE TRANSITO'])) {
+      necesitaGenerales = true;
+      if (esDepto) requisitosEspeciales += '\n- Improntas';
+    }
+
+    // CANCELACION DE CUENTA
+    if (tramiteContiene(['CANCELACION DE CUENTA'])) {
+      necesitaGenerales = true;
+      requisitosEspeciales += '\n- Certificado de vehiculo no recuperado expedido por la Fiscalia';
+    }
+
+    // MATRICULA INICIAL
+    if (tramiteContiene(['MATRICULA INICIAL'])) {
+      necesitaGenerales = true;
+      requisitosEspeciales += '\n- Improntas\n- Factura de compra\n- Manifiesto de importacion';
+    }
+
+    // CERTIFICADO DE TRADICION (no lleva generales)
+    if (tramiteContiene(['CERTIFICADO DE TRADICION'])) {
+      requisitosEspeciales += '\n- Copia de la tarjeta de propiedad';
+    }
+
+    // CAMBIO DE MOTOR
+    if (tramiteContiene(['CAMBIO DE MOTOR'])) {
+      necesitaGenerales = true;
+      requisitosEspeciales += '\n- Improntas';
+      requisitosEspeciales += '\n- Factura de compra con trazabilidad (si es nuevo)';
+      requisitosEspeciales += '\n- Manifiesto de importacion (si es nuevo)';
+      requisitosEspeciales += '\n- Certificado de tradicion del vehiculo al cual pertenecia el motor (si es usado)';
+      requisitosEspeciales += '\n- Certificado de tradicion del vehiculo en el cual se va a instalar el motor (si es usado)';
+      requisitosEspeciales += '\n- Contrato de compraventa del motor (si es usado)';
+      requisitosEspeciales += '\n- Certificado de revision expedido por la SIJIN';
+    }
+
+    // REGRABACION DE MOTOR
+    if (tramiteContiene(['REGRABACION DE MOTOR'])) {
+      necesitaGenerales = true;
+      requisitosEspeciales += '\n- Improntas\n- Certificado de revision expedido por la SIJIN';
+    }
+
+    // REGRABACION DE CHASIS
+    if (tramiteContiene(['REGRABACION DE CHASIS'])) {
+      necesitaGenerales = true;
+      requisitosEspeciales += '\n- Improntas\n- Certificado de revision expedido por la SIJIN';
+    }
+
+    // REGRABACION DE SERIE
+    if (tramiteContiene(['REGRABACION DE SERIE'])) {
+      necesitaGenerales = true;
+      requisitosEspeciales += '\n- Improntas\n- Certificado de revision expedido por la SIJIN';
+    }
+
+    // CAMBIO DE COLOR
+    if (tramiteContiene(['CAMBIO DE COLOR'])) {
+      necesitaGenerales = true;
+      requisitosEspeciales += '\n- Improntas\n- Carta de solicitud de cambio de color';
+    }
+
+    // Agregar generales UNA sola vez al inicio si algún trámite los requiere
+    if (necesitaGenerales) {
+      requisitosEspeciales = '\n- Formulario\n- Contrato de mandato\n- Copia documento de identidad Propietario' + requisitosEspeciales;
+    }
+
+    var autenticacionTexto = '';
+    var munAuth = antMunicipioActual.toUpperCase();
+    var reglasAuth = AUTENTICACION[munAuth];
+    if (reglasAuth) {
+      var reglaAuth = hayTraspaso() ? reglasAuth.traspaso : reglasAuth.otro;
+      if (reglaAuth) {
+        var docsAuth = reglaAuth.propietario || [];
+        var docsCompradorAuth = reglaAuth.comprador || [];
+        var notaAuth = reglaAuth.nota_especial || '';
+        var lineasAuth = [];
+        if (docsAuth.length > 0) lineasAuth.push('- Propietario debe autenticar: ' + docsAuth.join(' + ').toUpperCase());
+        if (docsCompradorAuth.length > 0) lineasAuth.push('- Comprador debe autenticar: ' + docsCompradorAuth.join(' + ').toUpperCase());
+        if (notaAuth) lineasAuth.push('- ' + notaAuth);
+        if (lineasAuth.length > 0) autenticacionTexto = '\n\n*AUTENTICACION:*\n' + lineasAuth.join('\n');
+      }
+    }
+
+    // Notas -- las predeterminadas (configurables desde el panel) + notas
+    // personalizadas del usuario. La nota de "no ponga precio en la compra
+    // venta" solo aplica cuando uno de los tramites es Traspaso de Propiedad.
+    // La nota de "traslado de cuenta" solo aplica cuando uno de los
+    // tramites es Traslado de Cuenta.
+    var hayTraspasoPropiedad = tramiteContiene(['TRASPASO DE PROPIEDAD']);
+    var hayTrasladoCuenta = tramiteContiene(['TRASLADO DE CUENTA']);
+    var notasConfig = (window.tramyProfile && window.tramyProfile.settings && window.tramyProfile.settings.notas)
+      ? window.tramyProfile.settings.notas : null;
+    var notasActivas = (notasConfig && Array.isArray(notasConfig.activas)) ? notasConfig.activas : ['firmas', 'precio_compraventa', 'traslado_cuenta'];
+    var notasPersonalizadas = (notasConfig && Array.isArray(notasConfig.personalizadas)) ? notasConfig.personalizadas : [];
+
+    var lineasNotas = [];
+    if(notasActivas.indexOf('firmas') >= 0){
+      lineasNotas.push('- NO olvide firmas y huellas en todos los documentos.');
+    }
+    if(notasActivas.indexOf('precio_compraventa') >= 0 && hayTraspasoPropiedad){
+      lineasNotas.push('- No ponga precio en la compra venta. En caso de tener que ponerlo puede usar el precio del avaluo.');
+    }
+    if(notasActivas.indexOf('traslado_cuenta') >= 0 && hayTrasladoCuenta){
+      lineasNotas.push('- Por favor, marque la casilla de traslado y escriba el municipio de destino en el formulario. Es muy importante hacerlo para evitar contratiempos.');
+    }
+    notasPersonalizadas.forEach(function(n){
+      if(n && n.trim()) lineasNotas.push('- ' + n.trim());
+    });
+    var notasTexto = lineasNotas.length > 0 ? ('*NOTAS:*\n' + lineasNotas.join('\n') + '\n\n') : '';
+
+    // Datos del RUNT (SOAT, RTM, limitaciones) -- solo se agregan si
+    // efectivamente se consulto el RUNT para este vehiculo (Premium).
+    var textoRuntLiq = '';
+    var elSoatLiq = document.getElementById('ant-soat');
+    var elRtmLiq = document.getElementById('ant-rtm');
+    var elLimitacionesLiq = document.getElementById('ant-limitaciones-propiedad');
+    if(elSoatLiq && elSoatLiq.value){
+      var lineasRunt = [];
+      lineasRunt.push('SOAT ' + elSoatLiq.value);
+      if(elRtmLiq && elRtmLiq.value) lineasRunt.push('RTM ' + elRtmLiq.value);
+      if(elLimitacionesLiq && elLimitacionesLiq.value){
+        var hayLimitacion = elLimitacionesLiq.value !== 'Sin limitaciones registradas';
+        lineasRunt.push('Limitaciones ' + (hayLimitacion ? 'Sí' : 'No'));
+      }
+      textoRuntLiq = lineasRunt.join('\n') + '\n\n';
+    }
+
+    // Datos de negocio del usuario logueado (si los tiene configurados en su panel)
+    var perfilNegocio = (window.tramyProfile && window.tramyProfile.settings) ? window.tramyProfile.settings : null;
+    var encabezadoNegocio = '';
+    if(perfilNegocio && perfilNegocio.business_name){
+      encabezadoNegocio = '*' + perfilNegocio.business_name + '*';
+      if(perfilNegocio.slogan) encabezadoNegocio += '\n' + perfilNegocio.slogan;
+      if(perfilNegocio.contact_info) encabezadoNegocio += '\n' + perfilNegocio.contact_info;
+      encabezadoNegocio += '\n\n';
+    }
+
+    var textoWA = encabezadoNegocio
+      + (encabezadoNegocio ? '' : 'Liquidacion realizada por Tramy App\nhttps://tramy.app/\n\n')
+      + tituloLiq + '\n\n'
+      + '*LIQUIDACION*\n'
+      + lineasLiq + '\n'
+      + 'TOTAL: $' + total.toLocaleString('es-CO') + '\n\n'
+      + '*REQUISITOS:*'
+      + requisitosEspeciales
+      + autenticacionTexto + '\n\n'
+      + notasTexto
+      + textoRuntLiq
+      + (encabezadoNegocio ? encabezadoNegocio.replace(/\n\n$/, '') : 'Liquidacion realizada por Tramy App\nhttps://tramy.app/');
+
+    var esMovil = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    if (esMovil && navigator.share) {
+      navigator.share({title: tituloCompleto, text: textoWA})
+        .catch(function(){ window.open('https://wa.me/?text='+encodeURIComponent(textoWA),'_blank'); });
+    } else {
+      var btnWA = document.getElementById('ant-btn-wa');
+      function confirmarCopiado() {
+        if (btnWA) {
+          var orig = btnWA.innerHTML;
+          btnWA.innerHTML = 'Texto copiado! Pega en WhatsApp';
+          setTimeout(function(){ btnWA.innerHTML = orig; }, 3000);
         }
-
-        id_doc = str(uuid.uuid4())[:10]
-        ruta_pdf_local = f"/tmp/EstadoCuenta_{placa}_{id_doc}.pdf"
-        generar_estado_cuenta_pdf(datos, ruta_pdf_local)
-
-        nombre_remoto = f"estado-cuenta/{placa}_{id_doc}.pdf"
-        url = subir_a_r2(ruta_pdf_local, nombre_remoto,
-                          nombre_descarga=f"EstadoCuenta_{placa}.pdf")
-        os.remove(ruta_pdf_local)
-        return jsonify({"ok": True, "url": url})
-    except Exception as e:
-        import traceback
-        print(traceback.format_exc(), flush=True)
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/registrar-mi-consulta", methods=["GET"])
-def registrar_mi_consulta_endpoint():
-    """Registra en el historial personal del usuario que consulto esta
-    placa, SIN volver a scrapear el RUNT -- se usa cuando el dato vino del
-    cache global, para que igual quede en 'Mis vehiculos consultados'."""
-    user_id = request.args.get("user_id", "").strip()
-    placa   = request.args.get("placa", "").upper().strip()
-    cedula  = request.args.get("cedula", "").strip()
-    if not user_id or not placa:
-        return jsonify({"error": "Debes proporcionar user_id y placa."}), 400
-    ok, error = guardar_mi_consulta(user_id, placa, cedula)
-    return jsonify({"ok": ok, "error": error})
-
-
-@app.route("/mis-vehiculos-runt", methods=["GET"])
-def mis_vehiculos_runt():
-    """Historial personal: solo las placas que ESTE usuario ha consultado
-    en el RUNT antes (a diferencia de /vehiculo-runt-guardado, que es
-    global para todos los usuarios). Acepta 'q' opcional para filtrar por
-    placa mientras el usuario escribe (la lista puede crecer mucho)."""
-    user_id = request.args.get("user_id", "").strip()
-    texto   = request.args.get("q", "").upper().strip()
-    if not user_id:
-        return jsonify({"error": "Debes proporcionar user_id."}), 400
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        if texto:
-            cur.execute("""
-                SELECT v.placa, v.marca, v.linea, v.modelo, mc.actualizado_en, v.fuente
-                FROM mis_consultas mc
-                JOIN vehiculos v ON v.placa = mc.placa
-                WHERE mc.user_id = %s AND v.placa LIKE %s
-                ORDER BY mc.actualizado_en DESC LIMIT 8
-            """, (user_id, texto + '%'))
-        else:
-            cur.execute("""
-                SELECT v.placa, v.marca, v.linea, v.modelo, mc.actualizado_en, v.fuente
-                FROM mis_consultas mc
-                JOIN vehiculos v ON v.placa = mc.placa
-                WHERE mc.user_id = %s
-                ORDER BY mc.actualizado_en DESC LIMIT 8
-            """, (user_id,))
-        filas = []
-        for r in cur.fetchall():
-            filas.append({
-                "placa": r[0], "marca": r[1], "linea": r[2], "modelo": r[3],
-                "actualizado_en": (r[4] - timedelta(hours=5)).strftime("%Y-%m-%d %H:%M") if r[4] else None,
-                "fuente": r[5],
-            })
-        cur.close(); conn.close()
-        return jsonify(filas)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/vehiculos-buscar", methods=["GET"])
-def vehiculos_buscar():
-    """Autocompletado: si hay texto ('q'), devuelve placas que empiecen con
-    ese texto; si no hay texto, devuelve las mas recientes -- para que el
-    desplegable muestre algo util apenas se abre, antes de escribir nada."""
-    prefijo = request.args.get("q", "").upper().strip()
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        if prefijo:
-            cur.execute("""
-                SELECT placa, marca, linea FROM vehiculos
-                WHERE placa LIKE %s ORDER BY leido_en DESC LIMIT 8
-            """, (prefijo + '%',))
-        else:
-            cur.execute("""
-                SELECT placa, marca, linea FROM vehiculos
-                ORDER BY leido_en DESC LIMIT 8
-            """)
-        filas = [{"placa": r[0], "marca": r[1], "linea": r[2]} for r in cur.fetchall()]
-        cur.close(); conn.close()
-        return jsonify(filas)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/vehiculo-runt-guardado", methods=["GET"])
-def vehiculo_runt_guardado():
-    """Trae los datos de RUNT ya guardados para una placa, sin consultar el
-    RUNT de nuevo (no tiene costo de 2Captcha). Se usa para que Tramy pueda
-    mostrar automaticamente lo que ya se sabe de un vehiculo, y que el
-    usuario decida si esta lo bastante reciente o prefiere consultar de nuevo."""
-    placa = request.args.get("placa", "").upper().strip()
-    if not placa:
-        return jsonify({"error": "Debes proporcionar la placa."}), 400
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM vehiculos WHERE placa = %s", (placa,))
-        fila = cur.fetchone()
-        if not fila:
-            cur.close(); conn.close()
-            return jsonify(None)
-        columnas = [desc[0] for desc in cur.description]
-        datos = dict(zip(columnas, fila))
-        cur.close(); conn.close()
-        # Convertir fechas a texto para que se puedan mostrar en JSON.
-        # "leido_en" es la unica con hora (las demas son solo fecha), y se
-        # guarda en UTC -- se ajusta a hora de Colombia (UTC-5) para mostrar.
-        for k, v in datos.items():
-            if hasattr(v, "isoformat"):
-                if k == "leido_en":
-                    datos[k] = (v - timedelta(hours=5)).strftime("%Y-%m-%d %H:%M")
-                else:
-                    datos[k] = str(v)
-        return jsonify(datos)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/consultar/estado", methods=["GET"])
-def consultar_estado():
-    job_id = request.args.get("job_id", "").strip()
-    if not job_id:
-        return jsonify({"error": "Falta job_id"}), 400
-    try:
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        cur.execute("SELECT estado, mensaje, resultado FROM consulta_jobs WHERE job_id=%s", (job_id,))
-        row = cur.fetchone()
-        cur.close(); conn.close()
-        if not row:
-            return jsonify({"estado": "no_encontrado"})
-        estado, mensaje, resultado = row
-        resp = {"estado": estado, "mensaje": mensaje}
-        if resultado:
-            # Siempre devolver resultado si existe (parcial o final)
-            resp["resultado"] = resultado
-        if estado == "error":
-            resp["error"] = mensaje
-        return jsonify(resp)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ============================================================
-#  RETEFUENTE
-# ============================================================
-
-# Mapeo clase OCR → tabla retefuente
-def _normalizar_marca(cur, marca):
-    """Si la marca no existe exacta, busca por ILIKE y devuelve la más cercana."""
-    cur.execute("SELECT COUNT(*) FROM retefuente_2026 WHERE marca = %s", (marca,))
-    if cur.fetchone()[0] > 0:
-        return marca
-    cur.execute("SELECT DISTINCT marca FROM retefuente_2026 WHERE marca ILIKE %s LIMIT 1", (f"%{marca}%",))
-    row = cur.fetchone()
-    return row[0] if row else marca
-
-
-def _es_carga(capacidad):
-    """Devuelve True si la capacidad indica carga (kg) en lugar de pasajeros."""
-    if not capacidad:
-        return False
-    cap = str(capacidad).strip().upper().replace('.','').replace(',','')
-    # Si contiene KG o KILO es carga
-    if 'KG' in cap or 'KILO' in cap or 'TON' in cap:
-        return True
-    # Si contiene PAX o PASAJERO es pasajeros
-    if 'PAX' in cap or 'PASAJERO' in cap or 'PASAJ' in cap:
-        return False
-    # Si es número puro para CAMIONETA: >=100 = carga (kg), <100 = pasajeros
-    try:
-        # Limpiar puntos de miles y comas decimales
-        cap_clean = re.sub(r'[^0-9]', '', cap)
-        num = int(cap_clean)
-        # Si el número original tiene punto como separador de miles (ej: 5.610 -> 5610)
-        # ya se limpió arriba. Si era 5 pasajeros sería simplemente "5"
-        return num >= 100
-    except Exception:
-        return False
-
-
-def _tabla_retefuente(clase, carroceria='', capacidad=''):
-    clase      = (clase or '').strip().upper()
-    carroceria = (carroceria or '').strip().upper()
-    if clase in ('AUTOMOVIL', 'AUTOMÓVIL'):                          return 'T1'
-    if clase == 'CAMIONETA CARGA' or clase == 'CAMIONETA ESTACAS':   return 'T7'
-    if clase == 'CAMIONETA':
-        if carroceria == 'DOBLE CABINA':                             return 'T3'
-        if _es_carga(capacidad):                                     return 'T7'
-        return 'T2'
-    if clase in ('CAMPERO',):                                         return 'T2'
-    if clase in ('MOTOCICLETA', 'MOTOCARRO'):                         return 'T5'
-    if clase in ('BUS', 'BUSETA', 'MICROBUS', 'MICROBÚS'):           return 'T6'
-    if clase in ('CAMION', 'CAMIÓN', 'VOLQUETA', 'TRACTOCAMION'):    return 'T7'
-    if clase == 'AMBULANCIA':                                         return 'T8'
-    return None
-
-def _col_anio(modelo):
-    """Devuelve el nombre de columna según el modelo del vehículo."""
-    try:
-        anio = int(str(modelo).strip())
-    except:
-        return 'anio_2001_ant'
-    if anio <= 2001:
-        return 'anio_2001_ant'
-    if anio > 2025:
-        return 'anio_2025'
-    return f'anio_{anio}'
-
-
-
-@app.route("/retefuente/marcas-all", methods=["GET"])
-def retefuente_marcas_all():
-    """Devuelve todas las marcas para una clase (tabla o clase_bd)."""
-    clase      = request.args.get("clase", "").strip().upper()
-    clase_bd   = request.args.get("clase_bd", "").strip().upper()
-    carroceria = request.args.get("carroceria", "").strip().upper()
-    try:
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        capacidad_m = request.args.get("capacidad","")
-        if clase_bd:
-            if clase_bd == 'CAMIONETA':
-                cur.execute("SELECT DISTINCT marca FROM retefuente_2026 WHERE clase='CAMIONETA' AND tabla='T7' ORDER BY marca")
-            else:
-                cur.execute("SELECT DISTINCT marca FROM retefuente_2026 WHERE clase=%s ORDER BY marca", (clase_bd,))
-        elif clase:
-            tabla = _tabla_retefuente(clase, carroceria, request.args.get('capacidad',''))
-            if tabla:
-                cur.execute("SELECT DISTINCT marca FROM retefuente_2026 WHERE tabla=%s ORDER BY marca", (tabla,))
-            else:
-                cur.execute("SELECT DISTINCT marca FROM retefuente_2026 ORDER BY marca")
-        else:
-            cur.execute("SELECT DISTINCT marca FROM retefuente_2026 ORDER BY marca")
-        marcas = [r[0] for r in cur.fetchall()]
-        cur.close(); conn.close()
-        return jsonify({"marcas": marcas})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/retefuente/lineas", methods=["GET"])
-def retefuente_lineas():
-    """Devuelve las lineas para una marca (y opcionalmente clase o clase_bd)."""
-    marca      = request.args.get("marca", "").strip().upper()
-    clase      = request.args.get("clase", "").strip().upper()
-    clase_bd   = request.args.get("clase_bd", "").strip().upper()
-    carroceria = request.args.get("carroceria", "").strip().upper()
-    if not marca:
-        return jsonify({"error": "Debes enviar marca."}), 400
-    try:
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        capacidad = request.args.get('capacidad','')
-        capacidad_l = request.args.get("capacidad","")
-        marca = _normalizar_marca(cur, marca)
-        if clase_bd:
-            if clase_bd == 'CAMIONETA':
-                # clase_bd=CAMIONETA significa explícitamente camioneta de carga → T7
-                cur.execute("SELECT DISTINCT linea FROM retefuente_2026 WHERE marca=%s AND clase='CAMIONETA' AND tabla='T7' ORDER BY linea", (marca,))
-            else:
-                cur.execute("SELECT DISTINCT linea FROM retefuente_2026 WHERE marca=%s AND clase=%s ORDER BY linea", (marca, clase_bd))
-        elif clase:
-            tabla = _tabla_retefuente(clase, carroceria, capacidad)
-            if tabla:
-                cur.execute("SELECT DISTINCT linea FROM retefuente_2026 WHERE marca=%s AND tabla=%s ORDER BY linea", (marca, tabla))
-            else:
-                cur.execute("SELECT DISTINCT linea FROM retefuente_2026 WHERE marca=%s ORDER BY linea", (marca,))
-        else:
-            cur.execute("SELECT DISTINCT linea FROM retefuente_2026 WHERE marca=%s ORDER BY linea", (marca,))
-        lineas = [r[0] for r in cur.fetchall()]
-        cur.close(); conn.close()
-        return jsonify({"lineas": lineas})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/retefuente/modelos", methods=["GET"])
-def retefuente_modelos():
-    """Devuelve los modelos (anos) disponibles."""
-    try:
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        cur.execute("""
-            SELECT column_name FROM information_schema.columns
-            WHERE table_name = 'retefuente_2026'
-              AND column_name LIKE 'anio_%'
-            ORDER BY column_name DESC
-        """)
-        modelos = [r[0].replace('anio_', '').replace('_ant', ' y anteriores') for r in cur.fetchall()]
-        cur.close(); conn.close()
-        return jsonify({"modelos": modelos})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/retefuente/opciones", methods=["GET"])
-def retefuente_opciones():
-    """
-    Devuelve todas las opciones para marca+linea+modelo+cilindraje.
-    Cilindraje >= al ingresado. Incluye clase, tonelaje, pasajeros.
-    """
-    marca      = request.args.get("marca", "").strip().upper()
-    linea      = request.args.get("linea", "").strip().upper()
-    clase      = request.args.get("clase", "").strip().upper()
-    carroceria = request.args.get("carroceria", "").strip().upper()
-    modelo     = request.args.get("modelo", "").strip()
-    cilindraje = request.args.get("cilindraje", "0").strip()
-
-    if not marca or not modelo:
-        return jsonify({"error": "Debes enviar marca y modelo."}), 400
-
-    # Normalizar modelo — acepta año libre, "2001 y anteriores", etc.
-    modelo_norm = modelo.replace(" y anteriores", "").replace("_ant", "").strip()
-    try:
-        anio_int = int(modelo_norm)
-    except:
-        return jsonify({"error": "Modelo invalido."}), 400
-    col_anio = _col_anio(str(anio_int))
-
-    try:
-        # Limpiar puntos de miles y comas decimales (ej: 3.760 -> 3760)
-        cil = int(re.sub(r'[^0-9]', '', cilindraje)) if cilindraje else 0
-    except:
-        cil = 0
-
-    try:
-        conn = get_db_conn()
-        cur  = conn.cursor()
-
-        marca  = _normalizar_marca(cur, marca)
-        where  = ["marca = %s", f"{col_anio} > 0"]
-        params = [marca]
-
-        if linea:
-            palabras = [p for p in linea.split() if len(p) > 2][:3]
-            for p in palabras:
-                where.append("linea ILIKE %s")
-                params.append(f'%{p}%')
-
-        clase_bd   = request.args.get("clase_bd", "").strip().upper()
-        capacidad  = request.args.get("capacidad", "")
-        if clase_bd:
-            if clase_bd == 'CAMIONETA':
-                where.append("clase = 'CAMIONETA'")
-                where.append("tabla = 'T7'")
-            else:
-                where.append("clase = %s")
-                params.append(clase_bd)
-        elif clase:
-            tabla = _tabla_retefuente(clase, carroceria, capacidad)
-            if tabla:
-                where.append("tabla = %s")
-                params.append(tabla)
-
-        if cil > 0:
-            where.append("cilindraje >= %s")
-            params.append(cil)
-
-        sql = f"""
-            SELECT marca, linea, cilindraje, tabla, {col_anio} as avaluo,
-                   clase, tonelaje, pasajeros
-            FROM retefuente_2026
-            WHERE {' AND '.join(where)}
-            ORDER BY cilindraje ASC
-            LIMIT 40
-        """
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-
-        # Si no hay resultados con filtro de linea, buscar sin él
-        if not rows and linea:
-            where2  = ["marca = %s", f"{col_anio} > 0"]
-            params2 = [marca]
-            if clase_bd:
-                if clase_bd == 'CAMIONETA':
-                    where2.append("clase = 'CAMIONETA'")
-                    where2.append("tabla = 'T7'")
-                else:
-                    where2.append("clase = %s")
-                    params2.append(clase_bd)
-            elif clase:
-                tabla = _tabla_retefuente(clase, carroceria, capacidad)
-                if tabla:
-                    where2.append("tabla = %s")
-                    params2.append(tabla)
-            if cil > 0:
-                where2.append("cilindraje >= %s")
-                params2.append(cil)
-            cil_dist2 = f"ABS(cilindraje - {cil})," if cil > 0 else ""
-            sql2 = f"""
-                SELECT marca, linea, cilindraje, tabla, {col_anio} as avaluo,
-                       clase, tonelaje, pasajeros
-                FROM retefuente_2026
-                WHERE {' AND '.join(where2)}
-                ORDER BY {cil_dist2} cilindraje ASC
-                LIMIT 20
-            """
-            cur.execute(sql2, params2)
-            rows = cur.fetchall()
-
-        # Ordenar en Python: 1) cilindraje más cercano, 2) mayor coincidencia con línea del OCR
-        linea_words = [w.upper() for w in linea.split() if len(w) > 1][:5] if linea else []
-        def score_row(r):
-            cil_r    = r[2] or 0
-            cil_dist = abs(cil_r - cil) if cil > 0 else cil_r
-            lin_score = sum(1 for w in linea_words if w in (r[1] or '').upper())
-            return (cil_dist, -lin_score)
-        rows = sorted(rows, key=score_row)[:20]
-
-        cur.close(); conn.close()
-
-        TABLA_CLASE = {
-            'T1':'Automóvil','T2':'Campero/Camioneta','T3':'Camioneta D.C.',
-            'T4':'Eléctrico','T5':'Motocicleta','T6':'Bus/Buseta',
-            'T7':'Camión/Volqueta','T8':'Ambulancia','T9':'Híbrido'
-        }
-
-        opciones = []
-        for r in rows:
-            op = {
-                "marca":      r[0],
-                "linea":      r[1],
-                "cilindraje": r[2],
-                "tabla":      r[3],
-                "avaluo":     r[4],
-                "retefuente": round(r[4] / 100) if r[4] else 0,
-                "clase_veh":  r[5] or TABLA_CLASE.get(r[3], r[3]),
-                "tonelaje":    float(r[6]) if r[6] else None,
-                "tonelaje_kg": int(float(r[6]) * 1000) if r[6] else None,
-                "pasajeros":   r[7] if r[7] else None,
-            }
-            opciones.append(op)
-
-        return jsonify({"opciones": opciones})
-    except Exception as e:
-        import traceback
-        print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/retefuente/buscar", methods=["GET"])
-def retefuente_buscar():
-    """
-    Busca opciones de retefuente según marca, clase, carroceria y modelo.
-    Devuelve lista de opciones para que el usuario elija.
-    """
-    marca      = request.args.get("marca", "").strip().upper()
-    linea      = request.args.get("linea", "").strip().upper()
-    clase      = request.args.get("clase", "").strip().upper()
-    carroceria = request.args.get("carroceria", "").strip().upper()
-    modelo     = request.args.get("modelo", "").strip()
-    cilindraje = request.args.get("cilindraje", "0").strip()
-
-    if not marca or not clase or not modelo:
-        return jsonify({"error": "Debes enviar marca, clase y modelo."}), 400
-
-    tabla = _tabla_retefuente(clase, carroceria, request.args.get('capacidad',''))
-    if not tabla:
-        return jsonify({"error": f"Clase '{clase}' no tiene tabla de retefuente."}), 400
-
-    col_anio = _col_anio(modelo)
-
-    try:
-        conn = get_db_conn()
-        cur  = conn.cursor()
-
-        # Cilindraje del vehículo para filtrar — mostrar desde (cilindraje - 100) hacia arriba
-        try:
-            cil_vehiculo = int(cilindraje) if cilindraje else 0
-        except:
-            cil_vehiculo = 0
-        cil_min = max(0, cil_vehiculo - 50) if cil_vehiculo > 0 else 0
-
-        # Función auxiliar para construir query con filtro cilindraje
-        def query_retefuente(where_extra, params_extra, cil_desde, limite=8):
-            cil_cond = f"AND cilindraje >= {cil_desde}" if cil_desde > 0 else ""
-            order = f"CASE WHEN cilindraje >= {cil_vehiculo} THEN cilindraje ELSE cilindraje + 999999 END, linea"
-            sql = f"""
-                SELECT id, marca, linea, cilindraje, {col_anio} as avaluo
-                FROM retefuente_2026
-                WHERE tabla = %s AND marca = %s {where_extra} {cil_cond} AND {col_anio} > 0
-                ORDER BY {order}
-                LIMIT {limite}
-            """
-            cur.execute(sql, [tabla, marca] + params_extra)
-            return cur.fetchall()
-
-        # Buscar solo cilindraje >= vehiculo (exacto o superior)
-        rows = []
-        palabras = [p for p in linea.split() if len(p) > 2][:3]
-
-        # 1. Con palabras de la línea + cilindraje >= vehiculo
-        if palabras and linea:
-            like_conds = " AND ".join(["linea ILIKE %s" for _ in palabras])
-            rows = query_retefuente(f"AND {like_conds}", [f'%{p}%' for p in palabras], cil_vehiculo)
-
-        # 2. Línea base estándar + cilindraje >= vehiculo
-        if not rows:
-            rows = query_retefuente(
-                "AND (linea ILIKE %s OR linea ILIKE %s)",
-                ['%LINEA BASE%', '%BASE ESTANDAR%'], cil_vehiculo
-            )
-
-        # 3. Todas las líneas de esa marca + cilindraje >= vehiculo
-        if not rows:
-            rows = query_retefuente("", [], cil_vehiculo)
-
-        cur.close()
-        conn.close()
-
-        opciones = [{
-            "id":         r[0],
-            "marca":      r[1],
-            "linea":      r[2],
-            "cilindraje": r[3],
-            "avaluo":     r[4],
-            "retefuente": round(r[4] / 100) if r[4] else 0
-        } for r in rows]
-
-        return jsonify({
-            "tabla":   tabla,
-            "col_anio": col_anio,
-            "opciones": opciones,
-            "total":   len(opciones)
-        })
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/retefuente/marcas", methods=["GET"])
-def retefuente_marcas():
-    """Devuelve lista de marcas disponibles para una tabla."""
-    clase      = request.args.get("clase", "").strip().upper()
-    carroceria = request.args.get("carroceria", "").strip().upper()
-    tabla = _tabla_retefuente(clase, carroceria, request.args.get('capacidad',''))
-    if not tabla:
-        return jsonify({"error": "Clase no reconocida"}), 400
-    try:
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        cur.execute("SELECT DISTINCT marca FROM retefuente_2026 WHERE tabla=%s ORDER BY marca", (tabla,))
-        marcas = [r[0] for r in cur.fetchall()]
-        cur.close(); conn.close()
-        return jsonify({"marcas": marcas})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/tramites/filtros", methods=["GET"])
-def tramites_filtros():
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        campo        = request.args.get("campo", "")
-        departamento = request.args.get("departamento", "").strip().upper()
-        municipio    = request.args.get("municipio", "").strip().upper()
-        clase        = request.args.get("clase", "").strip().upper()
-        if campo == "departamento" and municipio:
-            cur.execute("SELECT DISTINCT departamento FROM tramites_transito WHERE municipio=%s ORDER BY departamento LIMIT 1", (municipio,))
-        elif campo == "departamento":
-            cur.execute("SELECT DISTINCT departamento FROM tramites_transito ORDER BY departamento")
-        elif campo == "municipio" and departamento:
-            cur.execute("SELECT DISTINCT municipio FROM tramites_transito WHERE departamento=%s ORDER BY municipio", (departamento,))
-        elif campo == "municipio" and not departamento:
-            cur.execute("SELECT DISTINCT municipio FROM tramites_transito ORDER BY municipio")
-        elif campo == "clase" and municipio:
-            cur.execute("SELECT DISTINCT clase FROM tramites_transito WHERE municipio=%s ORDER BY clase", (municipio,))
-        elif campo == "tramite" and municipio and clase:
-            cur.execute("SELECT DISTINCT tramite FROM tramites_transito WHERE municipio=%s AND clase=%s ORDER BY tramite", (municipio, clase))
-        else:
-            cur.close(); conn.close()
-            return jsonify({"error": "Parametros insuficientes"}), 400
-        valores = [row[0] for row in cur.fetchall()]
-        cur.close(); conn.close()
-        return jsonify({"valores": valores})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/tramites/precio", methods=["GET"])
-def tramites_precio():
-    departamento = request.args.get("departamento", "").strip().upper()
-    municipio    = request.args.get("municipio", "").strip().upper()
-    clase        = request.args.get("clase", "").strip().upper()
-    tramite      = request.args.get("tramite", "").strip().upper()
-    if not all([departamento, municipio, clase, tramite]):
-        return jsonify({"error": "Debes enviar departamento, municipio, clase y tramite"}), 400
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT precio FROM tramites_transito WHERE departamento=%s AND municipio=%s AND clase=%s AND tramite=%s LIMIT 1", (departamento, municipio, clase, tramite))
-        row = cur.fetchone()
-        cur.close(); conn.close()
-        if row:
-            return jsonify({"departamento": departamento, "municipio": municipio, "clase": clase, "tramite": tramite, "precio": row[0]})
-        return jsonify({"error": "No se encontro el tramite"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ============ SOAT ============
-
-@app.route("/soat/clases", methods=["GET"])
-def soat_clases():
-    """Devuelve las clases de vehiculo disponibles, en orden de tarifa (1-9)."""
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT DISTINCT tarifa, clase_vehiculo FROM soat_tarifas
-            WHERE periodo = 2026 ORDER BY tarifa
-        """)
-        rows = cur.fetchall()
-        cur.close(); conn.close()
-        return jsonify([{"tarifa": r[0], "clase_vehiculo": r[1]} for r in rows])
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/soat/opciones", methods=["GET"])
-def soat_opciones():
-    """Devuelve las descripciones (cilindraje/toneladas/pasajeros) para una clase dada."""
-    clase = request.args.get("clase", "").strip().upper()
-    if not clase:
-        return jsonify({"error": "Debes enviar clase"}), 400
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT DISTINCT codigo, descripcion FROM soat_tarifas
-            WHERE periodo = 2026 AND clase_vehiculo = %s ORDER BY codigo
-        """, (clase,))
-        rows = cur.fetchall()
-        cur.close(); conn.close()
-        return jsonify([{"codigo": r[0], "descripcion": r[1]} for r in rows])
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/soat/modelos", methods=["GET"])
-def soat_modelos():
-    """Devuelve los rangos de modelo disponibles (si aplica) para clase+descripcion."""
-    clase       = request.args.get("clase", "").strip().upper()
-    descripcion = request.args.get("descripcion", "").strip()
-    if not clase or not descripcion:
-        return jsonify({"error": "Debes enviar clase y descripcion"}), 400
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT DISTINCT codigo, modelo FROM soat_tarifas
-            WHERE periodo = 2026 AND clase_vehiculo = %s AND descripcion = %s
-            ORDER BY codigo
-        """, (clase, descripcion))
-        rows = cur.fetchall()
-        cur.close(); conn.close()
-        return jsonify([{"codigo": r[0], "modelo": r[1]} for r in rows])
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/soat/precio", methods=["GET"])
-def soat_precio():
-    """Precio final. 'codigo' es suficiente si ya se conoce (mas directo),
-    o se puede armar con clase+descripcion+modelo."""
-    codigo = request.args.get("codigo", "").strip()
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        if codigo:
-            cur.execute("SELECT clase_vehiculo, descripcion, modelo, valor FROM soat_tarifas WHERE periodo=2026 AND codigo=%s", (codigo,))
-        else:
-            clase       = request.args.get("clase", "").strip().upper()
-            descripcion = request.args.get("descripcion", "").strip()
-            modelo      = request.args.get("modelo", "").strip()
-            if not clase:
-                return jsonify({"error": "Debes enviar codigo, o al menos clase"}), 400
-            if descripcion and modelo:
-                cur.execute("SELECT clase_vehiculo, descripcion, modelo, valor FROM soat_tarifas WHERE periodo=2026 AND clase_vehiculo=%s AND descripcion=%s AND modelo=%s", (clase, descripcion, modelo))
-            elif descripcion:
-                cur.execute("SELECT clase_vehiculo, descripcion, modelo, valor FROM soat_tarifas WHERE periodo=2026 AND clase_vehiculo=%s AND descripcion=%s", (clase, descripcion))
-            else:
-                cur.execute("SELECT clase_vehiculo, descripcion, modelo, valor FROM soat_tarifas WHERE periodo=2026 AND clase_vehiculo=%s", (clase,))
-        row = cur.fetchone()
-        cur.close(); conn.close()
-        if row:
-            return jsonify({"clase_vehiculo": row[0], "descripcion": row[1], "modelo": row[2], "valor": row[3]})
-        return jsonify({"error": "No se encontro tarifa SOAT para esos criterios"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ============ TECNOMECANICA ============
-
-@app.route("/tecnomecanica/categorias", methods=["GET"])
-def tecnomecanica_categorias():
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT categoria, valor FROM tecnomecanica_tarifas WHERE periodo = 2026 ORDER BY id")
-        rows = cur.fetchall()
-        cur.close(); conn.close()
-        return jsonify([{"categoria": r[0], "valor": r[1]} for r in rows])
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/tecnomecanica/precio", methods=["GET"])
-def tecnomecanica_precio():
-    categoria = request.args.get("categoria", "").strip()
-    if not categoria:
-        return jsonify({"error": "Debes enviar categoria"}), 400
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT valor FROM tecnomecanica_tarifas WHERE periodo = 2026 AND categoria = %s", (categoria,))
-        row = cur.fetchone()
-        cur.close(); conn.close()
-        if row:
-            return jsonify({"categoria": categoria, "valor": row[0]})
-        return jsonify({"error": "No se encontro esa categoria"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ============ COMPARENDOS ============
-
-@app.route("/comparendos/buscar", methods=["GET"])
-def comparendos_buscar():
-    """Busca por codigo exacto o por palabra clave dentro de la descripcion."""
-    q = request.args.get("q", "").strip()
-    if not q or len(q) < 2:
-        return jsonify([])
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT codigo, descripcion, valor, valor_desc_50, valor_desc_25 FROM comparendos_tarifas
-            WHERE periodo = 2026 AND (codigo ILIKE %s OR descripcion ILIKE %s)
-            ORDER BY codigo LIMIT 20
-        """, (f"{q}%", f"%{q}%"))
-        rows = cur.fetchall()
-        cur.close(); conn.close()
-        return jsonify([{"codigo": r[0], "descripcion": r[1], "valor": r[2], "valor_desc_50": r[3], "valor_desc_25": r[4]} for r in rows])
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/comparendos/precio", methods=["GET"])
-def comparendos_precio():
-    codigo = request.args.get("codigo", "").strip().upper()
-    if not codigo:
-        return jsonify({"error": "Debes enviar codigo"}), 400
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT descripcion, valor, valor_desc_50, valor_desc_25 FROM comparendos_tarifas WHERE periodo = 2026 AND codigo = %s", (codigo,))
-        row = cur.fetchone()
-        cur.close(); conn.close()
-        if row:
-            return jsonify({"codigo": codigo, "descripcion": row[0], "valor": row[1], "valor_desc_50": row[2], "valor_desc_25": row[3]})
-        return jsonify({"error": "No se encontro esa infraccion"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/reportar", methods=["POST"])
-def reportar():
-    try:
-        data      = request.get_json()
-        tipo      = data.get("tipo", "").strip()
-        comentario = data.get("comentario", "").strip()
-        placa     = data.get("placa", "").strip().upper()
-        municipio = data.get("municipio", "").strip().upper()
-        pagina    = data.get("pagina", "").strip()
-        if not tipo:
-            return jsonify({"ok": False, "error": "Tipo requerido"}), 400
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        cur.execute("""
-            INSERT INTO reportes_usuarios (tipo, comentario, placa, municipio, pagina)
-            VALUES (%s, %s, %s, %s, %s)
-        """, (tipo, comentario, placa, municipio, pagina))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/reportar/lista", methods=["GET"])
-def reportar_lista():
-    try:
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        cur.execute("""
-            SELECT id, tipo, comentario, placa, municipio, pagina, creado_en
-            FROM reportes_usuarios
-            ORDER BY creado_en DESC
-            LIMIT 100
-        """)
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        return jsonify({"reportes": [{
-            "id": r[0], "tipo": r[1], "comentario": r[2],
-            "placa": r[3], "municipio": r[4], "pagina": r[5],
-            "fecha": str(r[6])
-        } for r in rows]})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/reportar/eliminar/<int:reporte_id>", methods=["DELETE"])
-def reportar_eliminar(reporte_id):
-    try:
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        cur.execute("DELETE FROM reportes_usuarios WHERE id = %s", (reporte_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-
-
-
-@app.route("/ocr-tarjeta", methods=["POST"])
-def ocr_tarjeta():
-    try:
-        data = request.get_json()
-        if not data or "imagen" not in data:
-            return jsonify({"error": "No se recibio imagen"}), 400
-
-        def preparar_archivo(img_data):
-            es_pdf = "data:application/pdf" in img_data
-            media_type = "application/pdf" if es_pdf else "image/jpeg"
-            if not es_pdf:
-                if "data:image/png" in img_data:
-                    media_type = "image/png"
-                elif "data:image/webp" in img_data:
-                    media_type = "image/webp"
-            if "," in img_data:
-                img_data = img_data.split(",")[1]
-            if es_pdf:
-                return {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": img_data}}
-            return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_data}}
-
-        # Puede venir un solo archivo (imagen o PDF con ambas caras), o dos
-        # archivos separados (ej: foto de la cara frontal + foto de la cara
-        # trasera, subidas por separado). Ambos se envian juntos a Claude.
-        archivos_content = [preparar_archivo(data["imagen"])]
-        if data.get("imagen2"):
-            archivos_content.append(preparar_archivo(data["imagen2"]))
-
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not anthropic_key:
-            return jsonify({"error": "API Key de Anthropic no configurada"}), 500
-
-        response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-opus-4-5", "max_tokens": 600, "messages": [{"role": "user", "content": archivos_content + [
-                {"type": "text", "text": "Eres un experto en leer tarjetas/licencias de tránsito y documentos de impuestos vehiculares de Colombia. Puedes recibir UNO o DOS archivos (imagenes y/o PDFs): si recibes dos, son la cara frontal y la cara trasera de la MISMA tarjeta, subidas por separado — analiza ambos como si fueran las dos caras de un mismo documento. Cada archivo puede incluir SOLO la cara frontal, SOLO la cara trasera, o AMBAS caras. Los archivos pueden estar rotados o de lado (esto es MUY comun en fotos, especialmente de la cara trasera) — gira mentalmente el texto para leerlo sin importar su orientacion. Analiza TODOS los caracteres con mucho cuidado especialmente los numeros. Extrae: 1. PLACA (exactamente 3 letras + 3 numeros, verifica cada caracter) 2. MARCA del vehiculo 3. LINEA del vehiculo 4. MODELO (anno 4 digitos) 5. CLASE (automovil, motocicleta, campero, camioneta, etc) 6. SERVICIO (particular, publico, oficial) 7. CAPACIDAD (numero de pasajeros o carga) 8. CILINDRADA (numero en cc) 9. TIPO_DOCUMENTO (uno de: C.C, NIT, P.P.T, T.I, R.C - aparece debajo de IDENTIFICACION al lado izquierdo del numero) 10. CEDULA (numero de identificacion, verifica TODOS los digitos uno por uno, no omitas ninguno) 11. NOMBRE_COMPLETO del propietario: la tarjeta suele tener dos campos separados, 'APELLIDOS' y 'NOMBRES' -- combina AMBOS en un solo texto (ej. si dice Apellidos: GARCIA PEREZ y Nombres: JUAN CARLOS, responde 'GARCIA PEREZ JUAN CARLOS'). Si solo encuentras un campo con el nombre completo ya junto, cópialo tal cual. Nunca dejes fuera los nombres de pila, solo los apellidos no es una respuesta completa. 12. MUNICIPIO: este dato SOLO aparece en la cara TRASERA. Hay dos formatos posibles, busca cualquiera de los dos: (a) un campo llamado 'MUNICIPIO DE MATRICULA' (o similar, ej. 'Municipio Matricula') — en este caso el valor de ese campo ES DIRECTAMENTE el nombre del municipio, cópialo tal cual. (b) un campo llamado 'ORGANISMO DE TRANSITO', que casi siempre viene ABREVIADO de forma variable, por ejemplo 'STRIA TTEYTTO ENVIGADO' o 'STRIA DE TTOYTTE MEDELLIN' — ambos significan 'Secretaria de Transito y Transporte de <MUNICIPIO>'. El patron general es: unas siglas abreviadas de 'Secretaria de Transito y Transporte' seguidas del NOMBRE DEL MUNICIPIO al final del texto. En este caso extrae SOLAMENTE el nombre del municipio (la ultima palabra o palabras), sin ninguna de las siglas ni abreviaturas que la preceden. Si la cara trasera no esta visible en ninguno de los archivos, deja este campo vacio, NO lo inventes ni lo asumas. 13. LIMITACION_PROPIEDAD: este dato tambien esta SOLO en la cara TRASERA. SOLO debes responder algo distinto de vacio si encuentras EXACTAMENTE uno de estos dos patrones — si no encuentras ninguno de los dos (por ejemplo la cara trasera no esta visible, o esta borrosa, o no aparece ninguno de estos campos), deja el valor VACIO, NUNCA asumas ni adivines: (a) un campo llamado 'LIMITACION A LA PROPIEDAD' — debajo de ese titulo puede aparecer una serie de ASTERISCOS (ej: '******'), lo que significa que el vehiculo NO tiene ningun gravamen (responde 'NINGUNA', nunca copies los asteriscos tal cual); o puede aparecer el nombre de una persona natural o juridica (ej: 'PRENDA - BANCO FINANDINA', 'PRENDA - BANCO DE OCCIDENTE'), lo que significa que SI tiene gravamen (copia el valor completo tal cual aparece). (b) un campo llamado 'GRAVAMENES A LA PROPIEDAD' con una respuesta directa 'SI' o 'NO' — si dice 'SI' responde 'SI' (tiene gravamen), si dice 'NO' responde 'NINGUNA' (no tiene gravamen). Recuerda: si no ves con claridad ninguno de estos dos campos, deja limitacion_propiedad vacio — es preferible dejarlo vacio a arriesgarte a decir que no tiene gravamen cuando en realidad no pudiste verificarlo. 14. ES_DECLARACION_ANTIOQUIA: true SOLO si alguno de los archivos es un documento titulado 'DECLARACION SUGERIDA DE IMPUESTOS SOBRE VEHICULOS AUTOMOTORES' emitido por la Gobernacion de Antioquia. Si es asi, todos los campos 1-13 de arriba se extraen IGUAL (los mismos datos existen en este documento, solo que organizados en casillas tipo D.1 PLACA, D.2 MARCA, C.1 NOMBRE, C.3 APELLIDOS, etc en vez del formato de tarjeta -- usa tu criterio para ubicarlos ahi). Ademas: (a) el SERVICIO de este vehiculo SIEMPRE es 'PARTICULAR' (este tipo de documento solo se emite para vehiculos particulares), pon SERVICIO='PARTICULAR' sin importar lo que digan otros campos. (b) DECLARACION_VIGENCIA: el año de la vigencia que se esta declarando/pagando, normalmente aparece en la zona superior izquierda del documento (ej: 'Vigencia 2026' o similar — copia solo el numero de 4 digitos del año). (c) DECLARACION_PAGADO: true si el documento tiene un SELLO DE BANCO O ENTIDAD FINANCIERA que indique que fue pagado (busca sellos, timbres, o textos como 'PAGADO', 'RECIBIDO', nombre de un banco estampado, codigos de transaccion bancaria, etc). false si no hay ningun sello o indicio de pago. (d) DECLARACION_AVALUO: el valor de la casilla '1. AVALUO COMERCIAL DEL VEHICULO' (solo el numero, sin simbolos de moneda ni puntos de miles). (e) DECLARACION_CAJA: la sigla junto a la casilla 'CAJA' (ej MT, AT, CVT). (f) DECLARACION_TRACCION: el valor junto a 'TRACCION' o 'COMBUSTION/TRACCION' (ej 4X2, 4X4). (g) DECLARACION_CELULAR: casilla C.4 (CELULAR). (h) DECLARACION_EMAIL: casilla C.6 (E-MAIL). (i) DECLARACION_DIRECCION: casilla C.7 (DIRECCION). (j) DECLARACION_IMPUESTO: el valor de la casilla '2. IMPUESTO SOBRE VEHICULOS AUTOMOTORES' (solo el numero). (k) DECLARACION_SANCIONES: el valor de la casilla '3. MAS SANCIONES' (solo el numero). (l) DECLARACION_TOTAL_PAGAR: el valor de la casilla '11. TOTAL A PAGAR' (solo el numero). Si alguno de estos campos adicionales (e-l) no es visible, deja ese campo vacio, NUNCA lo inventes. Si el archivo NO es este tipo de documento, deja ES_DECLARACION_ANTIOQUIA en false y los demas campos de declaracion vacios. Responde SOLO en JSON sin explicaciones: {\"placa\": \"\", \"marca\": \"\", \"linea\": \"\", \"modelo\": \"\", \"clase\": \"\", \"servicio\": \"\", \"capacidad\": \"\", \"cilindrada\": \"\", \"carroceria\": \"\", \"tipo_documento\": \"\", \"cedula\": \"\", \"apellidos\": \"\", \"municipio\": \"\", \"limitacion_propiedad\": \"\", \"es_declaracion_antioquia\": false, \"declaracion_vigencia\": \"\", \"declaracion_pagado\": false, \"declaracion_avaluo\": \"\", \"declaracion_caja\": \"\", \"declaracion_traccion\": \"\", \"declaracion_celular\": \"\", \"declaracion_email\": \"\", \"declaracion_direccion\": \"\", \"declaracion_impuesto\": \"\", \"declaracion_sanciones\": \"\", \"declaracion_total_pagar\": \"\"}"}
-            ]}]},
-            timeout=120
-        )
-        if response.status_code != 200:
-            return jsonify({"error": f"Error Claude API: {response.status_code}"}), 500
-        resp_data = response.json()
-        texto = resp_data["content"][0]["text"].strip()
-        import json as json_lib, re as re_module
-        texto_clean = texto.replace("```json", "").replace("```", "").strip()
-        json_match = re_module.search(r'\{[^{}]*\}', texto_clean, re_module.DOTALL)
-        if not json_match:
-            return jsonify({"error": "No se pudo parsear respuesta de Claude"}), 500
-        resultado = json_lib.loads(json_match.group())
-        placa                = resultado.get("placa", "").upper().replace(" ", "").replace("-", "")
-        marca                = resultado.get("marca", "").upper().strip()
-        linea                = resultado.get("linea", "").upper().strip()
-        modelo               = resultado.get("modelo", "").strip()
-        clase                = resultado.get("clase", "").upper().strip()
-        servicio             = resultado.get("servicio", "").upper().strip()
-        capacidad            = resultado.get("capacidad", "").strip()
-        cilindrada           = resultado.get("cilindrada", "").strip()
-        carroceria           = resultado.get("carroceria", "").upper().strip()
-        tipo_documento       = resultado.get("tipo_documento", "").upper().strip()
-        cedula               = resultado.get("cedula", "").strip()
-        apellidos            = resultado.get("apellidos", "").upper().strip()
-        municipio            = resultado.get("municipio", "").upper().strip()
-        limitacion_propiedad = resultado.get("limitacion_propiedad", "").strip()
-
-        # Declaración Sugerida de Impuestos sobre Vehículos Automotores (Gobernación de Antioquia)
-        es_declaracion_antioquia = bool(resultado.get("es_declaracion_antioquia"))
-        paz_salvo_detectado = False
-        declaracion_extra = {}
-        if es_declaracion_antioquia:
-            # 1. Este tipo de documento solo se emite para vehiculos particulares
-            servicio = "PARTICULAR"
-
-            # 2. Si tiene sello de pago Y la vigencia es el año actual -> paz y salvo
-            declaracion_pagado = bool(resultado.get("declaracion_pagado"))
-            declaracion_vigencia_raw = str(resultado.get("declaracion_vigencia", "")).strip()
-            declaracion_avaluo_raw = str(resultado.get("declaracion_avaluo", "")).strip()
-            anio_actual = datetime.now().year  # siempre el año actual real, nunca fijo
-
-            try:
-                declaracion_vigencia = int(re.sub(r"[^\d]", "", declaracion_vigencia_raw)) if declaracion_vigencia_raw else 0
-            except ValueError:
-                declaracion_vigencia = 0
-            try:
-                declaracion_avaluo = int(re.sub(r"[^\d]", "", declaracion_avaluo_raw)) if declaracion_avaluo_raw else 0
-            except ValueError:
-                declaracion_avaluo = 0
-
-            if declaracion_pagado and declaracion_vigencia == anio_actual and placa and declaracion_avaluo > 0:
-                cache_antioquia_guardar_paz_salvo(placa, declaracion_avaluo, {})
-                paz_salvo_detectado = True
-
-            # 3. Campos adicionales que solo trae este tipo de documento -- se
-            # devuelven al frontend por si se quieren usar para prellenar
-            # otros formularios (ej. la Declaracion Manual).
-            def _num_declaracion(campo):
-                crudo = str(resultado.get(campo, "")).strip()
-                try:
-                    return int(re.sub(r"[^\d]", "", crudo)) if crudo else 0
-                except ValueError:
-                    return 0
-
-            declaracion_extra = {
-                "vigencia": declaracion_vigencia,
-                "pagado": declaracion_pagado,
-                "avaluo": declaracion_avaluo,
-                "caja": str(resultado.get("declaracion_caja", "")).upper().strip(),
-                "traccion": str(resultado.get("declaracion_traccion", "")).upper().strip(),
-                "celular": str(resultado.get("declaracion_celular", "")).strip(),
-                "email": str(resultado.get("declaracion_email", "")).strip(),
-                "direccion": str(resultado.get("declaracion_direccion", "")).strip(),
-                "impuesto": _num_declaracion("declaracion_impuesto"),
-                "sanciones": _num_declaracion("declaracion_sanciones"),
-                "total_pagar": _num_declaracion("declaracion_total_pagar"),
-            }
-
-        return jsonify({"placa": placa, "marca": marca, "linea": linea, "modelo": modelo, "clase": clase, "servicio": servicio, "capacidad": capacidad, "cilindrada": cilindrada, "carroceria": carroceria, "tipo_documento": tipo_documento, "cedula": cedula, "apellidos": apellidos, "municipio": municipio, "limitacion_propiedad": limitacion_propiedad, "paz_salvo_antioquia_detectado": paz_salvo_detectado, "es_declaracion_antioquia": es_declaracion_antioquia, "declaracion": declaracion_extra, "desde_cache": False})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/ocr-runt-texto", methods=["POST"])
-def ocr_runt_texto():
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "No se recibieron datos"}), 400
-        texto_placa  = (data.get("texto_placa") or "").strip()
-        texto_cedula = (data.get("texto_cedula") or "").strip()
-        if not texto_placa and not texto_cedula:
-            return jsonify({"error": "Debes pegar al menos un texto"}), 400
-
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not anthropic_key:
-            return jsonify({"error": "API Key de Anthropic no configurada"}), 500
-
-        texto_combinado = ""
-        if texto_placa:
-            texto_combinado += "=== TEXTO COPIADO DEL RUNT — CONSULTA POR PLACA (datos del VEHICULO) ===\n" + texto_placa + "\n\n"
-        if texto_cedula:
-            texto_combinado += "=== TEXTO COPIADO DEL RUNT — CONSULTA POR CEDULA (datos del PROPIETARIO/CONDUCTOR) ===\n" + texto_cedula
-
-        prompt = (
-            "Eres un experto en interpretar texto copiado y pegado directamente del portal RUNT "
-            "(Registro Unico Nacional de Transito de Colombia). Te voy a dar el texto plano que un "
-            "usuario copio de la pagina de resultados del RUNT — puede ser de una consulta por PLACA "
-            "(trae datos del vehiculo), por CEDULA (trae datos del propietario/conductor), o ambas. "
-            "El texto puede venir desordenado, con saltos de linea irregulares, o con texto de menus/"
-            "botones de la pagina mezclado — ignora ese ruido y concentrate en los datos reales. "
-            "Extrae los siguientes datos si estan presentes en cualquiera de los dos textos: "
-            "1. PLACA 2. MARCA 3. LINEA 4. MODELO (año) 5. CLASE 6. SERVICIO 7. CAPACIDAD "
-            "8. CILINDRADA (cc) 9. TIPO_DOCUMENTO (C.C, NIT, C.E, T.I, R.C, P.P.T) "
-            "10. CEDULA (numero de identificacion del propietario) 11. APELLIDOS (y nombres) del "
-            "propietario 12. MUNICIPIO: hay dos formatos posibles, busca cualquiera de los dos: "
-            "(a) un campo llamado 'MUNICIPIO DE MATRICULA' (o similar, ej. 'Municipio Matricula') — en "
-            "este caso el valor de ese campo ES DIRECTAMENTE el nombre del municipio, cópialo tal cual. "
-            "(b) un campo llamado 'Organismo de Transito' u 'Organismo de Transito Matricula', casi "
-            "siempre ABREVIADO de forma variable, por ejemplo "
-            "'STRIA TTEYTTO ENVIGADO' o 'STRIA DE TTOYTTE MEDELLIN' — ambos significan 'Secretaria de "
-            "Transito y Transporte de <MUNICIPIO>'. El patron general es: unas siglas abreviadas de "
-            "'Secretaria de Transito y Transporte' seguidas del NOMBRE DEL MUNICIPIO al final del texto. "
-            "En este caso extrae SOLAMENTE el nombre del municipio (la ultima palabra o palabras), sin "
-            "ninguna de las siglas ni abreviaturas que la preceden (nunca dejes 'STRIA', 'TTEYTTO', "
-            "'SRIA', 'SECRETARIA' ni similares como parte del valor). Si no aparece ese dato en el "
-            "texto, deja el campo vacio, no lo inventes. 13. LIMITACION_PROPIEDAD (gravamenes, prenda "
-            "a favor de alguna entidad, o 'NINGUNA' si no tiene). SOLO debes responder algo distinto de "
-            "vacio si encuentras EXACTAMENTE uno de estos dos patrones — si no encuentras ninguno, deja "
-            "el valor VACIO, nunca asumas ni adivines: (a) un campo 'Limitacion a la Propiedad' — si "
-            "aparece con una serie de asteriscos como '******', eso significa 'NINGUNA' (nunca copies "
-            "los asteriscos tal cual); si aparece el nombre de una persona o entidad, copia ese valor "
-            "tal cual (tiene gravamen). (b) un campo 'Gravamenes a la Propiedad' con respuesta directa "
-            "SI o NO — si dice SI responde 'SI' (tiene gravamen), si dice NO responde 'NINGUNA' (no "
-            "tiene gravamen). Es preferible dejarlo vacio a arriesgarte a decir que no tiene gravamen "
-            "cuando en realidad no pudiste verificarlo. Si un dato no aparece en el texto, "
-            "deja ese campo vacio, NO lo inventes ni lo asumas. Responde SOLO en JSON sin explicaciones: "
-            "{\"placa\": \"\", \"marca\": \"\", \"linea\": \"\", \"modelo\": \"\", \"clase\": \"\", "
-            "\"servicio\": \"\", \"capacidad\": \"\", \"cilindrada\": \"\", \"carroceria\": \"\", "
-            "\"tipo_documento\": \"\", \"cedula\": \"\", \"apellidos\": \"\", \"municipio\": \"\", "
-            "\"limitacion_propiedad\": \"\"}\n\nTEXTO A ANALIZAR:\n" + texto_combinado
-        )
-
-        response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-opus-4-5", "max_tokens": 600, "messages": [{"role": "user", "content": prompt}]},
-            timeout=90
-        )
-        if response.status_code != 200:
-            return jsonify({"error": f"Error Claude API: {response.status_code}"}), 500
-        resp_data = response.json()
-        texto_resp = resp_data["content"][0]["text"].strip()
-        import json as json_lib, re as re_module
-        texto_clean = texto_resp.replace("```json", "").replace("```", "").strip()
-        json_match = re_module.search(r'\{[^{}]*\}', texto_clean, re_module.DOTALL)
-        if not json_match:
-            return jsonify({"error": "No se pudo parsear respuesta"}), 500
-        resultado = json_lib.loads(json_match.group())
-        placa                = resultado.get("placa", "").upper().replace(" ", "").replace("-", "")
-        marca                = resultado.get("marca", "").upper().strip()
-        linea                = resultado.get("linea", "").upper().strip()
-        modelo               = resultado.get("modelo", "").strip()
-        clase                = resultado.get("clase", "").upper().strip()
-        servicio             = resultado.get("servicio", "").upper().strip()
-        capacidad            = resultado.get("capacidad", "").strip()
-        cilindrada           = resultado.get("cilindrada", "").strip()
-        carroceria           = resultado.get("carroceria", "").upper().strip()
-        tipo_documento       = resultado.get("tipo_documento", "").upper().strip()
-        cedula               = resultado.get("cedula", "").strip()
-        apellidos            = resultado.get("apellidos", "").upper().strip()
-        municipio            = resultado.get("municipio", "").upper().strip()
-        limitacion_propiedad = resultado.get("limitacion_propiedad", "").strip()
-        return jsonify({"placa": placa, "marca": marca, "linea": linea, "modelo": modelo, "clase": clase, "servicio": servicio, "capacidad": capacidad, "cilindrada": cilindrada, "carroceria": carroceria, "tipo_documento": tipo_documento, "cedula": cedula, "apellidos": apellidos, "municipio": municipio, "limitacion_propiedad": limitacion_propiedad})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/ocr-guardar-municipio", methods=["POST"])
-def ocr_guardar_municipio():
-    try:
-        data      = request.get_json()
-        placa     = data.get("placa", "").upper().strip()
-        municipio = data.get("municipio", "").upper().strip()
-        if not placa or not municipio:
-            return jsonify({"ok": False}), 400
-        conn = get_db_conn()
-        cur  = conn.cursor()
-        cur.execute("UPDATE cache_tarjetas SET municipio=%s, actualizado_en=NOW() WHERE placa=%s", (municipio, placa))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-
-# ============================================================
-# SIBGA — Avalúos motos bajo cilindraje (≤125cc)
-# Datos en tabla retefuente_bajocilindraje
-# ============================================================
-
-SIBGA_PERIODO = 2024
-
-def _sibga_col_anio(modelo):
-    try:
-        anio = int(str(modelo).strip())
-    except:
-        return "anio_2001_ant"
-    if anio <= 2001: return "anio_2001_ant"
-    if anio > 2024:  return "anio_2024"
-    return f"anio_{anio}"
-
-
-@app.route("/sibga/marcas", methods=["GET"])
-def sibga_marcas():
-    """Marcas de motos bajo cilindraje desde BD."""
-    try:
-        conn = get_db_conn(); cur = conn.cursor()
-        cur.execute("""
-            SELECT DISTINCT marca FROM retefuente_bajocilindraje
-            WHERE cilindraje <= 125 AND cilindraje > 0
-            ORDER BY marca
-        """)
-        rows = cur.fetchall(); cur.close(); conn.close()
-        return jsonify({"marcas": [r[0] for r in rows]})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/sibga/lineas", methods=["GET"])
-def sibga_lineas():
-    """Líneas de una marca desde BD."""
-    marca = request.args.get("marca", "").upper().strip()
-    if not marca:
-        return jsonify({"error": "marca requerida"}), 400
-    try:
-        conn = get_db_conn(); cur = conn.cursor()
-        cur.execute("""
-            SELECT DISTINCT linea_id, linea FROM retefuente_bajocilindraje
-            WHERE marca=%s AND cilindraje <= 125 AND cilindraje > 0
-            ORDER BY linea
-        """, (marca,))
-        rows = cur.fetchall(); cur.close(); conn.close()
-        return jsonify({"lineas": [{"id": r[0], "nombre": r[1]} for r in rows]})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/sibga/avaluo", methods=["GET"])
-def sibga_avaluo():
-    """Avalúo de moto bajo cilindraje desde BD."""
-    linea_id = request.args.get("linea_id", type=int)
-    modelo   = request.args.get("modelo", type=int)
-    if not linea_id or not modelo:
-        return jsonify({"error": "linea_id y modelo requeridos"}), 400
-
-    col_anio = _sibga_col_anio(modelo)
-
-    try:
-        conn = get_db_conn(); cur = conn.cursor()
-        cur.execute(f"""
-            SELECT {col_anio}, linea, cilindraje, marca
-            FROM retefuente_bajocilindraje
-            WHERE linea_id=%s
-        """, (linea_id,))
-        row = cur.fetchone(); cur.close(); conn.close()
-
-        if not row or not row[0]:
-            return jsonify({"error": "No se encontró avalúo para esa línea y modelo"}), 404
-
-        return jsonify({
-            "avaluo":     row[0],
-            "linea":      row[1],
-            "cilindraje": row[2],
-            "marca":      row[3],
-            "modelo":     modelo,
-            "periodo":    SIBGA_PERIODO,
-            "fuente":     "bd"
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/sibga/opciones", methods=["GET"])
-def sibga_opciones():
-    """Devuelve opciones de avalúo para motos bajo cilindraje — igual que retefuente/opciones."""
-    marca  = request.args.get("marca", "").strip().upper()
-    linea  = request.args.get("linea", "").strip().upper()
-    modelo = request.args.get("modelo", type=int, default=2020)
-    if not marca:
-        return jsonify({"error": "marca requerida"}), 400
-
-    col_anio = _sibga_col_anio(modelo)
-
-    try:
-        conn = get_db_conn(); cur = conn.cursor()
-
-        # Buscar por marca + palabras de la línea
-        cil_sibga = int(re.sub(r'[^0-9]', '', request.args.get('cilindraje','0') or '0') or 0)
-        where  = ["marca = %s", f"{col_anio} > 0", "cilindraje <= 125", "cilindraje > 0"]
-        params = [marca]
-
-        if linea:
-            # Separar letras y números pegados: AK125 -> AK 125
-            linea_sep = re.sub(r'([A-Za-z])(\d)', r'\1 \2', linea)
-            linea_sep = re.sub(r'(\d)([A-Za-z])', r'\1 \2', linea_sep)
-            palabras = [p for p in linea_sep.split() if len(p) > 1][:5]
-            if palabras:
-                or_conds = []
-                for p in palabras:
-                    or_conds.append("REPLACE(linea, ' ', '') ILIKE %s")
-                    params.append(f'%{p}%')
-                where.append("(" + " OR ".join(or_conds) + ")")
-
-        sql = f"""
-            SELECT linea_id, linea, cilindraje, {col_anio} as avaluo
-            FROM retefuente_bajocilindraje
-            WHERE {' AND '.join(where)}
-            ORDER BY cilindraje ASC
-            LIMIT 200
-        """
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-
-        # Si no hay resultados con filtro de línea, buscar solo por marca
-        if not rows and linea:
-            cur.execute(f"""
-                SELECT linea_id, linea, cilindraje, {col_anio} as avaluo
-                FROM retefuente_bajocilindraje
-                WHERE marca=%s AND {col_anio} > 0 AND cilindraje <= 125 AND cilindraje > 0
-                ORDER BY cilindraje ASC
-                LIMIT 40
-            """, (marca,))
-            rows = cur.fetchall()
-
-        # Ordenar: cilindraje más cercano primero, luego mayor coincidencia con línea
-        if linea:
-            linea_sep2 = re.sub(r'([A-Za-z])(\d)', r'\1 \2', linea)
-            linea_sep2 = re.sub(r'(\d)([A-Za-z])', r'\1 \2', linea_sep2)
-            linea_words_s = [w.upper() for w in linea_sep2.split() if len(w) > 1][:5]
-        else:
-            linea_words_s = []
-        def score_sibga(r):
-            cil_r = r[2] or 0
-            cil_dist = abs(cil_r - cil_sibga) if cil_sibga > 0 else cil_r
-            linea_db_sin_esp = (r[1] or '').upper().replace(' ', '')
-            lin_score = sum(1 for w in linea_words_s if w in linea_db_sin_esp)
-            return (cil_dist, -lin_score)
-        rows = sorted(rows, key=score_sibga)[:20]
-
-        cur.close(); conn.close()
-
-        opciones = [{
-            "linea_id":   r[0],
-            "linea":      r[1],
-            "cilindraje": r[2],
-            "avaluo":     r[3],
-            "retefuente": round(r[3] / 100) if r[3] else 0,
-        } for r in rows]
-
-        return jsonify({"opciones": opciones})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(textoWA).then(confirmarCopiado).catch(function() {
+          var ta = document.createElement('textarea');
+          ta.value = textoWA;
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+          confirmarCopiado();
+        });
+      } else {
+        var ta = document.createElement('textarea');
+        ta.value = textoWA;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        confirmarCopiado();
+      }
+    }
+  };
+
+  // ── NUEVA LIQUIDACION ────────────────────────────────────────────────────
+  window.antNuevaLiquidacion = function() {
+    document.documentElement.scrollTop = 0;
+    window.location.reload();
+    return;
+    // Limpiar todo y volver al estado inicial
+    limpiarCampos();
+    antMunicipioActual = '';
+    ocrLeido = false;
+    infoConfirmada = false;
+    antAvaluo = 0;
+    antRetAvaluo = 0;
+    antRetRetefuente = 0;
+
+    // Ocultar todos los bloques excepto info
+    ['bloque-depto','bloque-municipal','bloque-tramites','bloque-retefuente'].forEach(function(id) {
+      var bl = document.getElementById(id);
+      if (bl) { bl.style.display='none'; bl.classList.remove('visible'); }
+    });
+    var blLiq = document.getElementById('bloque-liq');
+    if (blLiq) blLiq.style.cssText = 'display:none !important';
+    var blRet = document.getElementById('bloque-retefuente');
+    if (blRet) { blRet.style.display='none'; blRet.classList.remove('visible'); }
+
+    // Mostrar y expandir bloque info
+    var blInfo = document.getElementById('bloque-info');
+    if (blInfo) { blInfo.style.display='block'; blInfo.classList.add('visible'); }
+    var contInfo = document.getElementById('contenido-info');
+    if (contInfo) contInfo.style.display='block';
+    var chevInfo = document.getElementById('ant-info-chevron');
+    if (chevInfo) chevInfo.textContent = '▲';
+
+    // Mostrar bienvenida
+    document.getElementById('ant-bienvenida').style.display = 'block';
+    if (window.tramyVehiculosGuardados && window.tramyVehiculosGuardados.length) { var vp = document.getElementById('tramyVehiculosPanel'); if (vp) vp.style.display = 'block'; }
+    document.getElementById('ant-info-expandido').style.display = 'block';
+    document.getElementById('ant-info-colapsado').style.display = 'none';
+
+    // Mostrar zona OCR y botones de entrada
+    document.getElementById('ant-zona-ocr').style.display = 'block';
+    document.getElementById('ant-ocr-zone').style.display = 'block';
+    document.getElementById('ant-preview-wrap').style.display = 'none';
+    document.getElementById('ant-ocr-status').style.display = 'none';
+    var entradaBtns = document.querySelector('.ant-entrada-btns');
+    if (entradaBtns) entradaBtns.style.display = 'flex';
+
+    // Limpiar liquidacion
+    limpiarLiq();
+
+    // Ocultar placa mini
+    var placaMini = document.getElementById('ant-placa-mini');
+    if (placaMini) placaMini.style.display = 'none';
+
+    // Scroll al inicio
+    window.scrollTo({top: 0, behavior: 'smooth'});
+  };
+
+  // ── REPORTE ──────────────────────────────────────────────────────────────
+  var antReporteTipo = '';
+
+  window.antToggleReporte = function() {
+    var panel = document.getElementById('ant-reporte-panel');
+    panel.style.display = panel.style.display === 'block' ? 'none' : 'block';
+    document.getElementById('ant-reporte-ok').style.display = 'none';
+    document.getElementById('ant-reporte-texto').value = '';
+    document.querySelectorAll('.ant-reporte-opcion').forEach(function(el){ el.classList.remove('sel'); });
+    antReporteTipo = '';
+  };
+
+  window.antSelOpcion = function(el, tipo) {
+    document.querySelectorAll('.ant-reporte-opcion').forEach(function(e){ e.classList.remove('sel'); });
+    el.classList.add('sel');
+    antReporteTipo = tipo;
+  };
+
+  window.antEnviarReporte = function() {
+    if (!antReporteTipo) { alert('Selecciona qué está pasando.'); return; }
+    var comentario  = document.getElementById('ant-reporte-texto').value.trim();
+    var placaEl     = document.getElementById('ant-placa');
+    var placa       = placaEl ? placaEl.value.trim() : '';
+    var tipoGuardar = antReporteTipo; // guardar antes de resetear
+
+    // Enviar primero
+    fetch(ANT_API + '/reportar', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        tipo:       tipoGuardar,
+        comentario: comentario,
+        placa:      placa,
+        municipio:  antMunicipioActual || '',
+        pagina:     window.location.href
+      })
+    }).catch(function(){});
+
+    // Mostrar confirmación inmediatamente
+    antReporteTipo = '';
+    document.getElementById('ant-reporte-ok').style.display = 'block';
+    setTimeout(function(){
+      document.getElementById('ant-reporte-panel').style.display = 'none';
+      document.getElementById('ant-reporte-ok').style.display = 'none';
+    }, 1500);
+  };
+
+})();
+</script>
+
+</body>
+</html>
