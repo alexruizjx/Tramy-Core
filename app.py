@@ -1392,7 +1392,15 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     celda_leyenda = edc["A47"]
     edc["A48"] = celda_leyenda.value
     edc["A48"].font = copy.copy(celda_leyenda.font)
-    edc["A48"].alignment = copy.copy(celda_leyenda.alignment)
+    edc["A48"].alignment = Alignment(
+        horizontal=celda_leyenda.alignment.horizontal,
+        vertical=celda_leyenda.alignment.vertical,
+        wrapText=True
+    )
+    # Se fusiona en un ancho moderado (mas angosto que el parrafo legal de
+    # la fila 6, que va de A a BH) para que el texto, mas corto, si se
+    # vea obligado a partir en 2 lineas en vez de quedar en 1 sola.
+    edc.merge_cells("A48:AJ49")
 
     for col in range(1, 60):
         celda_origen = edc.cell(row=46, column=col)
