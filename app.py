@@ -394,13 +394,31 @@ def envigado_hay_puntos_disponibles():
                 # casilla de busqueda, sugiriendo que el sitio muestra los
                 # vehiculos YA REGISTRADOS a ese numero de documento para
                 # elegir de una lista, en vez de escribir la placa
-                # libremente. Se intenta: escribir la placa en la
-                # busqueda, y luego elegir la opcion que aparezca.
+                # libremente. Es OTRO Select2 (el intento de clic normal
+                # fallaba con "subtree intercepts pointer events", el
+                # mismo problema que tuvimos con el select de servicios),
+                # asi que se selecciona la opcion directo por JavaScript
+                # en vez de hacer clic en el menu visual.
                 try:
                     page.locator('input[type="search"]').first.fill(ENVIGADO_CITAS_PLACA, timeout=5000)
                     page.wait_for_timeout(1500)
-                    page.locator('#selectOtrosVehiculos option', has_text=ENVIGADO_CITAS_PLACA).first.click(timeout=5000)
-                    placa_ok = True
+                    placa_seleccionada = page.evaluate("""(placaBuscada) => {
+                        var el = document.querySelector('#selectOtrosVehiculos');
+                        if (!el) return false;
+                        for (var i = 0; i < el.options.length; i++) {
+                            if (el.options[i].text.toUpperCase().indexOf(placaBuscada) !== -1) {
+                                el.options[i].selected = true;
+                                el.dispatchEvent(new Event('change', { bubbles: true }));
+                                return el.options[i].text;
+                            }
+                        }
+                        return false;
+                    }""", ENVIGADO_CITAS_PLACA)
+                    if placa_seleccionada:
+                        print(f"Vehiculo seleccionado desde la lista: {placa_seleccionada}", flush=True)
+                        placa_ok = True
+                    else:
+                        print(f"La placa {ENVIGADO_CITAS_PLACA} no aparecio como opcion en la lista de vehiculos del documento (puede que ese documento no tenga esa placa registrada).", flush=True)
                 except Exception as e_placa_select:
                     print(f"No se pudo elegir la placa desde el selector de vehiculos: {e_placa_select}", flush=True)
 
