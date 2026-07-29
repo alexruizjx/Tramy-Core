@@ -243,6 +243,12 @@ def envigado_hay_puntos_disponibles():
     reales."""
     session = requests.Session()
     try:
+        # OJO: "paramValidar" se agrega porque el sitio real lo manda
+        # (lo vimos en una captura real: paramValidar=1844) -- sin este
+        # campo el servidor respondia con un error 500 generico. No
+        # sabemos con certeza si este valor especifico importa, o si
+        # cualquier numero sirve (podria ser solo un ID de sesion/tramite
+        # que el servidor simplemente exige que EXISTA en la peticion).
         payload_validar = [{
             "documento": None,
             "respuesta": None,
@@ -251,6 +257,7 @@ def envigado_hay_puntos_disponibles():
             "tipoDocumento": ENVIGADO_CITAS_TIPO_DOC,
             "nroDocumento": ENVIGADO_CITAS_DOCUMENTO,
             "bloqueoPermanente": False,
+            "paramValidar": 1844,
         }]
         r_val = session.post(ENVIGADO_VALIDAR_API, json=payload_validar, timeout=20)
         r_val.raise_for_status()
@@ -273,12 +280,14 @@ def envigado_revisar_citas_disponibles(dias_adelante=14):
     sola peticion, no dia por dia), y guarda el resultado en la base de
     datos. 'dias_adelante' ya no se usa para hacer mas peticiones -- se
     deja como parametro por compatibilidad con quien ya llama esta
-    funcion. Devuelve una lista de resultados: {sede, fecha, cantidad_horarios}
-    (una entrada generica si hay citas, vacia si no hay nada)."""
+    funcion. Devuelve una tupla (resultados, hubo_error):
+    - resultados: lista de {sede, fecha, cantidad_horarios}
+    - hubo_error: True si la consulta fallo por dentro (para NO
+      confundirlo con un "confirmado, sin citas ahora mismo")."""
     puntos = envigado_hay_puntos_disponibles()
     if puntos is None:
         print("Error consultando disponibilidad de citas Envigado (ver logs arriba).", flush=True)
-        return []
+        return [], True
 
     resultados = []
     conn = get_db_conn()
@@ -315,7 +324,7 @@ def envigado_revisar_citas_disponibles(dias_adelante=14):
 
     conn.commit()
     cur.close(); conn.close()
-    return resultados
+    return resultados, False
 
 
 ENVIGADO_TURNOS_API = "https://gacomponentes.envigado.gov.co/backga/back-ga/turnos/findAtencionesMonitor"
@@ -3652,7 +3661,12 @@ def envigado_citas_disponibles_endpoint():
     dias = request.args.get("dias", "14")
     dias = int(dias) if dias.isdigit() else 14
     try:
-        resultados = envigado_revisar_citas_disponibles(dias_adelante=dias)
+        resultados, hubo_error = envigado_revisar_citas_disponibles(dias_adelante=dias)
+        if hubo_error:
+            return jsonify({
+                "ok": False,
+                "error": "No se pudo completar la consulta a Envigado (falló la conexión o algún paso previo). Revisa los logs del servidor para más detalle, e intenta de nuevo."
+            }), 502
         con_citas = [r for r in resultados if r["cantidad_horarios"] > 0]
         return jsonify({
             "ok": True,
