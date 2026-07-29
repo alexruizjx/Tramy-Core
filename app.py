@@ -281,6 +281,33 @@ def envigado_hay_puntos_disponibles():
                       wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(3000)  # dar tiempo a que la app Angular termine de armarse
 
+            # DIAGNOSTICO TEMPORAL -- en vez de seguir adivinando campo por
+            # campo, se listan TODOS los <input>/<select>/<textarea> reales
+            # de la pagina de una sola vez (name, id, type, placeholder),
+            # para ajustar todos los selectores juntos. Quitar despues.
+            try:
+                campos_reales = page.evaluate("""() => {
+                    var els = document.querySelectorAll('input, select, textarea');
+                    var resultado = [];
+                    els.forEach(function(el){
+                        resultado.push({
+                            tag: el.tagName,
+                            name: el.name || null,
+                            id: el.id || null,
+                            type: el.type || null,
+                            placeholder: el.placeholder || null,
+                            visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+                        });
+                    });
+                    return resultado;
+                }""")
+                print("=== DIAGNOSTICO: campos reales del formulario ===", flush=True)
+                for c in campos_reales:
+                    print(c, flush=True)
+                print("=== FIN DIAGNOSTICO campos ===", flush=True)
+            except Exception as e_diag:
+                print(f"No se pudo listar los campos: {e_diag}", flush=True)
+
             # Tipo de documento -- CONFIRMADO por diagnostico real: es un
             # <select> nativo de AngularJS clasico, con id="tipoDocumento"
             # y name="tipoDocumento" (no un componente moderno). Se usa
