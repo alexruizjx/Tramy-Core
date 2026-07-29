@@ -327,40 +327,22 @@ def envigado_hay_puntos_disponibles():
             page.locator('input[name="nombres"]').fill(ENVIGADO_CITAS_NOMBRES, timeout=8000)
             page.locator('input[name="apellidos"]').fill(ENVIGADO_CITAS_APELLIDOS, timeout=8000)
 
-            for selector_email in ['input[name="email"]', 'input[name="correo"]']:
-                try:
-                    page.locator(selector_email).first.fill(ENVIGADO_CITAS_EMAIL, timeout=4000)
-                    break
-                except Exception:
-                    continue
-            for selector_confirmar in ['input[name="confirmarEmail"]', 'input[name="confirmarCorreo"]', 'input[name="emailConfirm"]']:
-                try:
-                    page.locator(selector_confirmar).fill(ENVIGADO_CITAS_EMAIL, timeout=4000)
-                    break
-                except Exception:
-                    continue
-
-            celular_ok = False
-            for selector_celular in ['input[name="celular"]', 'input[name="telefono"]', 'input[name="numeroCelular"]', 'input[name="celularSolicitante"]']:
-                try:
-                    page.locator(selector_celular).fill(ENVIGADO_CITAS_CELULAR, timeout=4000)
-                    celular_ok = True
-                    break
-                except Exception:
-                    continue
-            if not celular_ok:
-                print("No se pudo llenar el campo de celular con ningun selector conocido (se sigue de todas formas).", flush=True)
+            # Nombres reales confirmados por diagnostico (no eran "email"
+            # ni "celular" como se habia adivinado antes).
+            page.locator('input[name="emailSolicitante"]').fill(ENVIGADO_CITAS_EMAIL, timeout=8000)
+            page.locator('input[name="confirmarEmail"]').fill(ENVIGADO_CITAS_EMAIL, timeout=8000)
+            page.locator('input[name="phone"]').fill(ENVIGADO_CITAS_CELULAR, timeout=8000)
 
             # Seleccionar el tramite -- CONFIRMADO por diagnostico real:
-            # es un <select> envuelto en Select2 (una libreria que lo
-            # oculta visualmente y lo reemplaza por un menu propio), por
-            # eso Playwright no podia "verlo" para hacer click ni
-            # select_option normal. Se cambia el valor directo por
-            # JavaScript y se dispara el evento "change" nativo, que es
-            # lo que AngularJS espera para actualizar su modelo
-            # (ng-change="ctrl.seleccionarServicio()").
+            # el campo que el usuario realmente ve e interactua es
+            # "servicios" (visible=True) -- "tramite" es un campo
+            # SECUNDARIO/oculto (visible=False) que probablemente se
+            # sincroniza solo, seleccionarlo directamente no funcionaba.
+            # Se cambia el valor por JavaScript y se dispara el evento
+            # "change" nativo, que es lo que AngularJS espera para
+            # actualizar su modelo.
             page.evaluate("""() => {
-                var el = document.querySelector('#tramite');
+                var el = document.querySelector('#servicios');
                 if (!el) return false;
                 el.value = '90';  // "Comprador/Vendedor - Traspaso"
                 el.dispatchEvent(new Event('change', { bubbles: true }));
@@ -368,12 +350,37 @@ def envigado_hay_puntos_disponibles():
             }""")
             page.wait_for_timeout(1500)  # dar tiempo a que aparezca el campo de placa (se agrega dinamicamente)
 
+            # DIAGNOSTICO TEMPORAL -- el campo de Placa no aparecia en el
+            # listado inicial de campos, seguramente porque se agrega
+            # recien despues de elegir el tramite. Se vuelve a listar
+            # todos los campos en este punto para encontrar su nombre
+            # real, en vez de seguir adivinando. Quitar despues.
+            try:
+                campos_tras_tramite = page.evaluate("""() => {
+                    var els = document.querySelectorAll('input, select, textarea');
+                    var resultado = [];
+                    els.forEach(function(el){
+                        resultado.push({
+                            tag: el.tagName, name: el.name || null, id: el.id || null,
+                            type: el.type || null, placeholder: el.placeholder || null,
+                            visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+                        });
+                    });
+                    return resultado;
+                }""")
+                print("=== DIAGNOSTICO: campos reales DESPUES de elegir tramite ===", flush=True)
+                for c in campos_tras_tramite:
+                    print(c, flush=True)
+                print("=== FIN DIAGNOSTICO campos tras tramite ===", flush=True)
+            except Exception as e_diag2:
+                print(f"No se pudo listar los campos tras el tramite: {e_diag2}", flush=True)
+
             # El campo de Placa no aparecia en el formulario inicial --
             # probablemente se agrega recien despues de elegir el tramite.
             # Se prueban varios selectores, ya que "get_by_label" no fue
             # confiable en este formulario (AngularJS clasico).
             placa_ok = False
-            for selector_placa in ['input[name="placa"]', 'input[name="placaVehiculo"]']:
+            for selector_placa in ['input[name="placa"]', 'input[name="placaVehiculo"]', 'input#placa']:
                 try:
                     page.locator(selector_placa).fill(ENVIGADO_CITAS_PLACA, timeout=5000)
                     placa_ok = True
@@ -381,7 +388,7 @@ def envigado_hay_puntos_disponibles():
                 except Exception:
                     continue
             if not placa_ok:
-                page.get_by_label("Placa").fill(ENVIGADO_CITAS_PLACA, timeout=5000)
+                print("No se pudo llenar el campo de placa con ningun selector conocido (revisar diagnostico de arriba).", flush=True)
 
             # Boton "Agregar servicio" -- avanza al paso donde el sitio
             # consulta la disponibilidad real.
