@@ -229,67 +229,123 @@ ENVIGADO_CITAS_TIPO_DOC = "2"
 ENVIGADO_CITAS_PLACA = "RST37B"
 
 
+ENVIGADO_CITAS_NOMBRES = "TRAMY"
+ENVIGADO_CITAS_APELLIDOS = "MONITOR"
+ENVIGADO_CITAS_EMAIL = "monitor.tramy@gmail.com"
+ENVIGADO_CITAS_CELULAR = "3000000000"
+ENVIGADO_CITAS_TRAMITE_TEXTO = "Traspaso"
+
+
 def envigado_hay_puntos_disponibles():
     """Revisa si hay ALGUN punto de atencion con citas disponibles para
-    el servicio vigilado, en UNA sola peticion (mucho mas eficiente que
-    consultar dia por dia y sede por sede). Devuelve la lista cruda que
-    entrega el sitio (vacia [] si no hay nada disponible en ningun lado
-    en este momento), o None si hubo un error de conexion.
+    el servicio vigilado. Usa un NAVEGADOR REAL (Playwright) en vez de
+    peticiones HTTP directas -- se probo con peticiones directas primero
+    (replicando payload y encabezados exactos capturados de un HAR real),
+    pero el servidor seguia devolviendo error 500 solo en este endpoint
+    especifico (el mismo enfoque SI funciona para otros endpoints de
+    Envigado, como el monitor de turnos) -- lo mas probable es que este
+    endpoint en particular tenga alguna proteccion anti-bot que detecta
+    que la conexion no viene de un navegador real. Se llena el formulario
+    igual que lo haria una persona, con datos de prueba que no
+    corresponden a ningun ciudadano real, y se intercepta la respuesta de
+    getPuntosAtencionServiciosLowcode directamente de la red.
+    Devuelve la lista cruda que entrega el sitio (vacia [] si no hay nada
+    disponible en ningun lado en este momento), o None si algo fallo."""
+    resultado_capturado = {"datos": None, "capturado": False}
 
-    IMPORTANTE: antes hay que pasar por 'validarMostrarPreguntasSeguridad'
-    en la MISMA sesion (a pesar del nombre, no son preguntas de seguridad
-    reales -- solo validan documento+placa y devuelven codigo:0 para
-    poder seguir). Sin este paso previo la consulta no trae resultados
-    reales."""
-    session = requests.Session()
-    # Se replican los encabezados que manda el navegador real (capturados
-    # en un HAR real) -- el servidor de Envigado devolvia error 500 sin
-    # ellos, probablemente por validar Origin/Referer, o por dos
-    # encabezados personalizados poco comunes que su propia app agrega
-    # (href, hostname).
-    session.headers.update({
-        "Accept": "*/*",
-        "Content-Type": "application/json",
-        "Origin": "https://movilidad.envigado.gov.co",
-        "Referer": "https://movilidad.envigado.gov.co/portal-servicios/",
-        "User-Agent": "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-        "hostname": "null",
-        "href": "https://movilidad.envigado.gov.co/portal-servicios/#/public",
-    })
-    try:
-        # OJO: "paramValidar" se agrega porque el sitio real lo manda
-        # (lo vimos en una captura real: paramValidar=1844) -- sin este
-        # campo el servidor respondia con un error 500 generico. No
-        # sabemos con certeza si este valor especifico importa, o si
-        # cualquier numero sirve (podria ser solo un ID de sesion/tramite
-        # que el servidor simplemente exige que EXISTA en la peticion).
-        payload_validar = [{
-            "documento": None,
-            "respuesta": None,
-            "placa": ENVIGADO_CITAS_PLACA,
-            "homePublic": True,
-            "tipoDocumento": ENVIGADO_CITAS_TIPO_DOC,
-            "nroDocumento": ENVIGADO_CITAS_DOCUMENTO,
-            "bloqueoPermanente": False,
-            "paramValidar": 1844,
-        }]
-        r_val = session.post(ENVIGADO_VALIDAR_API, json=payload_validar, timeout=20)
-        r_val.raise_for_status()
-    except Exception as e:
-        print(f"Error validando antes de consultar citas Envigado: {e}", flush=True)
-        return None
+    def _capturar_respuesta(response):
+        if "getPuntosAtencionServiciosLowcode" in response.url:
+            try:
+                resultado_capturado["datos"] = response.json()
+                resultado_capturado["capturado"] = True
+            except Exception:
+                pass
 
-    try:
-        payload_puntos = {"idServicios": ENVIGADO_CITAS_ID_SERVICIO, "cantidadTramites": 1}
-        r_puntos = session.post(ENVIGADO_PUNTOS_API, json=payload_puntos, timeout=20)
-        r_puntos.raise_for_status()
-        return r_puntos.json()
-    except Exception as e:
-        print(f"Error consultando puntos de atencion Envigado: {e}", flush=True)
-        return None
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, args=[
+            "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+            "--single-process", "--no-zygote", "--disable-setuid-sandbox"
+        ])
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
+            viewport={"width": 390, "height": 844},
+        )
+        page = context.new_page()
+        page.on("response", _capturar_respuesta)
+
+        try:
+            page.goto("https://movilidad.envigado.gov.co/portal-servicios/#/agendar-cita-publica",
+                      wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(3000)  # dar tiempo a que la app Angular termine de armarse
+
+            # Tipo de documento -- si el campo no existe o ya viene
+            # preseleccionado, se ignora el error y se sigue.
+            for selector_tipo_doc in ['select[formcontrolname="tipoDocumento"]', 'mat-select[formcontrolname="tipoDocumento"]']:
+                try:
+                    page.select_option(selector_tipo_doc, label="Cédula de Ciudadanía", timeout=4000)
+                    break
+                except Exception:
+                    continue
+
+            page.fill('input[formcontrolname="numeroDocumento"]', ENVIGADO_CITAS_DOCUMENTO, timeout=10000)
+            page.fill('input[formcontrolname="nombres"]', ENVIGADO_CITAS_NOMBRES, timeout=8000)
+            page.fill('input[formcontrolname="apellidos"]', ENVIGADO_CITAS_APELLIDOS, timeout=8000)
+            page.fill('input[formcontrolname="email"]', ENVIGADO_CITAS_EMAIL, timeout=8000)
+
+            # "Confirmar correo" -- el nombre exacto del campo puede variar
+            # segun la version del formulario, se prueban varios.
+            for selector_confirmar in [
+                'input[formcontrolname="confirmarEmail"]', 'input[formcontrolname="emailConfirm"]',
+                'input[formcontrolname="confirmEmail"]', 'input[formcontrolname="confirmarCorreo"]',
+            ]:
+                try:
+                    page.fill(selector_confirmar, ENVIGADO_CITAS_EMAIL, timeout=3000)
+                    break
+                except Exception:
+                    continue
+
+            page.fill('input[formcontrolname="celular"]', ENVIGADO_CITAS_CELULAR, timeout=8000)
+
+            # Seleccionar el tramite (ej. "Traspaso") -- se busca el texto
+            # visible, sea boton, item de lista, o casilla.
+            page.click(f'text="{ENVIGADO_CITAS_TRAMITE_TEXTO}"', timeout=8000)
+
+            page.fill('input[formcontrolname="placa"]', ENVIGADO_CITAS_PLACA, timeout=8000)
+
+            # Boton "Agregar servicio" -- avanza al paso donde el sitio
+            # consulta la disponibilidad real.
+            page.click('text="Agregar servicio"', timeout=8000)
+
+            # Esperar a que la peticion se dispare y la respuesta llegue.
+            for _ in range(10):
+                if resultado_capturado["capturado"]:
+                    break
+                page.wait_for_timeout(1000)
+
+            if not resultado_capturado["capturado"]:
+                # Diagnostico: se imprime un resumen del HTML visible para
+                # poder ajustar los selectores si algo no coincidio.
+                print("=== DIAGNOSTICO citas Envigado: no se capturo la respuesta esperada ===", flush=True)
+                print("URL actual:", page.url, flush=True)
+                try:
+                    print("Texto visible de la pagina (primeros 2000 caracteres):", flush=True)
+                    print(page.inner_text("body")[:2000], flush=True)
+                except Exception as e_txt:
+                    print("No se pudo leer el texto de la pagina:", e_txt, flush=True)
+                print("=== FIN DIAGNOSTICO ===", flush=True)
+
+        except Exception as e:
+            print(f"Error en el flujo de Playwright para citas Envigado: {e}", flush=True)
+            try:
+                print("=== DIAGNOSTICO citas Envigado: texto visible al momento del error ===", flush=True)
+                print(page.inner_text("body")[:2000], flush=True)
+                print("=== FIN DIAGNOSTICO ===", flush=True)
+            except Exception:
+                pass
+        finally:
+            context.close(); browser.close()
+
+    return resultado_capturado["datos"]
 
 
 def envigado_revisar_citas_disponibles(dias_adelante=14):
