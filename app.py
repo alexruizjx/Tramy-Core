@@ -313,7 +313,16 @@ def envigado_hay_puntos_disponibles():
                 except Exception:
                     continue
 
-            page.locator('input[name="celular"]').fill(ENVIGADO_CITAS_CELULAR, timeout=8000)
+            celular_ok = False
+            for selector_celular in ['input[name="celular"]', 'input[name="telefono"]', 'input[name="numeroCelular"]', 'input[name="celularSolicitante"]']:
+                try:
+                    page.locator(selector_celular).fill(ENVIGADO_CITAS_CELULAR, timeout=4000)
+                    celular_ok = True
+                    break
+                except Exception:
+                    continue
+            if not celular_ok:
+                print("No se pudo llenar el campo de celular con ningun selector conocido (se sigue de todas formas).", flush=True)
 
             # Seleccionar el tramite (texto exacto confirmado por una
             # captura real: "Comprador/Vendedor - Traspaso").
