@@ -242,6 +242,23 @@ def envigado_hay_puntos_disponibles():
     poder seguir). Sin este paso previo la consulta no trae resultados
     reales."""
     session = requests.Session()
+    # Se replican los encabezados que manda el navegador real (capturados
+    # en un HAR real) -- el servidor de Envigado devolvia error 500 sin
+    # ellos, probablemente por validar Origin/Referer, o por dos
+    # encabezados personalizados poco comunes que su propia app agrega
+    # (href, hostname).
+    session.headers.update({
+        "Accept": "*/*",
+        "Content-Type": "application/json",
+        "Origin": "https://movilidad.envigado.gov.co",
+        "Referer": "https://movilidad.envigado.gov.co/portal-servicios/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "hostname": "null",
+        "href": "https://movilidad.envigado.gov.co/portal-servicios/#/public",
+    })
     try:
         # OJO: "paramValidar" se agrega porque el sitio real lo manda
         # (lo vimos en una captura real: paramValidar=1844) -- sin este
