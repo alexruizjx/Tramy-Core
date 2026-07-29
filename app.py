@@ -281,26 +281,39 @@ def envigado_hay_puntos_disponibles():
                       wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(3000)  # dar tiempo a que la app Angular termine de armarse
 
-            # Tipo de documento -- la lista de opciones (CC, CE, CV, PAS,
-            # PPT, PEP, TI) aparece como texto plano en el diagnostico, lo
-            # que sugiere un desplegable tipo mat-select. Se abre por rol
-            # y se elige "CC" por su texto.
+            # Tipo de documento -- CONFIRMADO por diagnostico real: es un
+            # <select> nativo de AngularJS clasico, con id="tipoDocumento"
+            # y name="tipoDocumento" (no un componente moderno). Se usa
+            # select_option (no click), que es lo correcto para un
+            # <select> nativo.
             try:
-                page.get_by_role("combobox").first.click(timeout=5000)
-                page.get_by_text("CC", exact=True).click(timeout=4000)
+                page.select_option("#tipoDocumento", label="CC", timeout=5000)
             except Exception as e_tipodoc:
                 print(f"No se pudo seleccionar tipo de documento (se sigue de todas formas): {e_tipodoc}", flush=True)
 
-            # El resto de campos SI tienen una etiqueta visible clara
-            # (confirmado en un diagnostico anterior), asi que se usa esa
-            # etiqueta directamente -- mucho mas confiable que adivinar
-            # nombres de atributos internos del formulario.
-            page.get_by_label("Número de identificación").fill(ENVIGADO_CITAS_DOCUMENTO, timeout=10000)
-            page.get_by_label("Nombres").fill(ENVIGADO_CITAS_NOMBRES, timeout=8000)
-            page.get_by_label("Apellidos").fill(ENVIGADO_CITAS_APELLIDOS, timeout=8000)
-            page.get_by_label("Correo electrónico", exact=True).fill(ENVIGADO_CITAS_EMAIL, timeout=8000)
-            page.get_by_label("Confirmar correo electrónico").fill(ENVIGADO_CITAS_EMAIL, timeout=8000)
-            page.get_by_label("Celular").fill(ENVIGADO_CITAS_CELULAR, timeout=8000)
+            # El resto de campos: como es AngularJS clasico (ng-model), lo
+            # mas probable es que usen el atributo "name" igual que el de
+            # tipoDocumento -- se usa ese patron en vez de adivinar
+            # etiquetas visibles (que resultaron no estar bien asociadas
+            # a sus campos en este formulario).
+            page.locator('input[name="numeroDocumento"]').fill(ENVIGADO_CITAS_DOCUMENTO, timeout=10000)
+            page.locator('input[name="nombres"]').fill(ENVIGADO_CITAS_NOMBRES, timeout=8000)
+            page.locator('input[name="apellidos"]').fill(ENVIGADO_CITAS_APELLIDOS, timeout=8000)
+
+            for selector_email in ['input[name="email"]', 'input[name="correo"]']:
+                try:
+                    page.locator(selector_email).first.fill(ENVIGADO_CITAS_EMAIL, timeout=4000)
+                    break
+                except Exception:
+                    continue
+            for selector_confirmar in ['input[name="confirmarEmail"]', 'input[name="confirmarCorreo"]', 'input[name="emailConfirm"]']:
+                try:
+                    page.locator(selector_confirmar).fill(ENVIGADO_CITAS_EMAIL, timeout=4000)
+                    break
+                except Exception:
+                    continue
+
+            page.locator('input[name="celular"]').fill(ENVIGADO_CITAS_CELULAR, timeout=8000)
 
             # Seleccionar el tramite (texto exacto confirmado por una
             # captura real: "Comprador/Vendedor - Traspaso").
@@ -309,7 +322,18 @@ def envigado_hay_puntos_disponibles():
 
             # El campo de Placa no aparecia en el formulario inicial --
             # probablemente se agrega recien despues de elegir el tramite.
-            page.get_by_label("Placa").fill(ENVIGADO_CITAS_PLACA, timeout=8000)
+            # Se prueban varios selectores, ya que "get_by_label" no fue
+            # confiable en este formulario (AngularJS clasico).
+            placa_ok = False
+            for selector_placa in ['input[name="placa"]', 'input[name="placaVehiculo"]']:
+                try:
+                    page.locator(selector_placa).fill(ENVIGADO_CITAS_PLACA, timeout=5000)
+                    placa_ok = True
+                    break
+                except Exception:
+                    continue
+            if not placa_ok:
+                page.get_by_label("Placa").fill(ENVIGADO_CITAS_PLACA, timeout=5000)
 
             # Boton "Agregar servicio" -- avanza al paso donde el sitio
             # consulta la disponibilidad real.
