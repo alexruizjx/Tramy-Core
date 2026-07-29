@@ -325,9 +325,20 @@ def envigado_hay_puntos_disponibles():
                 print("No se pudo llenar el campo de celular con ningun selector conocido (se sigue de todas formas).", flush=True)
 
             # Seleccionar el tramite -- CONFIRMADO por diagnostico real:
-            # tambien es un <select> nativo (id="tramite"), no un elemento
-            # de texto clicable como se intento antes.
-            page.select_option("#tramite", label=ENVIGADO_CITAS_TRAMITE_TEXTO, timeout=8000)
+            # es un <select> envuelto en Select2 (una libreria que lo
+            # oculta visualmente y lo reemplaza por un menu propio), por
+            # eso Playwright no podia "verlo" para hacer click ni
+            # select_option normal. Se cambia el valor directo por
+            # JavaScript y se dispara el evento "change" nativo, que es
+            # lo que AngularJS espera para actualizar su modelo
+            # (ng-change="ctrl.seleccionarServicio()").
+            page.evaluate("""() => {
+                var el = document.querySelector('#tramite');
+                if (!el) return false;
+                el.value = '90';  // "Comprador/Vendedor - Traspaso"
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                return true;
+            }""")
             page.wait_for_timeout(1500)  # dar tiempo a que aparezca el campo de placa (se agrega dinamicamente)
 
             # El campo de Placa no aparecia en el formulario inicial --
