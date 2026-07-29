@@ -224,7 +224,7 @@ ENVIGADO_VALIDAR_API = "https://movilidad.envigado.gov.co/backavit/avit/segurida
 # Documento y placa "de prueba" -- no corresponden a un ciudadano real que
 # pueda verse afectado, siguiendo la misma logica que ya usa el usuario
 # manualmente (un numero que el sistema no tiene registrado).
-ENVIGADO_CITAS_DOCUMENTO = "71632131313"
+ENVIGADO_CITAS_DOCUMENTO = "711263131313"
 ENVIGADO_CITAS_TIPO_DOC = "2"
 ENVIGADO_CITAS_PLACA = "RST37B"
 
@@ -387,8 +387,25 @@ def envigado_hay_puntos_disponibles():
                     break
                 except Exception:
                     continue
+
             if not placa_ok:
-                print("No se pudo llenar el campo de placa con ningun selector conocido (revisar diagnostico de arriba).", flush=True)
+                # No hay campo de texto simple -- el diagnostico mostro un
+                # selector multiple "#selectOtrosVehiculos" junto con una
+                # casilla de busqueda, sugiriendo que el sitio muestra los
+                # vehiculos YA REGISTRADOS a ese numero de documento para
+                # elegir de una lista, en vez de escribir la placa
+                # libremente. Se intenta: escribir la placa en la
+                # busqueda, y luego elegir la opcion que aparezca.
+                try:
+                    page.locator('input[type="search"]').first.fill(ENVIGADO_CITAS_PLACA, timeout=5000)
+                    page.wait_for_timeout(1500)
+                    page.locator('#selectOtrosVehiculos option', has_text=ENVIGADO_CITAS_PLACA).first.click(timeout=5000)
+                    placa_ok = True
+                except Exception as e_placa_select:
+                    print(f"No se pudo elegir la placa desde el selector de vehiculos: {e_placa_select}", flush=True)
+
+            if not placa_ok:
+                print("No se pudo llenar/elegir la placa con ningun metodo conocido (revisar diagnostico de arriba).", flush=True)
 
             # Boton "Agregar servicio" -- avanza al paso donde el sitio
             # consulta la disponibilidad real.
