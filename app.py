@@ -233,7 +233,10 @@ ENVIGADO_CITAS_NOMBRES = "TRAMY"
 ENVIGADO_CITAS_APELLIDOS = "MONITOR"
 ENVIGADO_CITAS_EMAIL = "monitor.tramy@gmail.com"
 ENVIGADO_CITAS_CELULAR = "3000000000"
-ENVIGADO_CITAS_TRAMITE_TEXTO = "Traspaso"
+# Nombre EXACTO del tramite tal como aparece en el desplegable del sitio
+# (confirmado con una captura real del monitor de turnos, que mostraba
+# este mismo nombre como "nombreServicio").
+ENVIGADO_CITAS_TRAMITE_TEXTO = "Comprador/Vendedor - Traspaso"
 
 
 def envigado_hay_puntos_disponibles():
@@ -278,43 +281,39 @@ def envigado_hay_puntos_disponibles():
                       wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(3000)  # dar tiempo a que la app Angular termine de armarse
 
-            # Tipo de documento -- si el campo no existe o ya viene
-            # preseleccionado, se ignora el error y se sigue.
-            for selector_tipo_doc in ['select[formcontrolname="tipoDocumento"]', 'mat-select[formcontrolname="tipoDocumento"]']:
-                try:
-                    page.select_option(selector_tipo_doc, label="Cédula de Ciudadanía", timeout=4000)
-                    break
-                except Exception:
-                    continue
+            # Tipo de documento -- la lista de opciones (CC, CE, CV, PAS,
+            # PPT, PEP, TI) aparece como texto plano en el diagnostico, lo
+            # que sugiere un desplegable tipo mat-select. Se abre por rol
+            # y se elige "CC" por su texto.
+            try:
+                page.get_by_role("combobox").first.click(timeout=5000)
+                page.get_by_text("CC", exact=True).click(timeout=4000)
+            except Exception as e_tipodoc:
+                print(f"No se pudo seleccionar tipo de documento (se sigue de todas formas): {e_tipodoc}", flush=True)
 
-            page.fill('input[formcontrolname="numeroDocumento"]', ENVIGADO_CITAS_DOCUMENTO, timeout=10000)
-            page.fill('input[formcontrolname="nombres"]', ENVIGADO_CITAS_NOMBRES, timeout=8000)
-            page.fill('input[formcontrolname="apellidos"]', ENVIGADO_CITAS_APELLIDOS, timeout=8000)
-            page.fill('input[formcontrolname="email"]', ENVIGADO_CITAS_EMAIL, timeout=8000)
+            # El resto de campos SI tienen una etiqueta visible clara
+            # (confirmado en un diagnostico anterior), asi que se usa esa
+            # etiqueta directamente -- mucho mas confiable que adivinar
+            # nombres de atributos internos del formulario.
+            page.get_by_label("Número de identificación").fill(ENVIGADO_CITAS_DOCUMENTO, timeout=10000)
+            page.get_by_label("Nombres").fill(ENVIGADO_CITAS_NOMBRES, timeout=8000)
+            page.get_by_label("Apellidos").fill(ENVIGADO_CITAS_APELLIDOS, timeout=8000)
+            page.get_by_label("Correo electrónico", exact=True).fill(ENVIGADO_CITAS_EMAIL, timeout=8000)
+            page.get_by_label("Confirmar correo electrónico").fill(ENVIGADO_CITAS_EMAIL, timeout=8000)
+            page.get_by_label("Celular").fill(ENVIGADO_CITAS_CELULAR, timeout=8000)
 
-            # "Confirmar correo" -- el nombre exacto del campo puede variar
-            # segun la version del formulario, se prueban varios.
-            for selector_confirmar in [
-                'input[formcontrolname="confirmarEmail"]', 'input[formcontrolname="emailConfirm"]',
-                'input[formcontrolname="confirmEmail"]', 'input[formcontrolname="confirmarCorreo"]',
-            ]:
-                try:
-                    page.fill(selector_confirmar, ENVIGADO_CITAS_EMAIL, timeout=3000)
-                    break
-                except Exception:
-                    continue
+            # Seleccionar el tramite (texto exacto confirmado por una
+            # captura real: "Comprador/Vendedor - Traspaso").
+            page.get_by_text(ENVIGADO_CITAS_TRAMITE_TEXTO, exact=True).click(timeout=8000)
+            page.wait_for_timeout(1500)  # dar tiempo a que aparezca el campo de placa (se agrega dinamicamente)
 
-            page.fill('input[formcontrolname="celular"]', ENVIGADO_CITAS_CELULAR, timeout=8000)
-
-            # Seleccionar el tramite (ej. "Traspaso") -- se busca el texto
-            # visible, sea boton, item de lista, o casilla.
-            page.click(f'text="{ENVIGADO_CITAS_TRAMITE_TEXTO}"', timeout=8000)
-
-            page.fill('input[formcontrolname="placa"]', ENVIGADO_CITAS_PLACA, timeout=8000)
+            # El campo de Placa no aparecia en el formulario inicial --
+            # probablemente se agrega recien despues de elegir el tramite.
+            page.get_by_label("Placa").fill(ENVIGADO_CITAS_PLACA, timeout=8000)
 
             # Boton "Agregar servicio" -- avanza al paso donde el sitio
             # consulta la disponibilidad real.
-            page.click('text="Agregar servicio"', timeout=8000)
+            page.get_by_text("Agregar servicio", exact=True).click(timeout=8000)
 
             # Esperar a que la peticion se dispare y la respuesta llegue.
             for _ in range(10):
