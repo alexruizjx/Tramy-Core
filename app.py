@@ -324,9 +324,10 @@ def envigado_hay_puntos_disponibles():
             if not celular_ok:
                 print("No se pudo llenar el campo de celular con ningun selector conocido (se sigue de todas formas).", flush=True)
 
-            # Seleccionar el tramite (texto exacto confirmado por una
-            # captura real: "Comprador/Vendedor - Traspaso").
-            page.get_by_text(ENVIGADO_CITAS_TRAMITE_TEXTO, exact=True).click(timeout=8000)
+            # Seleccionar el tramite -- CONFIRMADO por diagnostico real:
+            # tambien es un <select> nativo (id="tramite"), no un elemento
+            # de texto clicable como se intento antes.
+            page.select_option("#tramite", label=ENVIGADO_CITAS_TRAMITE_TEXTO, timeout=8000)
             page.wait_for_timeout(1500)  # dar tiempo a que aparezca el campo de placa (se agrega dinamicamente)
 
             # El campo de Placa no aparecia en el formulario inicial --
