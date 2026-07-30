@@ -830,12 +830,15 @@ def consultar_runt_vehiculo(page, placa, cedula, tipo_documento="CC", job_id=Non
     # "networkidle" esperaba a que la red quedara completamente en reposo,
     # pero el portal del RUNT tiene actividad de fondo constante que nunca
     # la deja quieta del todo -- causaba timeouts frecuentes aunque la
-    # pagina ya hubiera cargado bien. Se usa "domcontentloaded" (mucho mas
-    # rapido) y se confia en el wait_for_selector de abajo, que ya
-    # confirma que el formulario esta realmente listo para usarse.
-    page.goto(RUNT_URL, wait_until="domcontentloaded", timeout=60000)
+    # pagina ya hubiera cargado bien. "domcontentloaded" resulto ser
+    # demasiado temprano (la pagina apenas empieza a construirse), asi
+    # que se usa "load" (espera a que terminen de cargar los recursos,
+    # un punto medio) y se le da al formulario mas tiempo real de sobra
+    # para aparecer -- la idea es reducir cuantas veces hace falta
+    # reintentar, no solo agregar mas intentos.
+    page.goto(RUNT_URL, wait_until="load", timeout=60000)
     try:
-        page.wait_for_selector('input[formcontrolname="placa"]', timeout=30000)
+        page.wait_for_selector('input[formcontrolname="placa"]', timeout=45000)
     except Exception as e_primer_intento:
         # El portal del RUNT a veces tarda mas de lo normal en terminar de
         # cargar (o se queda a medias) -- antes de rendirse del todo, se
@@ -845,8 +848,8 @@ def consultar_runt_vehiculo(page, placa, cedula, tipo_documento="CC", job_id=Non
         if job_id:
             job_actualizar(job_id, "El RUNT tardó más de lo normal, reintentando...", "procesando")
         try:
-            page.goto(RUNT_URL, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_selector('input[formcontrolname="placa"]', timeout=30000)
+            page.goto(RUNT_URL, wait_until="load", timeout=60000)
+            page.wait_for_selector('input[formcontrolname="placa"]', timeout=45000)
         except Exception as e_segundo_intento:
             # Diagnostico: se imprime la URL actual y el texto visible de
             # la pagina para entender que esta pasando cuando esto ocurre
