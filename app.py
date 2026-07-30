@@ -239,6 +239,22 @@ ENVIGADO_CITAS_CELULAR = "3000000000"
 ENVIGADO_CITAS_TRAMITE_TEXTO = "Comprador/Vendedor - Traspaso"
 
 
+def _envigado_hay_aviso_sin_agenda(page):
+    """Revisa si en este momento aparece el aviso 'El trámite seleccionado
+    no tiene agenda disponible para el punto de atención' en cualquier
+    parte visible de la pagina. Envigado muestra este aviso en momentos
+    DISTINTOS del proceso segun el caso (a veces apenas se entra, a veces
+    al elegir la sede, a veces solo al final al hacer clic en 'Agregar
+    servicio') -- probablemente para dificultar la automatizacion. Por
+    eso se revisa este texto varias veces durante el flujo, en vez de
+    confiar en un solo punto fijo."""
+    try:
+        texto = page.inner_text("body")
+        return "no tiene agenda disponible" in texto.lower()
+    except Exception:
+        return False
+
+
 def envigado_hay_puntos_disponibles():
     """Revisa si hay ALGUN punto de atencion con citas disponibles para
     el servicio vigilado. Usa un NAVEGADOR REAL (Playwright) en vez de
@@ -280,6 +296,10 @@ def envigado_hay_puntos_disponibles():
             page.goto("https://movilidad.envigado.gov.co/portal-servicios/#/agendar-cita-publica",
                       wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(3000)  # dar tiempo a que la app Angular termine de armarse
+
+            if _envigado_hay_aviso_sin_agenda(page):
+                print("Aviso 'sin agenda disponible' detectado apenas se cargo la pagina -- confirmado, no hay citas.", flush=True)
+                return []
 
             # DIAGNOSTICO TEMPORAL -- en vez de seguir adivinando campo por
             # campo, se listan TODOS los <input>/<select>/<textarea> reales
@@ -350,6 +370,10 @@ def envigado_hay_puntos_disponibles():
             }""")
             page.wait_for_timeout(1500)  # dar tiempo a que aparezca el campo de placa (se agrega dinamicamente)
 
+            if _envigado_hay_aviso_sin_agenda(page):
+                print("Aviso 'sin agenda disponible' detectado despues de elegir el tramite -- confirmado, no hay citas.", flush=True)
+                return []
+
             # DIAGNOSTICO TEMPORAL -- el campo de Placa no aparecia en el
             # listado inicial de campos, seguramente porque se agrega
             # recien despues de elegir el tramite. Se vuelve a listar
@@ -411,13 +435,31 @@ def envigado_hay_puntos_disponibles():
                 print("No se pudo llenar/elegir la placa con ningun metodo conocido (revisar diagnostico de arriba).", flush=True)
 
             # Boton "Agregar servicio" -- avanza al paso donde el sitio
-            # consulta la disponibilidad real.
-            page.get_by_text("Agregar servicio", exact=True).click(timeout=8000)
+            # consulta la disponibilidad real. A veces el aviso de "sin
+            # agenda" ya tapa este boton o lo bloquea -- si el clic falla,
+            # se revisa el aviso antes de reportarlo como error.
+            try:
+                page.get_by_text("Agregar servicio", exact=True).click(timeout=8000)
+            except Exception as e_clic_agregar:
+                if _envigado_hay_aviso_sin_agenda(page):
+                    print("Aviso 'sin agenda disponible' detectado al intentar hacer clic en 'Agregar servicio' -- confirmado, no hay citas.", flush=True)
+                    return []
+                raise e_clic_agregar
+
+            if _envigado_hay_aviso_sin_agenda(page):
+                print("Aviso 'sin agenda disponible' detectado justo despues de 'Agregar servicio' -- confirmado, no hay citas.", flush=True)
+                return []
 
             # Esperar a que la peticion se dispare y la respuesta llegue.
+            # Se revisa el aviso de "sin agenda" en cada vuelta tambien,
+            # por si aparece justo en este momento (a veces tarda un poco
+            # en mostrarse despues del clic).
             for _ in range(10):
                 if resultado_capturado["capturado"]:
                     break
+                if _envigado_hay_aviso_sin_agenda(page):
+                    print("Aviso 'sin agenda disponible' detectado mientras se esperaba la respuesta -- confirmado, no hay citas.", flush=True)
+                    return []
                 page.wait_for_timeout(1000)
 
             if not resultado_capturado["capturado"]:
