@@ -4221,6 +4221,31 @@ def vehiculos_buscar():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/vigencias-adeudadas-cache", methods=["GET"])
+def vigencias_adeudadas_cache_endpoint():
+    """Devuelve las vigencias que, segun la ultima consulta guardada en
+    cache, estan CON_DEUDA para esta placa -- para autocompletar el
+    campo de 'Vigencia(s) a descargar' en el generador de Declaraciones
+    Sugeridas, sin tener que volver a consultar."""
+    placa = request.args.get("placa", "").upper().strip()
+    if not placa:
+        return jsonify({"error": "Debes indicar la placa."}), 400
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT vigencia FROM cache_impuestos_antioquia
+            WHERE placa = %s AND estado = 'CON_DEUDA'
+              AND (expira_en IS NULL OR expira_en >= NOW())
+            ORDER BY vigencia ASC
+        """, (placa,))
+        vigencias = [r[0] for r in cur.fetchall()]
+        cur.close(); conn.close()
+        return jsonify({"ok": True, "placa": placa, "vigencias": vigencias})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/vehiculo-runt-guardado", methods=["GET"])
 def vehiculo_runt_guardado():
     """Trae los datos de RUNT ya guardados para una placa, sin consultar el
