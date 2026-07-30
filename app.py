@@ -834,7 +834,33 @@ def consultar_runt_vehiculo(page, placa, cedula, tipo_documento="CC", job_id=Non
     # rapido) y se confia en el wait_for_selector de abajo, que ya
     # confirma que el formulario esta realmente listo para usarse.
     page.goto(RUNT_URL, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_selector('input[formcontrolname="placa"]', timeout=30000)
+    try:
+        page.wait_for_selector('input[formcontrolname="placa"]', timeout=30000)
+    except Exception as e_primer_intento:
+        # El portal del RUNT a veces tarda mas de lo normal en terminar de
+        # cargar (o se queda a medias) -- antes de rendirse del todo, se
+        # intenta una vez mas con una recarga completa, en vez de fallar
+        # de una con el primer timeout.
+        print(f"Timeout esperando el formulario del RUNT, reintentando con recarga completa: {e_primer_intento}", flush=True)
+        if job_id:
+            job_actualizar(job_id, "El RUNT tardó más de lo normal, reintentando...", "procesando")
+        try:
+            page.goto(RUNT_URL, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_selector('input[formcontrolname="placa"]', timeout=30000)
+        except Exception as e_segundo_intento:
+            # Diagnostico: se imprime la URL actual y el texto visible de
+            # la pagina para entender que esta pasando cuando esto ocurre
+            # (por ejemplo, un aviso de mantenimiento, una pantalla de
+            # error, o simplemente que el sitio esta caido).
+            print("=== DIAGNOSTICO RUNT: el formulario no aparecio tras 2 intentos ===", flush=True)
+            print("URL actual:", page.url, flush=True)
+            try:
+                print("Texto visible de la pagina (primeros 1500 caracteres):", flush=True)
+                print(page.inner_text("body")[:1500], flush=True)
+            except Exception:
+                pass
+            print("=== FIN DIAGNOSTICO RUNT ===", flush=True)
+            raise e_segundo_intento
 
     # Procedencia (Nacional) y Consultar Por (Placa y Propietario) ya vienen
     # seleccionados por defecto -- no hace falta tocarlos.
