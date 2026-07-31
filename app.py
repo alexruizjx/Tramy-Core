@@ -12,6 +12,7 @@ import threading
 import boto3
 from botocore.config import Config
 from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 from pypdf import PdfWriter
@@ -1451,7 +1452,7 @@ def generar_declaracion_manual_pdf(datos, ruta_salida_pdf):
     # que una vencida. Las etiquetas fijas ("FECHA LÍMITE PAGO" / "FECHA
     # GENERACIÓN") ya estan en la plantilla (E68/E69) -- aqui solo se
     # escribe el valor de cada fecha, en las celdas AE68/AE69.
-    hoy = datetime.now()
+    hoy = datetime.now(ZoneInfo("America/Bogota"))
     fecha_generacion_str = hoy.strftime("%d/%m/%Y")
     fecha_limite = _antioquia_calcular_validez_pdf(datos.get("vigencia", hoy.year))
     fecha_limite_str = fecha_limite.strftime("%d/%m/%Y")
@@ -1464,6 +1465,21 @@ def generar_declaracion_manual_pdf(datos, ruta_salida_pdf):
 
         ws["AE68"] = fecha_limite_str
         ws["AE69"] = fecha_generacion_str
+
+        # Las etiquetas fijas "FECHA LÍMITE PAGO" / "FECHA GENERACIÓN"
+        # (E68/E69) usaban color de tema (theme=1) en vez de un color
+        # fijo -- LibreOffice (el motor que convierte a PDF en el
+        # servidor) a veces no resuelve bien ese color de tema y el
+        # texto sale invisible, aunque en Excel se vea negro normal.
+        # Mismo problema que ya se habia resuelto antes en otra parte de
+        # este documento -- se fuerza el color negro directo.
+        for celda_etiqueta in ["E68", "E69"]:
+            fuente_actual = ws[celda_etiqueta].font
+            ws[celda_etiqueta].font = Font(
+                name=fuente_actual.name, size=fuente_actual.size,
+                bold=fuente_actual.bold, italic=fuente_actual.italic,
+                color="FF000000"
+            )
 
         # C. Declarante
         ws["D15"] = datos.get("nombre_completo", "")
@@ -2660,8 +2676,11 @@ def _antioquia_calcular_validez_pdf(vigencia):
     ACTUAL (el año en curso) es distinta: sirve durante toda la ventana de
     pronto pago -- del 1 de enero al 30 de abril, o del 1 de mayo al 31 de
     julio -- y desde el 1 de agosto en adelante se comporta igual que una
-    vigencia vencida (valida solo el mismo dia)."""
-    hoy = datetime.now().date()
+    vigencia vencida (valida solo el mismo dia).
+    OJO: el servidor corre en UTC, pero "el mismo dia" debe ser el dia en
+    Colombia -- sin este ajuste, de 7pm a 12am hora Colombia el servidor
+    ya cree que es el dia siguiente (UTC va 5 horas adelante)."""
+    hoy = datetime.now(ZoneInfo("America/Bogota")).date()
     anio_actual = hoy.year
 
     if int(vigencia) == anio_actual:
