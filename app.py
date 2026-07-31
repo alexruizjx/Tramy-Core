@@ -3847,9 +3847,13 @@ def generar_declaracion_manual_endpoint():
     apellidos_propietario = request.args.get("apellidos_propietario", "").strip()
     nombres_propietario = request.args.get("nombres_propietario", "").strip()
 
-    celular = request.args.get("celular", "").strip() or "3000000000"
-    email = request.args.get("email", "").strip() or "consulta@consulta.com"
-    direccion = request.args.get("direccion", "").strip() or "CRA"
+    # Estos 4 datos son siempre los mismos, sin importar el cliente --
+    # se dejan fijos aqui, ignorando cualquier valor que llegue del
+    # formulario para estos campos especificos.
+    celular = "3107208784"
+    telefono_fijo = "2379933"
+    email = "Dilydocs@gmail.com"
+    direccion = "cra 80  50 - 52"
     municipio_residencia = request.args.get("municipio", "").strip() or "MEDELLIN"
     municipio_cod = request.args.get("municipio_cod", "").strip()
     municipio_cod = int(municipio_cod) if municipio_cod.isdigit() else 5001000
@@ -3930,10 +3934,10 @@ def generar_declaracion_manual_endpoint():
                         "vigencia": vigencia,
                         "nombre_completo": nombres_propietario,
                         "apellidos": apellidos_propietario,
-                        "celular": celular if celular != "3000000000" else "",
-                        "telefono": "",
-                        "email": email if email != "consulta@consulta.com" else "",
-                        "direccion": direccion if direccion != "CRA" else "",
+                        "celular": celular,
+                        "telefono": telefono_fijo,
+                        "email": email,
+                        "direccion": direccion,
                         "municipio_residencia": municipio_residencia,
                         "departamento_residencia": "ANTIOQUIA",
                         "numero_documento": identificacion,
