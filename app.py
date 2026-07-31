@@ -2654,45 +2654,50 @@ def _antioquia_calcular_validez_pdf(vigencia):
 
 
 def _cache_declaracion_buscar(placa, vigencia):
-    """Busca un PDF de declaracion sugerida ya generado hoy (o dentro de
-    su ventana de validez) para esta placa/vigencia. Devuelve un dict
-    {url, datos} si existe (datos puede ser None si se guardo antes de
-    que existiera esta columna), o None si no hay nada cacheado."""
+    """Busca lo que ya se haya generado hoy (o dentro de su ventana de
+    validez) para esta placa/vigencia. Devuelve un dict {url, url_manual,
+    datos} si existe (url/url_manual/datos pueden venir en None si nunca
+    se genero ese PDF en particular), o None si no hay nada cacheado."""
     try:
         conn = get_db_conn()
         cur = conn.cursor()
         cur.execute("""
-            SELECT url, datos_json FROM cache_declaraciones_antioquia
+            SELECT url, datos_json, url_manual FROM cache_declaraciones_antioquia
             WHERE placa = %s AND vigencia = %s AND valido_hasta >= CURRENT_DATE
         """, (placa.upper(), int(vigencia)))
         row = cur.fetchone()
         cur.close(); conn.close()
         if not row:
             return None
-        return {"url": row[0], "datos": row[1]}
+        return {"url": row[0], "datos": row[1], "url_manual": row[2]}
     except Exception as e:
         print(f"Error buscando cache de declaracion: {e}")
         return None
 
 
-def _cache_declaracion_guardar(placa, vigencia, url, datos_extra=None):
+def _cache_declaracion_guardar(placa, vigencia, url, datos_extra=None, url_manual=None):
     """Guarda el PDF generado en cache. 'datos_extra', si se da, guarda
     ademas la liquidacion completa (avaluo, impuesto, sanciones, etc.) y
     caja/traccion, para que otras herramientas (como la Declaracion
     Manual) puedan reutilizarlos sin tener que consultar de nuevo en
-    vivo a la Gobernacion."""
+    vivo a la Gobernacion. 'url_manual', si se da, guarda la URL del PDF
+    de la Declaracion Manual ya generado (para poder saltarla si se
+    vuelve a pedir la misma vigencia el mismo dia)."""
     try:
         valido_hasta = _antioquia_calcular_validez_pdf(vigencia)
         conn = get_db_conn()
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO cache_declaraciones_antioquia (placa, vigencia, url, valido_hasta, datos_json)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (placa, vigencia) DO UPDATE SET url = EXCLUDED.url,
+            INSERT INTO cache_declaraciones_antioquia (placa, vigencia, url, valido_hasta, datos_json, url_manual)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (placa, vigencia) DO UPDATE SET
+                url = COALESCE(EXCLUDED.url, cache_declaraciones_antioquia.url),
                 valido_hasta = EXCLUDED.valido_hasta,
                 datos_json = COALESCE(EXCLUDED.datos_json, cache_declaraciones_antioquia.datos_json),
+                url_manual = COALESCE(EXCLUDED.url_manual, cache_declaraciones_antioquia.url_manual),
                 creado_en = NOW()
-        """, (placa.upper(), int(vigencia), url, valido_hasta, json.dumps(datos_extra) if datos_extra else None))
+        """, (placa.upper(), int(vigencia), url, valido_hasta,
+              json.dumps(datos_extra) if datos_extra else None, url_manual))
         conn.commit()
         cur.close(); conn.close()
     except Exception as e:
@@ -3822,13 +3827,25 @@ def generar_declaracion_manual_endpoint():
 
             for vigencia in vigencias:
                 try:
+                    cache = _cache_declaracion_buscar(placa, vigencia)
+
+                    # Si ya se genero un PDF de Declaracion MANUAL hoy para
+                    # esta misma placa/vigencia, se reutiliza directo (sin
+                    # volver a generar nada) -- por eso se revisa esto
+                    # primero, antes de cualquier otra cosa.
+                    if cache and cache.get("url_manual"):
+                        job_actualizar(job_id, f"Vigencia {vigencia}: ya existe un PDF generado hoy, usando ese...",
+                                        datos_parciales=resultados)
+                        resultados.append({"vigencia": vigencia, "ok": True, "url": cache["url_manual"]})
+                        job_actualizar(job_id, f"Vigencia {vigencia} lista.", datos_parciales=resultados)
+                        continue
+
                     # Si ya se genero una Declaracion Sugerida de esta
                     # misma placa/vigencia hoy (desde esta misma
                     # herramienta o desde el Generador de Declaraciones
                     # Sugeridas), se reutilizan esos datos en vez de
                     # volver a consultar en vivo a la Gobernacion (evita
                     # el captcha y es practicamente instantaneo).
-                    cache = _cache_declaracion_buscar(placa, vigencia)
                     if cache and cache.get("datos"):
                         job_actualizar(job_id, f"Vigencia {vigencia}: usando liquidación ya consultada hoy...",
                                         datos_parciales=resultados)
@@ -3913,6 +3930,10 @@ def generar_declaracion_manual_endpoint():
                     url = subir_a_r2(ruta_pdf, f"declaraciones-manuales/{placa}_{vigencia}_{id_unico}.pdf",
                                       nombre_descarga=f"Declaracion_Manual_{placa}_{vigencia}.pdf")
                     os.remove(ruta_pdf)
+
+                    # Se guarda para poder saltar esta vigencia si se
+                    # vuelve a pedir el mismo dia.
+                    _cache_declaracion_guardar(placa, vigencia, None, url_manual=url)
 
                     resultados.append({"vigencia": vigencia, "ok": True, "url": url})
                 except Exception as e_vig:
