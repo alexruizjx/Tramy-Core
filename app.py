@@ -2771,6 +2771,8 @@ def antioquia_generar_todas_declaraciones(placa, identificacion, tipo_documento_
 
     for vigencia in vigencias:
         cache = None if ignorar_cache else _cache_declaracion_buscar(placa, vigencia)
+        # DIAGNOSTICO TEMPORAL -- quitar despues de confirmar que funciona.
+        print(f"=== DIAGNOSTICO CACHE (sugeridas): placa={placa} vigencia={vigencia} ignorar_cache={ignorar_cache} -> {cache}", flush=True)
         if cache:
             resultados.append({"vigencia": vigencia, "ok": True, "url": cache["url"]})
             if job_id:
@@ -3875,6 +3877,10 @@ def generar_declaracion_manual_endpoint():
             for vigencia in vigencias:
                 try:
                     cache = _cache_declaracion_buscar(placa, vigencia)
+                    # DIAGNOSTICO TEMPORAL -- para ver exactamente que
+                    # encuentra (o no) el cache para esta vigencia. Quitar
+                    # despues de confirmar que funciona.
+                    print(f"=== DIAGNOSTICO CACHE: placa={placa} vigencia={vigencia} -> {cache}", flush=True)
 
                     # Si ya se genero un PDF de Declaracion MANUAL hoy para
                     # esta misma placa/vigencia, se reutiliza directo (sin
