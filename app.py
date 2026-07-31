@@ -1471,14 +1471,16 @@ def generar_declaracion_manual_pdf(datos, ruta_salida_pdf):
         # servidor) a veces no resuelve bien ese color de tema y el
         # texto sale invisible, aunque en Excel se vea negro normal.
         # Mismo problema que ya se habia resuelto antes en otra parte de
-        # este documento -- se fuerza el color negro directo.
+        # este documento (D37/D39/D41-43) -- se usa el MISMO patron que
+        # ya funciona ahi: copiar la fuente completa con copy.copy() y
+        # solo cambiar el color (reconstruir un Font() nuevo desde cero
+        # perdia algun atributo que hacia que LibreOffice lo siguiera
+        # tratando como color de tema).
         for celda_etiqueta in ["E68", "E69"]:
-            fuente_actual = ws[celda_etiqueta].font
-            ws[celda_etiqueta].font = Font(
-                name=fuente_actual.name, size=fuente_actual.size,
-                bold=fuente_actual.bold, italic=fuente_actual.italic,
-                color="FF000000"
-            )
+            celda = ws[celda_etiqueta]
+            nueva_fuente = copy.copy(celda.font)
+            nueva_fuente.color = "FF000000"
+            celda.font = nueva_fuente
 
         # C. Declarante
         ws["D15"] = datos.get("nombre_completo", "")
