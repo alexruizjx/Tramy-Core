@@ -2654,32 +2654,45 @@ def _antioquia_calcular_validez_pdf(vigencia):
 
 
 def _cache_declaracion_buscar(placa, vigencia):
+    """Busca un PDF de declaracion sugerida ya generado hoy (o dentro de
+    su ventana de validez) para esta placa/vigencia. Devuelve un dict
+    {url, datos} si existe (datos puede ser None si se guardo antes de
+    que existiera esta columna), o None si no hay nada cacheado."""
     try:
         conn = get_db_conn()
         cur = conn.cursor()
         cur.execute("""
-            SELECT url FROM cache_declaraciones_antioquia
+            SELECT url, datos_json FROM cache_declaraciones_antioquia
             WHERE placa = %s AND vigencia = %s AND valido_hasta >= CURRENT_DATE
         """, (placa.upper(), int(vigencia)))
         row = cur.fetchone()
         cur.close(); conn.close()
-        return row[0] if row else None
+        if not row:
+            return None
+        return {"url": row[0], "datos": row[1]}
     except Exception as e:
         print(f"Error buscando cache de declaracion: {e}")
         return None
 
 
-def _cache_declaracion_guardar(placa, vigencia, url):
+def _cache_declaracion_guardar(placa, vigencia, url, datos_extra=None):
+    """Guarda el PDF generado en cache. 'datos_extra', si se da, guarda
+    ademas la liquidacion completa (avaluo, impuesto, sanciones, etc.) y
+    caja/traccion, para que otras herramientas (como la Declaracion
+    Manual) puedan reutilizarlos sin tener que consultar de nuevo en
+    vivo a la Gobernacion."""
     try:
         valido_hasta = _antioquia_calcular_validez_pdf(vigencia)
         conn = get_db_conn()
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO cache_declaraciones_antioquia (placa, vigencia, url, valido_hasta)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO cache_declaraciones_antioquia (placa, vigencia, url, valido_hasta, datos_json)
+            VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (placa, vigencia) DO UPDATE SET url = EXCLUDED.url,
-                valido_hasta = EXCLUDED.valido_hasta, creado_en = NOW()
-        """, (placa.upper(), int(vigencia), url, valido_hasta))
+                valido_hasta = EXCLUDED.valido_hasta,
+                datos_json = COALESCE(EXCLUDED.datos_json, cache_declaraciones_antioquia.datos_json),
+                creado_en = NOW()
+        """, (placa.upper(), int(vigencia), url, valido_hasta, json.dumps(datos_extra) if datos_extra else None))
         conn.commit()
         cur.close(); conn.close()
     except Exception as e:
@@ -2705,9 +2718,9 @@ def antioquia_generar_todas_declaraciones(placa, identificacion, tipo_documento_
     resultados = []
 
     for vigencia in vigencias:
-        url_cache = None if ignorar_cache else _cache_declaracion_buscar(placa, vigencia)
-        if url_cache:
-            resultados.append({"vigencia": vigencia, "ok": True, "url": url_cache})
+        cache = None if ignorar_cache else _cache_declaracion_buscar(placa, vigencia)
+        if cache:
+            resultados.append({"vigencia": vigencia, "ok": True, "url": cache["url"]})
             if job_id:
                 job_actualizar(job_id, f"Vigencia {vigencia}: usando declaración ya generada hoy...",
                                 datos_parciales=resultados)
@@ -2717,7 +2730,7 @@ def antioquia_generar_todas_declaraciones(placa, identificacion, tipo_documento_
             job_actualizar(job_id, f"Generando declaración de la vigencia {vigencia}...",
                             datos_parciales=resultados)
         try:
-            pdf_bytes, _data_vig = antioquia_generar_pdf_declaracion(
+            pdf_bytes, data_vig = antioquia_generar_pdf_declaracion(
                 placa, identificacion, tipo_documento_abrev, vigencia,
                 modelo, municipio_transito, apellidos_propietario,
                 celular, email, direccion, municipio, municipio_cod, departamento_cod
@@ -2730,7 +2743,20 @@ def antioquia_generar_todas_declaraciones(placa, identificacion, tipo_documento_
             url = subir_a_r2(ruta, f"declaraciones/{placa}_{vigencia}_{id_unico}.pdf",
                               nombre_descarga=f"Declaracion_{placa}_{vigencia}.pdf")
             os.remove(ruta)
-            _cache_declaracion_guardar(placa, vigencia, url)
+
+            # Se extrae caja/traccion (y se guarda la liquidacion completa)
+            # en cache -- asi otras herramientas (ej. la Declaracion
+            # Manual) pueden reutilizar estos datos sin volver a consultar
+            # en vivo a la Gobernacion.
+            try:
+                caja_traccion = _extraer_caja_traccion_declaracion(pdf_bytes)
+            except Exception:
+                caja_traccion = {}
+            datos_extra = dict(data_vig or {})
+            datos_extra["caja"] = caja_traccion.get("caja", "")
+            datos_extra["traccion"] = caja_traccion.get("traccion", "")
+
+            _cache_declaracion_guardar(placa, vigencia, url, datos_extra=datos_extra)
             resultados.append({"vigencia": vigencia, "ok": True, "url": url})
         except Exception as e:
             print(f"Error generando declaracion vigencia {vigencia} para {placa}: {e}", flush=True)
@@ -3789,17 +3815,42 @@ def generar_declaracion_manual_endpoint():
                 vehiculo = dict(zip(columnas, fila))
             cur.close(); conn.close()
 
-            job_actualizar(job_id, "Consultando liquidación en la Gobernación (puede tardar por el captcha)...")
-            pdf_sugerida_bytes, data_vig = antioquia_generar_pdf_declaracion(
-                placa, identificacion, tipo_documento, vigencia,
-                modelo, municipio_transito, apellidos_propietario,
-                celular=celular, email=email, direccion=direccion,
-                municipio=municipio_residencia, municipio_cod=municipio_cod,
-                departamento_cod=departamento_cod
-            )
+            # Si ya se genero una Declaracion Sugerida de esta misma
+            # placa/vigencia hoy (desde esta misma herramienta o desde el
+            # Generador de Declaraciones Sugeridas), se reutilizan esos
+            # datos en vez de volver a consultar en vivo a la Gobernacion
+            # (evita el captcha y es practicamente instantaneo).
+            cache = _cache_declaracion_buscar(placa, vigencia)
+            if cache and cache.get("datos"):
+                job_actualizar(job_id, "Usando liquidación ya consultada hoy (sin necesidad de captcha)...")
+                data_vig = cache["datos"]
+                caja_traccion = {"caja": data_vig.get("caja", ""), "traccion": data_vig.get("traccion", "")}
+            else:
+                job_actualizar(job_id, "Consultando liquidación en la Gobernación (puede tardar por el captcha)...")
+                pdf_sugerida_bytes, data_vig = antioquia_generar_pdf_declaracion(
+                    placa, identificacion, tipo_documento, vigencia,
+                    modelo, municipio_transito, apellidos_propietario,
+                    celular=celular, email=email, direccion=direccion,
+                    municipio=municipio_residencia, municipio_cod=municipio_cod,
+                    departamento_cod=departamento_cod
+                )
 
-            job_actualizar(job_id, "Extrayendo Caja y Tracción del documento...")
-            caja_traccion = _extraer_caja_traccion_declaracion(pdf_sugerida_bytes)
+                job_actualizar(job_id, "Extrayendo Caja y Tracción del documento...")
+                caja_traccion = _extraer_caja_traccion_declaracion(pdf_sugerida_bytes)
+
+                # Se guarda en cache SOLO si ya existia una entrada con
+                # PDF real generado antes (para no crear una fila sin URL
+                # que despues rompa al Generador de Declaraciones
+                # Sugeridas si busca un PDF que no existe). Si no habia
+                # nada en cache, esta consulta simplemente no se
+                # comparte -- la proxima vez que se use CUALQUIERA de las
+                # dos herramientas, la que la use primero la deja
+                # guardada para la otra.
+                if cache and cache.get("url"):
+                    datos_extra = dict(data_vig or {})
+                    datos_extra["caja"] = caja_traccion.get("caja", "")
+                    datos_extra["traccion"] = caja_traccion.get("traccion", "")
+                    _cache_declaracion_guardar(placa, vigencia, cache["url"], datos_extra=datos_extra)
 
             datos = {
                 "vigencia": vigencia,
