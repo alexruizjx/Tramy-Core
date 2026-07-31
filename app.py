@@ -3776,12 +3776,15 @@ def generar_declaracion_manual_endpoint():
     los datos del propietario que escribe el usuario, y la liquidacion
     privada + caja/traccion que se obtienen de una consulta real a la
     Gobernacion (la misma consulta que usa la Declaracion Sugerida).
-    Se ejecuta en segundo plano por el mismo motivo que las demas consultas
-    a la Gobernacion: puede tardar por los captchas."""
+    Acepta varias vigencias separadas por coma (igual que el Generador de
+    Declaraciones Sugeridas) -- cada una es independiente, si una falla
+    las demas igual se entregan. Se ejecuta en segundo plano por el mismo
+    motivo que las demas consultas a la Gobernacion: puede tardar por los
+    captchas."""
     placa = request.args.get("placa", "").upper().strip()
     identificacion = request.args.get("identificacion", "").strip()
     tipo_documento = request.args.get("tipo_documento", "CC").strip()
-    vigencia = request.args.get("vigencia", "").strip()
+    vigencias_raw = request.args.get("vigencia", "").strip()
     modelo = request.args.get("modelo", "").strip()
     municipio_transito = request.args.get("municipio_transito", "").strip()
     apellidos_propietario = request.args.get("apellidos_propietario", "").strip()
@@ -3796,15 +3799,17 @@ def generar_declaracion_manual_endpoint():
     departamento_cod = request.args.get("departamento_cod", "").strip()
     departamento_cod = int(departamento_cod) if departamento_cod.isdigit() else 5
 
-    if not all([placa, identificacion, vigencia, modelo, municipio_transito, apellidos_propietario]):
+    if not all([placa, identificacion, vigencias_raw, modelo, municipio_transito, apellidos_propietario]):
         return jsonify({"error": "Faltan parametros: placa, identificacion, vigencia, modelo, municipio_transito, apellidos_propietario"}), 400
+
+    vigencias = [v.strip() for v in vigencias_raw.split(",") if v.strip()]
 
     job_id = str(uuid.uuid4())
     job_actualizar(job_id, "Iniciando...", "procesando")
 
     def ejecutar():
+        resultados = []
         try:
-            job_actualizar(job_id, "Consultando datos guardados del vehículo...")
             conn = get_db_conn()
             cur = conn.cursor()
             cur.execute("SELECT * FROM vehiculos WHERE placa = %s", (placa,))
@@ -3815,100 +3820,108 @@ def generar_declaracion_manual_endpoint():
                 vehiculo = dict(zip(columnas, fila))
             cur.close(); conn.close()
 
-            # Si ya se genero una Declaracion Sugerida de esta misma
-            # placa/vigencia hoy (desde esta misma herramienta o desde el
-            # Generador de Declaraciones Sugeridas), se reutilizan esos
-            # datos en vez de volver a consultar en vivo a la Gobernacion
-            # (evita el captcha y es practicamente instantaneo).
-            cache = _cache_declaracion_buscar(placa, vigencia)
-            if cache and cache.get("datos"):
-                job_actualizar(job_id, "Usando liquidación ya consultada hoy (sin necesidad de captcha)...")
-                data_vig = cache["datos"]
-                caja_traccion = {"caja": data_vig.get("caja", ""), "traccion": data_vig.get("traccion", "")}
-            else:
-                job_actualizar(job_id, "Consultando liquidación en la Gobernación (puede tardar por el captcha)...")
-                pdf_sugerida_bytes, data_vig = antioquia_generar_pdf_declaracion(
-                    placa, identificacion, tipo_documento, vigencia,
-                    modelo, municipio_transito, apellidos_propietario,
-                    celular=celular, email=email, direccion=direccion,
-                    municipio=municipio_residencia, municipio_cod=municipio_cod,
-                    departamento_cod=departamento_cod
-                )
+            for vigencia in vigencias:
+                try:
+                    # Si ya se genero una Declaracion Sugerida de esta
+                    # misma placa/vigencia hoy (desde esta misma
+                    # herramienta o desde el Generador de Declaraciones
+                    # Sugeridas), se reutilizan esos datos en vez de
+                    # volver a consultar en vivo a la Gobernacion (evita
+                    # el captcha y es practicamente instantaneo).
+                    cache = _cache_declaracion_buscar(placa, vigencia)
+                    if cache and cache.get("datos"):
+                        job_actualizar(job_id, f"Vigencia {vigencia}: usando liquidación ya consultada hoy...",
+                                        datos_parciales=resultados)
+                        data_vig = cache["datos"]
+                        caja_traccion = {"caja": data_vig.get("caja", ""), "traccion": data_vig.get("traccion", "")}
+                    else:
+                        job_actualizar(job_id, f"Vigencia {vigencia}: consultando en la Gobernación (puede tardar por el captcha)...",
+                                        datos_parciales=resultados)
+                        pdf_sugerida_bytes, data_vig = antioquia_generar_pdf_declaracion(
+                            placa, identificacion, tipo_documento, vigencia,
+                            modelo, municipio_transito, apellidos_propietario,
+                            celular=celular, email=email, direccion=direccion,
+                            municipio=municipio_residencia, municipio_cod=municipio_cod,
+                            departamento_cod=departamento_cod
+                        )
+                        caja_traccion = _extraer_caja_traccion_declaracion(pdf_sugerida_bytes)
 
-                job_actualizar(job_id, "Extrayendo Caja y Tracción del documento...")
-                caja_traccion = _extraer_caja_traccion_declaracion(pdf_sugerida_bytes)
+                        # Se guarda en cache SOLO si ya existia una entrada
+                        # con PDF real generado antes (para no crear una
+                        # fila sin URL que despues rompa al Generador de
+                        # Declaraciones Sugeridas si busca un PDF que no
+                        # existe).
+                        if cache and cache.get("url"):
+                            datos_extra = dict(data_vig or {})
+                            datos_extra["caja"] = caja_traccion.get("caja", "")
+                            datos_extra["traccion"] = caja_traccion.get("traccion", "")
+                            _cache_declaracion_guardar(placa, vigencia, cache["url"], datos_extra=datos_extra)
 
-                # Se guarda en cache SOLO si ya existia una entrada con
-                # PDF real generado antes (para no crear una fila sin URL
-                # que despues rompa al Generador de Declaraciones
-                # Sugeridas si busca un PDF que no existe). Si no habia
-                # nada en cache, esta consulta simplemente no se
-                # comparte -- la proxima vez que se use CUALQUIERA de las
-                # dos herramientas, la que la use primero la deja
-                # guardada para la otra.
-                if cache and cache.get("url"):
-                    datos_extra = dict(data_vig or {})
-                    datos_extra["caja"] = caja_traccion.get("caja", "")
-                    datos_extra["traccion"] = caja_traccion.get("traccion", "")
-                    _cache_declaracion_guardar(placa, vigencia, cache["url"], datos_extra=datos_extra)
+                    datos = {
+                        "vigencia": vigencia,
+                        "nombre_completo": nombres_propietario,
+                        "apellidos": apellidos_propietario,
+                        "celular": celular if celular != "3000000000" else "",
+                        "telefono": "",
+                        "email": email if email != "consulta@consulta.com" else "",
+                        "direccion": direccion if direccion != "CRA" else "",
+                        "municipio_residencia": municipio_residencia,
+                        "departamento_residencia": "ANTIOQUIA",
+                        "numero_documento": identificacion,
+                        "tipo_documento": tipo_documento,
 
-            datos = {
-                "vigencia": vigencia,
-                "nombre_completo": nombres_propietario,
-                "apellidos": apellidos_propietario,
-                "celular": celular if celular != "3000000000" else "",
-                "telefono": "",
-                "email": email if email != "consulta@consulta.com" else "",
-                "direccion": direccion if direccion != "CRA" else "",
-                "municipio_residencia": municipio_residencia,
-                "departamento_residencia": "ANTIOQUIA",
-                "numero_documento": identificacion,
-                "tipo_documento": tipo_documento,
+                        "placa": placa,
+                        "marca": vehiculo.get("marca", ""),
+                        "linea": vehiculo.get("linea", ""),
+                        "modelo": modelo,
+                        "clase": vehiculo.get("clase", ""),
+                        "carroceria": vehiculo.get("carroceria", ""),
+                        "puertas": vehiculo.get("puertas", ""),
+                        "cilindraje": vehiculo.get("cilindrada", ""),
+                        "capacidad_carga": vehiculo.get("capacidad_carga", ""),
+                        "capacidad_pasajeros": vehiculo.get("capacidad_pasajeros", ""),
+                        "municipio_matricula": municipio_transito,
+                        "departamento_matricula": "ANTIOQUIA",
+                        "blindado": bool(vehiculo.get("info_blindaje")),
+                        "importado": False,
+                        "caja": caja_traccion.get("caja", ""),
+                        "traccion": caja_traccion.get("traccion", ""),
 
-                "placa": placa,
-                "marca": vehiculo.get("marca", ""),
-                "linea": vehiculo.get("linea", ""),
-                "modelo": modelo,
-                "clase": vehiculo.get("clase", ""),
-                "carroceria": vehiculo.get("carroceria", ""),
-                "puertas": vehiculo.get("puertas", ""),
-                "cilindraje": vehiculo.get("cilindrada", ""),
-                "capacidad_carga": vehiculo.get("capacidad_carga", ""),
-                "capacidad_pasajeros": vehiculo.get("capacidad_pasajeros", ""),
-                "municipio_matricula": municipio_transito,
-                "departamento_matricula": "ANTIOQUIA",
-                "blindado": bool(vehiculo.get("info_blindaje")),
-                "importado": False,
-                "caja": caja_traccion.get("caja", ""),
-                "traccion": caja_traccion.get("traccion", ""),
+                        # Liquidacion privada -- ver nota de mapeo mas abajo
+                        "avaluo": data_vig.get("avaluoComercial", 0),
+                        "impuesto": data_vig.get("impuesto", 0),
+                        "sanciones": data_vig.get("sancion", 0),
+                        "descuentos": data_vig.get("descuentoSancion", 0),
+                        "total_cargo_5": data_vig.get("totalCargo", 0),
+                        "total_cargo_6": data_vig.get("totalCargo", 0),
+                        "intereses_mora": data_vig.get("interesesMora", 0),
+                        "pagos_anteriores": data_vig.get("pagosAnteriores", 0),
+                        "descuento_interes": data_vig.get("descuentoInteresesMora", 0),
+                        "saldo_favor": data_vig.get("saldoFavor", 0),
+                        # OJO: se usa "saldoPagar", NO "totalPagar" -- este
+                        # ultimo incluye el costo de $25.900 del servicio
+                        # de declaracion sugerida, que no aplica a la
+                        # declaracion manual.
+                        "total_pagar": data_vig.get("saldoPagar", 0),
+                    }
 
-                # Liquidacion privada -- ver nota de mapeo mas abajo
-                "avaluo": data_vig.get("avaluoComercial", 0),
-                "impuesto": data_vig.get("impuesto", 0),
-                "sanciones": data_vig.get("sancion", 0),
-                "descuentos": data_vig.get("descuentoSancion", 0),
-                "total_cargo_5": data_vig.get("totalCargo", 0),
-                "total_cargo_6": data_vig.get("totalCargo", 0),
-                "intereses_mora": data_vig.get("interesesMora", 0),
-                "pagos_anteriores": data_vig.get("pagosAnteriores", 0),
-                "descuento_interes": data_vig.get("descuentoInteresesMora", 0),
-                "saldo_favor": data_vig.get("saldoFavor", 0),
-                # OJO: se usa "saldoPagar", NO "totalPagar" -- este ultimo
-                # incluye el costo de $25.900 del servicio de declaracion
-                # sugerida, que no aplica a la declaracion manual.
-                "total_pagar": data_vig.get("saldoPagar", 0),
-            }
+                    job_actualizar(job_id, f"Vigencia {vigencia}: generando el documento...", datos_parciales=resultados)
+                    id_unico = uuid.uuid4().hex[:8]
+                    ruta_pdf = f"/tmp/decl_manual_{placa}_{vigencia}_{id_unico}.pdf"
+                    generar_declaracion_manual_pdf(datos, ruta_pdf)
 
-            job_actualizar(job_id, "Generando el documento...")
-            id_unico = uuid.uuid4().hex[:8]
-            ruta_pdf = f"/tmp/decl_manual_{placa}_{vigencia}_{id_unico}.pdf"
-            generar_declaracion_manual_pdf(datos, ruta_pdf)
+                    url = subir_a_r2(ruta_pdf, f"declaraciones-manuales/{placa}_{vigencia}_{id_unico}.pdf",
+                                      nombre_descarga=f"Declaracion_Manual_{placa}_{vigencia}.pdf")
+                    os.remove(ruta_pdf)
 
-            url = subir_a_r2(ruta_pdf, f"declaraciones-manuales/{placa}_{vigencia}_{id_unico}.pdf",
-                              nombre_descarga=f"Declaracion_Manual_{placa}_{vigencia}.pdf")
-            os.remove(ruta_pdf)
+                    resultados.append({"vigencia": vigencia, "ok": True, "url": url})
+                except Exception as e_vig:
+                    print(f"Error generando declaracion manual vigencia {vigencia} para {placa}: {e_vig}", flush=True)
+                    resultados.append({"vigencia": vigencia, "ok": False, "error": str(e_vig)})
 
-            job_terminar(job_id, {"url": url})
+                job_actualizar(job_id, f"Vigencia {vigencia} lista.", datos_parciales=resultados)
+
+            job_terminar(job_id, {"resultados": resultados})
         except Exception as e:
             import traceback
             print(traceback.format_exc(), flush=True)
