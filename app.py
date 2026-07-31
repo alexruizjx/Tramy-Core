@@ -12,7 +12,6 @@ import threading
 import boto3
 from botocore.config import Config
 from datetime import datetime, timedelta, date
-from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 from pypdf import PdfWriter
@@ -1452,7 +1451,7 @@ def generar_declaracion_manual_pdf(datos, ruta_salida_pdf):
     # que una vencida. Las etiquetas fijas ("FECHA LÍMITE PAGO" / "FECHA
     # GENERACIÓN") ya estan en la plantilla (E68/E69) -- aqui solo se
     # escribe el valor de cada fecha, en las celdas AE68/AE69.
-    hoy = datetime.now(ZoneInfo("America/Bogota"))
+    hoy = datetime.utcnow() - timedelta(hours=5)  # Colombia = UTC-5 todo el año, sin horario de verano
     fecha_generacion_str = hoy.strftime("%d/%m/%Y")
     fecha_limite = _antioquia_calcular_validez_pdf(datos.get("vigencia", hoy.year))
     fecha_limite_str = fecha_limite.strftime("%d/%m/%Y")
@@ -2680,7 +2679,7 @@ def _antioquia_calcular_validez_pdf(vigencia):
     OJO: el servidor corre en UTC, pero "el mismo dia" debe ser el dia en
     Colombia -- sin este ajuste, de 7pm a 12am hora Colombia el servidor
     ya cree que es el dia siguiente (UTC va 5 horas adelante)."""
-    hoy = datetime.now(ZoneInfo("America/Bogota")).date()
+    hoy = (datetime.utcnow() - timedelta(hours=5)).date()  # Colombia = UTC-5 todo el año, sin horario de verano
     anio_actual = hoy.year
 
     if int(vigencia) == anio_actual:
