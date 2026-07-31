@@ -1448,9 +1448,9 @@ def generar_declaracion_manual_pdf(datos, ruta_salida_pdf):
     # intereses suben a diario); la del año en curso sirve durante toda
     # la ventana de pronto pago (hasta el 30 de abril o el 31 de julio,
     # segun cuando se genere), y desde el 1 de agosto se comporta igual
-    # que una vencida.
-    # NOTA: pendiente indicar en que celda exacta va cada fecha (el
-    # texto fijo de las etiquetas se agrega directo en la plantilla).
+    # que una vencida. Las etiquetas fijas ("FECHA LÍMITE PAGO" / "FECHA
+    # GENERACIÓN") ya estan en la plantilla (E68/E69) -- aqui solo se
+    # escribe el valor de cada fecha, en las celdas AE68/AE69.
     hoy = datetime.now()
     fecha_generacion_str = hoy.strftime("%d/%m/%Y")
     fecha_limite = _antioquia_calcular_validez_pdf(datos.get("vigencia", hoy.year))
@@ -1461,6 +1461,9 @@ def generar_declaracion_manual_pdf(datos, ruta_salida_pdf):
 
         # A. Periodo
         ws["H12"] = datos.get("vigencia", "")
+
+        ws["AE68"] = fecha_limite_str
+        ws["AE69"] = fecha_generacion_str
 
         # C. Declarante
         ws["D15"] = datos.get("nombre_completo", "")
