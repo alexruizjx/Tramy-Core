@@ -1240,7 +1240,7 @@ def guardar_vehiculo_runt(datos):
 import unicodedata
 import subprocess
 import shutil
-from openpyxl.styles import PatternFill, Alignment, Border, Side
+from openpyxl.styles import PatternFill, Alignment, Border, Side, Font
 from openpyxl.worksheet.pagebreak import Break
 import openpyxl as _openpyxl
 import copy
@@ -1439,6 +1439,22 @@ def generar_declaracion_manual_pdf(datos, ruta_salida_pdf):
     RECAUDADORA). 'datos' es un dict con todos los campos ya resueltos:
     datos del vehiculo, del propietario, y la liquidacion privada."""
     wb = _openpyxl.load_workbook(DECLARACION_MANUAL_PLANTILLA)
+
+    # FECHA GENERACIÓN / FECHA LÍMITE PAGO -- el PDF de la Declaracion
+    # Sugerida (que viene directo de la Gobernacion) siempre trae estas
+    # dos fechas. Se calculan aqui con la MISMA logica de validez que ya
+    # se usa para el cache (_antioquia_calcular_validez_pdf): una
+    # vigencia vencida solo sirve el mismo dia en que se genero (los
+    # intereses suben a diario); la del año en curso sirve durante toda
+    # la ventana de pronto pago (hasta el 30 de abril o el 31 de julio,
+    # segun cuando se genere), y desde el 1 de agosto se comporta igual
+    # que una vencida.
+    # NOTA: pendiente indicar en que celda exacta va cada fecha (el
+    # texto fijo de las etiquetas se agrega directo en la plantilla).
+    hoy = datetime.now()
+    fecha_generacion_str = hoy.strftime("%d/%m/%Y")
+    fecha_limite = _antioquia_calcular_validez_pdf(datos.get("vigencia", hoy.year))
+    fecha_limite_str = fecha_limite.strftime("%d/%m/%Y")
 
     for nombre_hoja in wb.sheetnames:
         ws = wb[nombre_hoja]
