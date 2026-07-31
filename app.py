@@ -1249,7 +1249,7 @@ import copy
 # La plantilla debe subirse al repositorio junto a app.py, con este mismo
 # nombre exacto ("AppJX.xlsm"), en el mismo directorio.
 FUN_PLANTILLA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "AppJX.xlsm")
-DECLARACION_MANUAL_PLANTILLA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DECLARACION_MANUAL_DE_IMPUESTOS_DEPARTAMENTALES.xlsx")
+DECLARACION_MANUAL_PLANTILLA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DECLARACION_MANUAL_DE_IMPUESTOS_DEPARTAMENTALES V2.xlsx")
 
 VERDE_MARCA = PatternFill(start_color="92D050", end_color="92D050", fill_type="solid")
 
@@ -2698,12 +2698,20 @@ def _cache_declaracion_buscar(placa, vigencia):
     datos} si existe (url/url_manual/datos pueden venir en None si nunca
     se genero ese PDF en particular), o None si no hay nada cacheado."""
     try:
+        # OJO: no se usa CURRENT_DATE de Postgres porque el servidor de
+        # base de datos corre en su propia zona horaria (UTC), distinta
+        # a la de Colombia -- eso causaba que, en la noche (cuando UTC ya
+        # va en el dia siguiente), el cache pareciera "vencido" aunque
+        # todavia fuera valido segun la hora real de Colombia. Se manda
+        # la fecha de Colombia calculada en Python, para que ambos lados
+        # de la comparacion usen la MISMA referencia de "hoy".
+        hoy_colombia = (datetime.utcnow() - timedelta(hours=5)).date()
         conn = get_db_conn()
         cur = conn.cursor()
         cur.execute("""
             SELECT url, datos_json, url_manual FROM cache_declaraciones_antioquia
-            WHERE placa = %s AND vigencia = %s AND valido_hasta >= CURRENT_DATE
-        """, (placa.upper(), int(vigencia)))
+            WHERE placa = %s AND vigencia = %s AND valido_hasta >= %s
+        """, (placa.upper(), int(vigencia), hoy_colombia))
         row = cur.fetchone()
         cur.close(); conn.close()
         if not row:
