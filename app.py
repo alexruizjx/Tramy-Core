@@ -348,17 +348,21 @@ def medellin_crear_usuario(datos):
             if datos.get("celular"):
                 page.fill("#cCelular", datos["celular"])
 
-            # 7. Pais/Departamento/Ciudad ya vienen preseleccionados en
-            # Colombia/Antioquia/Medellin -- solo se cambian si se pide
-            # explicitamente algo distinto.
-            if datos.get("ciudad_valor"):
-                page.select_option("#cCiudad", value=datos["ciudad_valor"])
+            # 7. Pais, Departamento y Ciudad -- se seleccionan explicito
+            # (Colombia / Antioquia / Medellin), en vez de confiar en que
+            # ya vienen preseleccionados asi por defecto en el HTML.
+            page.select_option("#cPais", value="CO")
+            page.select_option("#cDepartamento", value="05-ANTIOQUIA")
+            page.select_option("#cCiudad", value="05001-MEDELLÍN")
 
             # 8. Aceptar politicas de uso (obligatorio) y autorizar
             # notificaciones (opcional, pero conviene para que lleguen
-            # avisos del tramite).
-            page.check("#cAcepto")
-            page.check("#cNotifica")
+            # avisos del tramite). El <input type="checkbox"> real esta
+            # oculto por CSS (checkbox personalizado con su propio
+            # estilo) -- se hace clic en la etiqueta visible en vez del
+            # checkbox directamente, que es lo que ve y usa una persona.
+            page.click('label[for="cAcepto"]')
+            page.click('label[for="cNotifica"]')
 
             page.wait_for_timeout(500)
 
