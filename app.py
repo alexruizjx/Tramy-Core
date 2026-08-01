@@ -316,10 +316,22 @@ def medellin_crear_usuario(datos):
         def _capturar_peticion(response):
             try:
                 if response.request.resource_type in ("xhr", "fetch"):
+                    cuerpo_pedido = None
+                    cuerpo_respuesta = None
+                    try:
+                        cuerpo_pedido = response.request.post_data
+                    except Exception:
+                        pass
+                    try:
+                        cuerpo_respuesta = response.text()[:1500]
+                    except Exception:
+                        pass
                     peticiones_capturadas.append({
                         "url": response.url,
                         "status": response.status,
                         "metodo": response.request.method,
+                        "cuerpo_pedido": cuerpo_pedido,
+                        "cuerpo_respuesta": cuerpo_respuesta,
                     })
             except Exception:
                 pass
@@ -387,11 +399,24 @@ def medellin_crear_usuario(datos):
 
             # 9. Pais, Departamento y Ciudad -- se seleccionan explicito
             # (Colombia / Antioquia / Medellin), en vez de confiar en que
-            # ya vienen preseleccionados asi por defecto en el HTML. Se
-            # hace AL FINAL, justo antes de Siguiente, para que nada mas
-            # (como los checkboxes) alcance a resetear la Ciudad despues.
+            # ya vienen preseleccionados asi por defecto en el HTML.
+            # OJO: se detecto que Ciudad se resetea solo unos ~500ms
+            # despues de seleccionarla, sin importar el orden con los
+            # checkboxes -- sospecha: el propio sitio, al cambiar
+            # Departamento, dispara con un poco de retraso un reinicio
+            # automatico de Ciudad (patron comun de "selects en cascada").
+            # Se prueba dejando que ese reinicio (si existe) ocurra ANTES,
+            # dejando Ciudad como lo ULTIMO que se toca del formulario.
             page.select_option("#cPais", value="CO")
             page.select_option("#cDepartamento", value="05-ANTIOQUIA")
+            page.wait_for_timeout(2500)  # dejar que cualquier reinicio automatico de Ciudad ya ocurra aqui
+
+            try:
+                v0 = page.evaluate("() => document.querySelector('#cCiudad').value")
+                print(f"{etiqueta} === CIUDAD antes de seleccionarla (tras esperar por Departamento): '{v0}'", flush=True)
+            except Exception as e0:
+                print(f"{etiqueta} No se pudo leer ciudad (momento 0): {e0}", flush=True)
+
             page.select_option("#cCiudad", value="05001-MEDELLÍN")
 
             # DIAGNOSTICO TEMPORAL -- revisar el valor de Ciudad en varios
