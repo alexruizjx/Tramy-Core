@@ -591,12 +591,15 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
 
             # 3. Confirmar que la sesion quedo autenticada (revisa el
             # username devuelto, debe coincidir con el que se uso para
-            # entrar).
+            # entrar). OJO: el sitio antepone "UE" al numero de
+            # documento (ej "UE1036614666"), asi que no se compara
+            # exacto -- solo se revisa que NO sea "ANONIMO" (el valor
+            # que devuelve cuando el login de verdad fallo).
             resp_jwt = page.request.get(f"{MEDELLIN_AVIT_API}/login/JWT/")
             datos_sesion = resp_jwt.json()
             print(f"{etiqueta} Usuario autenticado segun el sitio: {datos_sesion.get('username')}", flush=True)
-            if datos_sesion.get("username") != usuario:
-                return False, {"error": "El login no parece haber funcionado (usuario no coincide)."}
+            if not datos_sesion.get("username") or datos_sesion.get("username") == "ANONIMO":
+                return False, {"error": "El login no parece haber funcionado (sesión sigue anónima)."}
 
             headers_json = {"Content-Type": "application/json"}
 
