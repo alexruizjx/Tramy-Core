@@ -977,6 +977,41 @@ def _envigado_polling_citas(duracion_segundos, intervalo_segundos=30):
     _envigado_citas_monitoreo_estado["detener"] = False
 
 
+# Igual que el de Envigado, pero para Medellin -- se guarda el ultimo
+# hallazgo EN MEMORIA (se pierde si el servidor se reinicia, pero eso ya
+# se acepta igual para el resto de estos monitoreos en vivo) para que el
+# aviso en Ejecucion pueda mostrar el resultado sin tener que esperar el
+# siguiente ciclo.
+_medellin_citas_monitoreo_estado = {
+    "activo": False, "inicio": None, "fin_esperado": None, "detener": False,
+    "ultimo_hallazgo": None,
+}
+
+
+def _medellin_polling_citas(usuario, password, placa, id_servicio, duracion_segundos, intervalo_segundos=30):
+    """Revisa si hay citas disponibles en Medellin cada 'intervalo_segundos'
+    (30 por defecto), durante 'duracion_segundos'. A diferencia de
+    Envigado, aqui hay que volver a iniciar sesion en cada ciclo (cada
+    revision abre su propia sesion de Playwright)."""
+    fin = time.time() + duracion_segundos
+    while time.time() < fin:
+        if _medellin_citas_monitoreo_estado["detener"]:
+            break
+        try:
+            hay_citas, detalle = medellin_hay_citas_disponibles(usuario, password, placa, id_servicio)
+            if hay_citas:
+                _medellin_citas_monitoreo_estado["ultimo_hallazgo"] = {
+                    "detalle": detalle,
+                    "encontrado_en": datetime.now().isoformat() + "Z",  # UTC -- el navegador lo convierte solo a hora local
+                }
+        except Exception as e:
+            print(f"Error en monitoreo constante de citas Medellin: {e}", flush=True)
+        time.sleep(intervalo_segundos)
+
+    _medellin_citas_monitoreo_estado["activo"] = False
+    _medellin_citas_monitoreo_estado["detener"] = False
+
+
 def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_monitor=1, numeros_vigilados=None):
     """Revisa el "monitor de turnos" de Envigado cada pocos segundos,
     durante 'duracion_segundos'. Cada vez que aparece un idGestionAtencion
@@ -4669,6 +4704,73 @@ def envigado_citas_estado_monitoreo_endpoint():
         "activo": _envigado_citas_monitoreo_estado["activo"],
         "inicio": _envigado_citas_monitoreo_estado["inicio"],
         "fin_esperado": _envigado_citas_monitoreo_estado["fin_esperado"],
+    })
+
+
+@app.route("/medellin-citas-iniciar-monitoreo", methods=["GET"])
+def medellin_citas_iniciar_monitoreo_endpoint():
+    """Arranca una sesion de monitoreo CONSTANTE de citas disponibles en
+    Medellin -- revisa cada 30 segundos, durante maximo 2 horas (o hasta
+    que se detenga manualmente)."""
+    if _medellin_citas_monitoreo_estado["activo"]:
+        return jsonify({
+            "ok": False,
+            "error": "Ya hay una sesión de monitoreo de citas de Medellín corriendo.",
+            "fin_esperado": _medellin_citas_monitoreo_estado["fin_esperado"]
+        }), 409
+
+    usuario = request.args.get("usuario", "").strip()
+    password = request.args.get("password", "").strip()
+    placa = request.args.get("placa", "").upper().strip()
+    id_servicio = request.args.get("id_servicio", MEDELLIN_SERVICIO_TRASPASO).strip()
+    if not all([usuario, password, placa]):
+        return jsonify({"error": "Faltan datos: usuario, password, placa"}), 400
+
+    duracion_minutos = request.args.get("minutos", "120")
+    duracion_minutos = int(duracion_minutos) if duracion_minutos.isdigit() else 120
+    duracion_minutos = min(duracion_minutos, 120)  # tope maximo de 2 horas
+    duracion_segundos = duracion_minutos * 60
+
+    _medellin_citas_monitoreo_estado["activo"] = True
+    _medellin_citas_monitoreo_estado["inicio"] = datetime.now().isoformat() + "Z"  # UTC
+    _medellin_citas_monitoreo_estado["fin_esperado"] = (datetime.now() + timedelta(seconds=duracion_segundos)).isoformat() + "Z"  # UTC
+    _medellin_citas_monitoreo_estado["detener"] = False
+    _medellin_citas_monitoreo_estado["ultimo_hallazgo"] = None  # se limpia cualquier hallazgo viejo de una sesion anterior
+
+    threading.Thread(
+        target=_medellin_polling_citas,
+        args=(usuario, password, placa, id_servicio, duracion_segundos),
+        daemon=True
+    ).start()
+
+    return jsonify({
+        "ok": True,
+        "mensaje": f"Monitoreo de citas de Medellín iniciado, revisando cada 30 segundos por {duracion_minutos} minutos (o hasta que lo detengas).",
+        "fin_esperado": _medellin_citas_monitoreo_estado["fin_esperado"]
+    })
+
+
+@app.route("/medellin-citas-detener-monitoreo", methods=["GET"])
+def medellin_citas_detener_monitoreo_endpoint():
+    """Detiene la sesion de monitoreo constante de citas de Medellin
+    antes de que se cumpla el tiempo maximo."""
+    if not _medellin_citas_monitoreo_estado["activo"]:
+        return jsonify({"ok": False, "error": "No hay ningún monitoreo de citas de Medellín corriendo en este momento."}), 409
+    _medellin_citas_monitoreo_estado["detener"] = True
+    return jsonify({"ok": True, "mensaje": "Deteniendo el monitoreo de citas de Medellín..."})
+
+
+@app.route("/medellin-citas-estado-monitoreo", methods=["GET"])
+def medellin_citas_estado_monitoreo_endpoint():
+    """Indica si hay una sesion de monitoreo constante de citas de
+    Medellin activa, y el ultimo hallazgo (si hay alguno) guardado
+    durante esta sesion."""
+    return jsonify({
+        "ok": True,
+        "activo": _medellin_citas_monitoreo_estado["activo"],
+        "inicio": _medellin_citas_monitoreo_estado["inicio"],
+        "fin_esperado": _medellin_citas_monitoreo_estado["fin_esperado"],
+        "ultimo_hallazgo": _medellin_citas_monitoreo_estado["ultimo_hallazgo"],
     })
 
 
