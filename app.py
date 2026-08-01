@@ -342,52 +342,44 @@ def medellin_crear_usuario(datos):
                 valor_genero = MEDELLIN_GENERO.get(datos["genero"], "m")
                 page.select_option("#cGenero", value=valor_genero)
 
-            # 6. Correo, Direccion, Telefono
+            # 6. Correo y Direccion
             page.fill("#cCorreoElectronico", datos["email"])
             page.fill("#cDireccionResidencia", datos["direccion"])
-            # DIAGNOSTICO TEMPORAL -- revisar de inmediato si la direccion
-            # ya se daño justo aqui (antes de tocar Ciudad/Departamento).
-            try:
-                valor_dir_inmediato = page.evaluate("() => document.querySelector('#cDireccionResidencia').value")
-                print(f"=== DIAGNOSTICO INMEDIATO (justo despues de llenar Direccion): '{valor_dir_inmediato}'", flush=True)
-            except Exception as e_diag_dir:
-                print(f"No se pudo leer el valor de direccion: {e_diag_dir}", flush=True)
-            page.fill("#cTelefono", datos["telefono"])
-            if datos.get("celular"):
-                page.fill("#cCelular", datos["celular"])
 
-            # 7. Pais, Departamento y Ciudad -- se seleccionan explicito
-            # (Colombia / Antioquia / Medellin), en vez de confiar en que
-            # ya vienen preseleccionados asi por defecto en el HTML.
-            page.select_option("#cPais", value="CO")
-            page.select_option("#cDepartamento", value="05-ANTIOQUIA")
-            page.select_option("#cCiudad", value="05001-MEDELLÍN")
-
-            # DIAGNOSTICO TEMPORAL -- revisar de inmediato (antes de
-            # tocar los checkboxes) si Direccion/Ciudad ya se dañaron en
-            # este punto, o si pasa despues.
-            try:
-                valores_inmediatos = page.evaluate("""() => {
-                    return {
-                        direccion: document.querySelector('#cDireccionResidencia').value,
-                        ciudad: document.querySelector('#cCiudad').value,
-                        departamento: document.querySelector('#cDepartamento').value,
-                    };
-                }""")
-                print(f"=== DIAGNOSTICO INMEDIATO (justo despues de pais/depto/ciudad, antes de checkboxes): {valores_inmediatos}", flush=True)
-            except Exception as e_diag_inm:
-                print(f"No se pudo leer valores inmediatos: {e_diag_inm}", flush=True)
-
-            # 8. Aceptar politicas de uso (obligatorio) y autorizar
+            # 7. Aceptar politicas de uso (obligatorio) y autorizar
             # notificaciones (opcional, pero conviene para que lleguen
             # avisos del tramite). El <input type="checkbox"> real esta
             # oculto por CSS (checkbox personalizado con su propio
             # estilo) -- se hace clic en la etiqueta visible en vez del
             # checkbox directamente, que es lo que ve y usa una persona.
+            # OJO: se hace ESTO primero, y Telefono/Ciudad AL FINAL --
+            # se detecto que hacer clic en estos checkboxes reseteaba el
+            # campo Ciudad si se seleccionaba antes.
             page.click('label[for="cAcepto"]')
             page.click('label[for="cNotifica"]')
-
             page.wait_for_timeout(500)
+
+            # 8. Telefono -- tambien parece validarse contra el servidor
+            # (igual que el numero de identificacion), asi que se le da
+            # tiempo de sobra despues de escribirlo.
+            page.fill("#cTelefono", datos["telefono"])
+            if datos.get("celular"):
+                page.fill("#cCelular", datos["celular"])
+            page.wait_for_timeout(3000)
+
+            # 9. Pais, Departamento y Ciudad -- se seleccionan explicito
+            # (Colombia / Antioquia / Medellin), en vez de confiar en que
+            # ya vienen preseleccionados asi por defecto en el HTML. Se
+            # hace AL FINAL, justo antes de Siguiente, para que nada mas
+            # (como los checkboxes) alcance a resetear la Ciudad despues.
+            page.select_option("#cPais", value="CO")
+            page.select_option("#cDepartamento", value="05-ANTIOQUIA")
+            page.select_option("#cCiudad", value="05001-MEDELLÍN")
+            page.wait_for_timeout(500)
+
+            # Se le da mas tiempo de sobra a la validacion del numero de
+            # identificacion tambien, por si seguia pendiente.
+            page.wait_for_timeout(2000)
 
             # DIAGNOSTICO -- antes de dar clic en "Siguiente", se revisa
             # si algun campo quedo marcado como invalido (la casilla
