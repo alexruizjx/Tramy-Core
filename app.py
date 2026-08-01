@@ -60,6 +60,20 @@ def subir_a_r2(ruta_local, nombre_archivo_remoto, content_type="application/pdf"
     return f"{R2_PUBLIC_BASE_URL}/{nombre_archivo_remoto}"
 
 
+def borrar_de_r2(url):
+    """Borra un archivo de R2 a partir de su URL publica (la que devuelve
+    subir_a_r2). Se usa para limpiar PDFs de declaraciones que ya
+    vencieron y no sirven para otro dia."""
+    if not url or not url.startswith(R2_PUBLIC_BASE_URL):
+        return
+    nombre_archivo_remoto = url[len(R2_PUBLIC_BASE_URL):].lstrip("/")
+    try:
+        cliente = _r2_client()
+        cliente.delete_object(Bucket=R2_BUCKET_NAME, Key=nombre_archivo_remoto)
+    except Exception as e:
+        print(f"Error borrando de R2 ({url}): {e}")
+
+
 EMTRASUR_SITE_KEY  = "6Leshn4sAAAAAIas9tkeW3vKPg0a4uYqw-7fG7Pn"
 EMTRASUR_URL       = "https://sistematizacion.emtrasur.com.co/"
 ANTIOQUIA_SITE_KEY = "0x4AAAAAACJy_BR2tRNN1cnv"
@@ -2692,6 +2706,38 @@ def _antioquia_calcular_validez_pdf(vigencia):
     return hoy  # vigencias vencidas, o vigencia actual desde agosto en adelante
 
 
+def _limpiar_declaraciones_vencidas():
+    """Borra de R2 y de la base de datos los PDFs de declaraciones que ya
+    vencieron (valido_hasta < hoy en Colombia) -- las de una vigencia
+    vencida solo sirven el mismo dia en que se generaron, asi que no
+    tiene sentido dejarlas guardadas para siempre. Se llama de forma
+    'perezosa' (cada vez que se hace una consulta de Impuesto
+    Departamental), no con una tarea programada aparte."""
+    try:
+        hoy_colombia = (datetime.utcnow() - timedelta(hours=5)).date()
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, url, url_manual FROM cache_declaraciones_antioquia
+            WHERE valido_hasta < %s
+        """, (hoy_colombia,))
+        vencidas = cur.fetchall()
+        if not vencidas:
+            cur.close(); conn.close()
+            return
+        for fila_id, url, url_manual in vencidas:
+            if url:
+                borrar_de_r2(url)
+            if url_manual:
+                borrar_de_r2(url_manual)
+        cur.execute("DELETE FROM cache_declaraciones_antioquia WHERE valido_hasta < %s", (hoy_colombia,))
+        conn.commit()
+        cur.close(); conn.close()
+        print(f"Limpieza de declaraciones vencidas: se borraron {len(vencidas)} registro(s).", flush=True)
+    except Exception as e:
+        print(f"Error limpiando declaraciones vencidas: {e}")
+
+
 def _cache_declaracion_buscar(placa, vigencia):
     """Busca lo que ya se haya generado hoy (o dentro de su ventana de
     validez) para esta placa/vigencia. Devuelve un dict {url, url_manual,
@@ -2836,6 +2882,13 @@ def consultar_antioquia(page, placa, identificacion, tipo_documento_abrev,
     """
     LIMITE = ANTIOQUIA_LIMITE_VIGENCIAS
 
+    # Limpieza perezosa: se aprovecha cada consulta de Impuesto
+    # Departamental para borrar de paso los PDFs de declaraciones que ya
+    # vencieron (no sirven para otro dia, no tiene sentido dejarlos
+    # ocupando espacio).
+    _limpiar_declaraciones_vencidas()
+
+
     # Resolver tipo de documento
     tipo_documento_id = ANTIOQUIA_TIPO_DOC_MAP.get(tipo_documento_abrev.upper(), "1")
     tipo_doc_info     = ANTIOQUIA_TIPOS_DOCUMENTO.get(tipo_documento_id, ANTIOQUIA_TIPOS_DOCUMENTO["1"])
@@ -2940,7 +2993,8 @@ def consultar_antioquia(page, placa, identificacion, tipo_documento_abrev,
                     avaluo_vig  = data_vig.get("avaluoComercial", 0) or 0
                     if total_pagar is not None:
                         print(f"  ✔ Vigencia {anio}: ${total_pagar:,}")
-                        # Guardar en caché
+                        # Guardar en caché (costo de la vigencia -- esta
+                        # parte NO se toca, sigue igual que siempre)
                         try:
                             cache_antioquia_guardar_deuda(placa, [{
                                 'vigencia': anio,
@@ -2949,6 +3003,51 @@ def consultar_antioquia(page, placa, identificacion, tipo_documento_abrev,
                             print(f"  → Caché guardado exitosamente para {placa} vigencia {anio}")
                         except Exception as ce:
                             print(f"  ✖ Error guardando caché vigencia {anio}: {ce}")
+
+                        # Se aprovecha la MISMA sesion (sin gastar captcha
+                        # adicional -- aceptar terminos y descargar el PDF
+                        # no lo necesitan) para tambien generar y guardar
+                        # el PDF de la declaracion de esta vigencia, listo
+                        # por si luego se necesita descargar. Se guarda
+                        # con la misma validez que ya se usa en otras
+                        # partes: la vigencia actual sigue la ventana de
+                        # pronto pago (enero-abril / mayo-julio), y las
+                        # demas solo sirven el mismo dia.
+                        try:
+                            formulario_liquidacion = data_vig.get("formularioLiquidacion")
+                            if formulario_liquidacion:
+                                _antioquia_aceptar_terminos_liquidacion(
+                                    session_v, identificacion, tipo_documento_id,
+                                    doc_abreviatura, doc_nombre
+                                )
+                                pdf_bytes_vig = _antioquia_descargar_pdf_liquidacion(
+                                    session_v, int(formulario_liquidacion)
+                                )
+                                id_unico_vig = uuid.uuid4().hex[:8]
+                                ruta_pdf_vig = f"/tmp/decl_{placa}_{anio}_{id_unico_vig}.pdf"
+                                with open(ruta_pdf_vig, "wb") as f_pdf:
+                                    f_pdf.write(pdf_bytes_vig)
+                                url_pdf_vig = subir_a_r2(
+                                    ruta_pdf_vig, f"declaraciones/{placa}_{anio}_{id_unico_vig}.pdf",
+                                    nombre_descarga=f"Declaracion_{placa}_{anio}.pdf"
+                                )
+                                os.remove(ruta_pdf_vig)
+
+                                try:
+                                    caja_traccion_vig = _extraer_caja_traccion_declaracion(pdf_bytes_vig)
+                                except Exception:
+                                    caja_traccion_vig = {}
+                                datos_extra_vig = dict(data_vig or {})
+                                datos_extra_vig["caja"] = caja_traccion_vig.get("caja", "")
+                                datos_extra_vig["traccion"] = caja_traccion_vig.get("traccion", "")
+                                _cache_declaracion_guardar(placa, anio, url_pdf_vig, datos_extra=datos_extra_vig)
+                                print(f"  → PDF de la vigencia {anio} guardado (aprovechando la misma consulta).")
+                        except Exception as e_pdf:
+                            # Si falla la parte del PDF, no se interrumpe
+                            # la consulta principal -- el dato del costo
+                            # ya se obtuvo bien, que es lo importante.
+                            print(f"  ✖ No se pudo generar/guardar el PDF de la vigencia {anio}: {e_pdf}")
+
                         break
                 except Exception as e:
                     print(f"  ✖ Error vigencia {anio} intento {intento}: {e}")
