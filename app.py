@@ -328,9 +328,10 @@ def medellin_crear_usuario(datos):
             page.select_option("#cTipoIdentificacion", value=valor_tipo_id)
             page.fill("#cNumeroIdentificacion", datos["numero_identificacion"])
             # El sitio valida el numero de identificacion en tiempo real
-            # (por eso la casilla "tdOk" al lado) -- se espera un poco a
-            # que esa validacion termine antes de seguir.
-            page.wait_for_timeout(1500)
+            # (por eso la casilla "tdOk" al lado) -- se espera a que esa
+            # validacion termine antes de seguir (puede tardar, es una
+            # consulta al servidor).
+            page.wait_for_timeout(3000)
 
             # 4. Nombre / Razon Social
             page.fill("#cNombre", datos["nombre"])
@@ -377,10 +378,13 @@ def medellin_crear_usuario(datos):
                     filas.forEach(function(fila){
                         var tdOk = fila.querySelector('.tdOk');
                         var label = fila.querySelector('.tdIzq');
+                        var campoInput = fila.querySelector('input, select');
                         if (label) {
                             resultado.push({
                                 campo: label.innerText.trim(),
-                                tieneOk: tdOk ? !!tdOk.querySelector('img') : null
+                                valorActual: campoInput ? campoInput.value : null,
+                                tieneOk: tdOk ? !!tdOk.querySelector('img') : null,
+                                filaHtmlCompleto: fila.innerHTML.substring(0, 400)
                             });
                         }
                     });
