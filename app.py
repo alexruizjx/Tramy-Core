@@ -356,7 +356,13 @@ def medellin_crear_usuario(datos):
             # 3. Tipo y Numero de Identificacion
             valor_tipo_id = MEDELLIN_TIPO_IDENTIFICACION.get(datos["tipo_identificacion"], "1-Cedula de Ciudadania")
             page.select_option("#cTipoIdentificacion", value=valor_tipo_id)
-            page.fill("#cNumeroIdentificacion", datos["numero_identificacion"])
+            # Se escribe caracter por caracter (no fill() de un solo golpe)
+            # porque este campo no dispara ninguna peticion al servidor
+            # para validarse -- sospecha: usa un evento tipo "keyup" que
+            # solo se dispara escribiendo tecla por tecla, como lo haria
+            # una persona real.
+            page.click("#cNumeroIdentificacion")
+            page.keyboard.type(datos["numero_identificacion"], delay=80)
             # El sitio valida el numero de identificacion en tiempo real
             # (por eso la casilla "tdOk" al lado) -- se espera a que esa
             # validacion termine antes de seguir (puede tardar, es una
@@ -392,7 +398,11 @@ def medellin_crear_usuario(datos):
             # 8. Telefono -- tambien parece validarse contra el servidor
             # (igual que el numero de identificacion), asi que se le da
             # tiempo de sobra despues de escribirlo.
-            page.fill("#cTelefono", datos["telefono"])
+            # Mismo motivo que Numero de Identificacion: se escribe
+            # caracter por caracter para disparar el evento de tecleo que
+            # el sitio necesita para marcarlo como valido.
+            page.click("#cTelefono")
+            page.keyboard.type(datos["telefono"], delay=80)
             if datos.get("celular"):
                 page.fill("#cCelular", datos["celular"])
             page.wait_for_timeout(3000)
@@ -511,6 +521,118 @@ def medellin_crear_usuario(datos):
             context.close(); browser.close()
 
     return resultado
+
+
+MEDELLIN_LOGIN_URL = "https://www.medellin.gov.co/irj/servlet/prt/portal/prtroot/pcd!3aportal_content!2fMunicipioMedellin!2fPCM!2fadmin!2froles!2fmedellin!2futilMedellin!2fauth"
+MEDELLIN_INICIO_SESION_URL = "https://www.medellin.gov.co/portal-movilidad/index.html#/inicio-sesion"
+MEDELLIN_AVIT_API = "https://www.medellin.gov.co/backavit/avit"
+MEDELLIN_SERVICIO_TRASPASO = "1"  # confirmado con un HAR real: idServicio=1 -> nombreServicio="Traspaso"
+
+
+def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLIN_SERVICIO_TRASPASO):
+    """Revisa si hay citas disponibles para un servicio (por defecto
+    'Traspaso') en el portal 'Movilidad en Linea' de Medellin. A
+    diferencia de Envigado, este portal EXIGE iniciar sesion antes de
+    poder consultar nada. La secuencia completa de peticiones (incluidos
+    los nombres exactos de cada endpoint y sus payloads) se confirmo con
+    un HAR real capturado por el usuario, asi que se replican las
+    llamadas directamente (dentro de una sesion real de Playwright, para
+    que las cookies de la sesion se manejen igual que en un navegador
+    real) en vez de interactuar con la interfaz paso a paso.
+    'usuario' es el numero de documento con el que se inicia sesion (el
+    campo 'username' del login coincide con el numero de documento).
+    Devuelve una tupla (hay_citas: bool, detalle: dict|None)."""
+    etiqueta = f"[MEDELLIN-CITAS-{uuid.uuid4().hex[:6]}]"
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, args=[
+            "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+            "--single-process", "--no-zygote", "--disable-setuid-sandbox"
+        ])
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            viewport={"width": 1366, "height": 900},
+        )
+        page = context.new_page()
+
+        try:
+            # 1. Cargar la pagina de inicio de sesion primero (para que
+            # se establezca la cookie de sesion inicial del portal SAP,
+            # antes de mandar el login).
+            page.goto(MEDELLIN_INICIO_SESION_URL, wait_until="load", timeout=45000)
+            page.wait_for_timeout(2000)
+
+            # 2. Login -- se manda directo por POST (con la misma sesion
+            # de Playwright, asi que las cookies se comparten igual que
+            # en un navegador real).
+            resp_login = page.request.post(MEDELLIN_LOGIN_URL, form={
+                "user": usuario, "passw": password, "correo": "",
+                "action": "login", "idComponente": "loginServiciosDigitales",
+                "navigation": "",
+            })
+            print(f"{etiqueta} Login status: {resp_login.status}", flush=True)
+
+            # 3. Confirmar que la sesion quedo autenticada (revisa el
+            # username devuelto, debe coincidir con el que se uso para
+            # entrar).
+            resp_jwt = page.request.get(f"{MEDELLIN_AVIT_API}/login/JWT/")
+            datos_sesion = resp_jwt.json()
+            print(f"{etiqueta} Usuario autenticado segun el sitio: {datos_sesion.get('username')}", flush=True)
+            if datos_sesion.get("username") != usuario:
+                return False, {"error": "El login no parece haber funcionado (usuario no coincide)."}
+
+            headers_json = {"Content-Type": "application/json"}
+
+            # 4. Preguntas de "seguridad" -- igual que en Envigado, no son
+            # preguntas reales, solo validan documento+placa.
+            resp_preg = page.request.post(
+                f"{MEDELLIN_AVIT_API}/seguridad/preguntas/validarMostrarPreguntasSeguridad",
+                data=json.dumps([{
+                    "documento": None, "respuesta": None, "placa": placa,
+                    "homePublic": False, "tipoDocumento": None, "nroDocumento": None,
+                    "bloqueoPermanente": False, "paramValidar": 1844,
+                }]),
+                headers=headers_json,
+            )
+            print(f"{etiqueta} Preguntas de seguridad: {resp_preg.status} {resp_preg.text()[:200]}", flush=True)
+
+            # 5. Puntos de atencion que ofrecen este servicio.
+            resp_puntos = page.request.post(
+                f"{MEDELLIN_AVIT_API}/citas/getPuntosAtencionServiciosLowcode",
+                data=json.dumps({"idServicios": str(id_servicio), "cantidadTramites": 1}),
+                headers=headers_json,
+            )
+            puntos = resp_puntos.json()
+            print(f"{etiqueta} Puntos de atencion encontrados: {puntos}", flush=True)
+
+            if not puntos:
+                return False, {"mensaje": "No hay ningun punto de atencion ofreciendo este servicio en este momento."}
+
+            # 6. Para cada punto de atencion, revisar fechas disponibles.
+            for punto in puntos:
+                id_subsede = punto.get("idSubsede")
+                resp_fechas = page.request.post(
+                    f"{MEDELLIN_AVIT_API}/citas/getFechasDisponibles",
+                    data=json.dumps({
+                        "idServicios": str(id_servicio), "idSubsede": id_subsede,
+                        "cantidadTramites": 1, "cantidadDiasMostrar": 211,
+                        "tiempoAtencion": 20, "cantidadLimiteLibracion": "1",
+                        "isIncluirHorariosCancelados": "S",
+                    }),
+                    headers=headers_json,
+                )
+                fechas = resp_fechas.json()
+                print(f"{etiqueta} Fechas disponibles en '{punto.get('nombreSubsede')}': {fechas}", flush=True)
+                if fechas:
+                    return True, {"sede": punto.get("nombreSubsede"), "id_subsede": id_subsede, "fechas": fechas}
+
+            return False, {"mensaje": "Se revisaron todos los puntos de atencion, ninguno tiene fechas disponibles ahora mismo."}
+
+        except Exception as e:
+            print(f"{etiqueta} Error: {e}", flush=True)
+            return False, {"error": str(e)}
+        finally:
+            context.close(); browser.close()
 
 
 def envigado_hay_puntos_disponibles():
@@ -4404,6 +4526,35 @@ def envigado_citas_disponibles_endpoint():
         import traceback
         print(traceback.format_exc(), flush=True)
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/medellin-citas-disponibles", methods=["GET"])
+def medellin_citas_disponibles_endpoint():
+    """Revisa si hay citas disponibles en el portal de Medellin para el
+    servicio indicado (Traspaso por defecto). Requiere las credenciales
+    de una cuenta ya registrada y activa en el portal."""
+    usuario = request.args.get("usuario", "").strip()
+    password = request.args.get("password", "").strip()
+    placa = request.args.get("placa", "").upper().strip()
+    id_servicio = request.args.get("id_servicio", MEDELLIN_SERVICIO_TRASPASO).strip()
+
+    if not all([usuario, password, placa]):
+        return jsonify({"error": "Faltan datos: usuario, password, placa"}), 400
+
+    job_id = str(uuid.uuid4())
+    job_actualizar(job_id, "Iniciando sesión en el portal de Medellín...", "procesando")
+
+    def ejecutar():
+        try:
+            hay_citas, detalle = medellin_hay_citas_disponibles(usuario, password, placa, id_servicio)
+            job_terminar(job_id, {"hay_citas": hay_citas, "detalle": detalle})
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc(), flush=True)
+            job_error(job_id, str(e))
+
+    threading.Thread(target=ejecutar, daemon=True).start()
+    return jsonify({"job_id": job_id})
 
 
 @app.route("/medellin-crear-usuario", methods=["GET"])
