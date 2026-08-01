@@ -307,6 +307,23 @@ def medellin_crear_usuario(datos):
         )
         page = context.new_page()
 
+        # DIAGNOSTICO TEMPORAL -- se capturan todas las peticiones de red
+        # (especialmente las de validacion, tipo AJAX/XHR) para entender
+        # que esta pasando exactamente con la validacion del numero de
+        # identificacion, que nunca pasa.
+        peticiones_capturadas = []
+        def _capturar_peticion(response):
+            try:
+                if response.request.resource_type in ("xhr", "fetch"):
+                    peticiones_capturadas.append({
+                        "url": response.url,
+                        "status": response.status,
+                        "metodo": response.request.method,
+                    })
+            except Exception:
+                pass
+        page.on("response", _capturar_peticion)
+
         try:
             page.goto(MEDELLIN_REGISTRO_URL, wait_until="load", timeout=60000)
             page.wait_for_timeout(2000)
@@ -401,6 +418,11 @@ def medellin_crear_usuario(datos):
                 print(f"=== CIUDAD despues de esperar 2000ms mas: '{v3}'", flush=True)
             except Exception as e3:
                 print(f"No se pudo leer ciudad (momento 3): {e3}", flush=True)
+
+            print("=== DIAGNOSTICO: peticiones de red (xhr/fetch) capturadas hasta ahora ===", flush=True)
+            for p in peticiones_capturadas:
+                print(p, flush=True)
+            print("=== FIN peticiones capturadas ===", flush=True)
 
             # DIAGNOSTICO -- antes de dar clic en "Siguiente", se revisa
             # si algun campo quedo marcado como invalido (la casilla
