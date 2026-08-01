@@ -345,6 +345,13 @@ def medellin_crear_usuario(datos):
             # 6. Correo, Direccion, Telefono
             page.fill("#cCorreoElectronico", datos["email"])
             page.fill("#cDireccionResidencia", datos["direccion"])
+            # DIAGNOSTICO TEMPORAL -- revisar de inmediato si la direccion
+            # ya se daño justo aqui (antes de tocar Ciudad/Departamento).
+            try:
+                valor_dir_inmediato = page.evaluate("() => document.querySelector('#cDireccionResidencia').value")
+                print(f"=== DIAGNOSTICO INMEDIATO (justo despues de llenar Direccion): '{valor_dir_inmediato}'", flush=True)
+            except Exception as e_diag_dir:
+                print(f"No se pudo leer el valor de direccion: {e_diag_dir}", flush=True)
             page.fill("#cTelefono", datos["telefono"])
             if datos.get("celular"):
                 page.fill("#cCelular", datos["celular"])
@@ -355,6 +362,21 @@ def medellin_crear_usuario(datos):
             page.select_option("#cPais", value="CO")
             page.select_option("#cDepartamento", value="05-ANTIOQUIA")
             page.select_option("#cCiudad", value="05001-MEDELLÍN")
+
+            # DIAGNOSTICO TEMPORAL -- revisar de inmediato (antes de
+            # tocar los checkboxes) si Direccion/Ciudad ya se dañaron en
+            # este punto, o si pasa despues.
+            try:
+                valores_inmediatos = page.evaluate("""() => {
+                    return {
+                        direccion: document.querySelector('#cDireccionResidencia').value,
+                        ciudad: document.querySelector('#cCiudad').value,
+                        departamento: document.querySelector('#cDepartamento').value,
+                    };
+                }""")
+                print(f"=== DIAGNOSTICO INMEDIATO (justo despues de pais/depto/ciudad, antes de checkboxes): {valores_inmediatos}", flush=True)
+            except Exception as e_diag_inm:
+                print(f"No se pudo leer valores inmediatos: {e_diag_inm}", flush=True)
 
             # 8. Aceptar politicas de uso (obligatorio) y autorizar
             # notificaciones (opcional, pero conviene para que lleguen
