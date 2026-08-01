@@ -375,11 +375,32 @@ def medellin_crear_usuario(datos):
             page.select_option("#cPais", value="CO")
             page.select_option("#cDepartamento", value="05-ANTIOQUIA")
             page.select_option("#cCiudad", value="05001-MEDELLÍN")
+
+            # DIAGNOSTICO TEMPORAL -- revisar el valor de Ciudad en varios
+            # momentos seguidos, para ver exactamente cuando se resetea.
+            try:
+                v1 = page.evaluate("() => document.querySelector('#cCiudad').value")
+                print(f"=== CIUDAD justo despues de select_option: '{v1}'", flush=True)
+            except Exception as e1:
+                print(f"No se pudo leer ciudad (momento 1): {e1}", flush=True)
+
             page.wait_for_timeout(500)
+
+            try:
+                v2 = page.evaluate("() => document.querySelector('#cCiudad').value")
+                print(f"=== CIUDAD despues de esperar 500ms: '{v2}'", flush=True)
+            except Exception as e2:
+                print(f"No se pudo leer ciudad (momento 2): {e2}", flush=True)
 
             # Se le da mas tiempo de sobra a la validacion del numero de
             # identificacion tambien, por si seguia pendiente.
             page.wait_for_timeout(2000)
+
+            try:
+                v3 = page.evaluate("() => document.querySelector('#cCiudad').value")
+                print(f"=== CIUDAD despues de esperar 2000ms mas: '{v3}'", flush=True)
+            except Exception as e3:
+                print(f"No se pudo leer ciudad (momento 3): {e3}", flush=True)
 
             # DIAGNOSTICO -- antes de dar clic en "Siguiente", se revisa
             # si algun campo quedo marcado como invalido (la casilla
