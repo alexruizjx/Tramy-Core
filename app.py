@@ -556,21 +556,38 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
         page = context.new_page()
 
         try:
-            # 1. Cargar la pagina de inicio de sesion primero (para que
-            # se establezca la cookie de sesion inicial del portal SAP,
-            # antes de mandar el login).
+            # 1. Cargar la pagina de inicio de sesion primero.
             page.goto(MEDELLIN_INICIO_SESION_URL, wait_until="load", timeout=45000)
             page.wait_for_timeout(2000)
 
-            # 2. Login -- se manda directo por POST (con la misma sesion
-            # de Playwright, asi que las cookies se comparten igual que
-            # en un navegador real).
-            resp_login = page.request.post(MEDELLIN_LOGIN_URL, form={
-                "user": usuario, "passw": password, "correo": "",
-                "action": "login", "idComponente": "loginServiciosDigitales",
-                "navigation": "",
-            })
-            print(f"{etiqueta} Login status: {resp_login.status}", flush=True)
+            # 2. Login -- OJO: el login real del sitio es un ENVIO DE
+            # FORMULARIO NORMAL (navegacion completa, Sec-Fetch-Mode:
+            # navigate), NO una peticion tipo API/AJAX. Se probo primero
+            # con page.request.post() y el servidor respondia distinto
+            # (usuario "ANONIMO"), asi que se llena el formulario real y
+            # se envia con Enter, para que el navegador dispare la MISMA
+            # navegacion completa que dispara una persona real.
+            try:
+                page.fill('input[name="user"]', usuario)
+                page.fill('input[name="passw"]', password)
+            except Exception as e_login_campos:
+                print(f"{etiqueta} No se encontraron los campos de login con los selectores esperados: {e_login_campos}", flush=True)
+                try:
+                    campos_login = page.evaluate("""() => {
+                        var els = document.querySelectorAll('input');
+                        var resultado = [];
+                        els.forEach(function(el){
+                            resultado.push({name: el.name || null, id: el.id || null, type: el.type || null});
+                        });
+                        return resultado;
+                    }""")
+                    print(f"{etiqueta} Campos input reales encontrados en la pagina: {campos_login}", flush=True)
+                except Exception:
+                    pass
+                raise
+            with page.expect_navigation(wait_until="load", timeout=20000):
+                page.press('input[name="passw"]', "Enter")
+            page.wait_for_timeout(2000)
 
             # 3. Confirmar que la sesion quedo autenticada (revisa el
             # username devuelto, debe coincidir con el que se uso para
