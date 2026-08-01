@@ -269,6 +269,159 @@ def _envigado_hay_aviso_sin_agenda(page):
         return False
 
 
+MEDELLIN_REGISTRO_URL = "https://www.medellin.gov.co/irj/servlet/prt/portal/prtroot/pcd!3aportal_content!2fMunicipioMedellin!2fPCM!2fadmin!2froles!2fmedellin!2futilMedellin!2fauthexterna!2fSelfRegistrationExterno"
+
+# Mapeo de los valores reales de cada <select>, confirmados leyendo el
+# HTML real del formulario (no son solo el texto visible -- cada opcion
+# tiene un codigo antes del guion, ej "1-Cedula de Ciudadania").
+MEDELLIN_TIPO_SOCIEDAD = {"Persona Natural": "N-Persona Natural", "Persona Juridica": "J-Persona Juridica"}
+MEDELLIN_TIPO_IDENTIFICACION = {
+    "Cedula de ciudadania": "1-Cedula de Ciudadania",
+    "Tarjeta de identidad": "2-Tarjeta de identidad",
+    "Cedula de extranjeria": "3-Cedula de Extranjeria",
+    "NIT": "4-NIT",
+}
+MEDELLIN_GENERO = {"Masculino": "m", "Femenino": "f", "Otro": "o"}
+
+
+def medellin_crear_usuario(datos):
+    """Crea un usuario nuevo en el portal 'Movilidad en Linea' de la
+    Alcaldia de Medellin (formulario de auto-registro). Los selectores
+    estan confirmados con el HTML real del formulario (no son una
+    suposicion) -- es un formulario HTML clasico con jQuery, no un SPA
+    moderno. 'datos' es un dict con: tipo_sociedad, tipo_identificacion,
+    numero_identificacion, nombre, apellidos, genero, email, direccion,
+    telefono (todos como texto, tal como se ven en el formulario).
+    Pais/Departamento/Ciudad se dejan en su valor por defecto (Colombia/
+    Antioquia/Medellin), que ya vienen preseleccionados."""
+    resultado = {"exito": False, "mensaje": ""}
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, args=[
+            "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+            "--single-process", "--no-zygote", "--disable-setuid-sandbox"
+        ])
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            viewport={"width": 1366, "height": 900},
+        )
+        page = context.new_page()
+
+        try:
+            page.goto(MEDELLIN_REGISTRO_URL, wait_until="load", timeout=60000)
+            page.wait_for_timeout(2000)
+
+            # 1. Tipo de Sociedad -- esto dispara (via jQuery) que se
+            # muestren/oculten otros campos (Tipo de Entidad para
+            # Juridica, Apellidos/Genero para Natural).
+            valor_sociedad = MEDELLIN_TIPO_SOCIEDAD.get(datos["tipo_sociedad"], "N-Persona Natural")
+            page.select_option("#cTipoSociedad", value=valor_sociedad)
+            page.wait_for_timeout(500)
+
+            # 2. Tipo de Entidad -- solo aplica si es Persona Juridica
+            if datos["tipo_sociedad"] == "Persona Juridica" and datos.get("tipo_entidad"):
+                page.select_option("#cTipoEntidad", value=datos["tipo_entidad"])
+                page.wait_for_timeout(300)
+
+            # 3. Tipo y Numero de Identificacion
+            valor_tipo_id = MEDELLIN_TIPO_IDENTIFICACION.get(datos["tipo_identificacion"], "1-Cedula de Ciudadania")
+            page.select_option("#cTipoIdentificacion", value=valor_tipo_id)
+            page.fill("#cNumeroIdentificacion", datos["numero_identificacion"])
+            # El sitio valida el numero de identificacion en tiempo real
+            # (por eso la casilla "tdOk" al lado) -- se espera un poco a
+            # que esa validacion termine antes de seguir.
+            page.wait_for_timeout(1500)
+
+            # 4. Nombre / Razon Social
+            page.fill("#cNombre", datos["nombre"])
+
+            # 5. Apellidos y Genero -- solo aplican para Persona Natural
+            if datos["tipo_sociedad"] == "Persona Natural":
+                page.fill("#cApellidos", datos["apellidos"])
+                valor_genero = MEDELLIN_GENERO.get(datos["genero"], "m")
+                page.select_option("#cGenero", value=valor_genero)
+
+            # 6. Correo, Direccion, Telefono
+            page.fill("#cCorreoElectronico", datos["email"])
+            page.fill("#cDireccionResidencia", datos["direccion"])
+            page.fill("#cTelefono", datos["telefono"])
+            if datos.get("celular"):
+                page.fill("#cCelular", datos["celular"])
+
+            # 7. Pais/Departamento/Ciudad ya vienen preseleccionados en
+            # Colombia/Antioquia/Medellin -- solo se cambian si se pide
+            # explicitamente algo distinto.
+            if datos.get("ciudad_valor"):
+                page.select_option("#cCiudad", value=datos["ciudad_valor"])
+
+            # 8. Aceptar politicas de uso (obligatorio) y autorizar
+            # notificaciones (opcional, pero conviene para que lleguen
+            # avisos del tramite).
+            page.check("#cAcepto")
+            page.check("#cNotifica")
+
+            page.wait_for_timeout(500)
+
+            # DIAGNOSTICO -- antes de dar clic en "Siguiente", se revisa
+            # si algun campo quedo marcado como invalido (la casilla
+            # tdOk al lado de cada campo se llena con una imagen "ok"
+            # cuando el campo pasa la validacion del sitio).
+            try:
+                estado_validacion = page.evaluate("""() => {
+                    var filas = document.querySelectorAll('.tableContFormRegistro tr');
+                    var resultado = [];
+                    filas.forEach(function(fila){
+                        var tdOk = fila.querySelector('.tdOk');
+                        var label = fila.querySelector('.tdIzq');
+                        if (label) {
+                            resultado.push({
+                                campo: label.innerText.trim(),
+                                tieneOk: tdOk ? !!tdOk.querySelector('img') : null
+                            });
+                        }
+                    });
+                    return resultado;
+                }""")
+                print("=== DIAGNOSTICO: estado de validacion de cada campo antes de Siguiente ===", flush=True)
+                for c in estado_validacion:
+                    print(c, flush=True)
+                print("=== FIN DIAGNOSTICO validacion ===", flush=True)
+            except Exception as e_diag:
+                print(f"No se pudo revisar el estado de validacion: {e_diag}", flush=True)
+
+            # 9. Clic en "Siguiente"
+            page.click("#inpBtnNext")
+            page.wait_for_timeout(3000)
+
+            # DIAGNOSTICO -- que paso despues de dar clic en Siguiente
+            # (puede ser un segundo paso del formulario, un mensaje de
+            # error, o una confirmacion de que el registro se completo).
+            print("=== DIAGNOSTICO: despues de clic en Siguiente ===", flush=True)
+            print("URL actual:", page.url, flush=True)
+            try:
+                print("Texto visible de la pagina (primeros 2000 caracteres):", flush=True)
+                print(page.inner_text("body")[:2000], flush=True)
+            except Exception as e_txt:
+                print("No se pudo leer el texto de la pagina:", e_txt, flush=True)
+            print("=== FIN DIAGNOSTICO despues de Siguiente ===", flush=True)
+
+            resultado["exito"] = True
+            resultado["mensaje"] = "Formulario enviado -- revisa los logs para confirmar el resultado real (puede haber un segundo paso)."
+
+        except Exception as e:
+            print(f"Error en el flujo de Playwright para registro Medellin: {e}", flush=True)
+            resultado["mensaje"] = str(e)
+            try:
+                print("=== DIAGNOSTICO: texto visible al momento del error ===", flush=True)
+                print(page.inner_text("body")[:2000], flush=True)
+            except Exception:
+                pass
+        finally:
+            context.close(); browser.close()
+
+    return resultado
+
+
 def envigado_hay_puntos_disponibles():
     """Revisa si hay ALGUN punto de atencion con citas disponibles para
     el servicio vigilado. Usa un NAVEGADOR REAL (Playwright) en vez de
@@ -4160,6 +4313,43 @@ def envigado_citas_disponibles_endpoint():
         import traceback
         print(traceback.format_exc(), flush=True)
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/medellin-crear-usuario", methods=["GET"])
+def medellin_crear_usuario_endpoint():
+    """Inicia la creacion de un usuario en el portal de Medellin. Como es
+    un proceso que puede tardar (carga de pagina + llenado), se ejecuta
+    en segundo plano con el mismo patron de job que las demas consultas
+    que usan Playwright."""
+    datos = {
+        "tipo_sociedad": request.args.get("tipo_sociedad", "").strip(),
+        "tipo_identificacion": request.args.get("tipo_identificacion", "").strip(),
+        "numero_identificacion": request.args.get("numero_identificacion", "").strip(),
+        "nombre": request.args.get("nombre", "").strip(),
+        "apellidos": request.args.get("apellidos", "").strip(),
+        "genero": request.args.get("genero", "").strip(),
+        "email": request.args.get("email", "").strip(),
+        "direccion": request.args.get("direccion", "").strip(),
+        "telefono": request.args.get("telefono", "").strip(),
+    }
+    faltantes = [k for k, v in datos.items() if not v]
+    if faltantes:
+        return jsonify({"error": f"Faltan datos: {', '.join(faltantes)}"}), 400
+
+    job_id = str(uuid.uuid4())
+    job_actualizar(job_id, "Iniciando registro en el portal de Medellín...", "procesando")
+
+    def ejecutar():
+        try:
+            resultado = medellin_crear_usuario(datos)
+            job_terminar(job_id, resultado)
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc(), flush=True)
+            job_error(job_id, str(e))
+
+    threading.Thread(target=ejecutar, daemon=True).start()
+    return jsonify({"job_id": job_id})
 
 
 @app.route("/envigado-citas-iniciar-monitoreo", methods=["GET"])
