@@ -295,6 +295,7 @@ def medellin_crear_usuario(datos):
     Pais/Departamento/Ciudad se dejan en su valor por defecto (Colombia/
     Antioquia/Medellin), que ya vienen preseleccionados."""
     resultado = {"exito": False, "mensaje": ""}
+    etiqueta = f"[MEDELLIN-{uuid.uuid4().hex[:6]}]"  # para poder filtrar SOLO estos logs entre los de otros procesos concurrentes
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True, args=[
@@ -397,17 +398,17 @@ def medellin_crear_usuario(datos):
             # momentos seguidos, para ver exactamente cuando se resetea.
             try:
                 v1 = page.evaluate("() => document.querySelector('#cCiudad').value")
-                print(f"=== CIUDAD justo despues de select_option: '{v1}'", flush=True)
+                print(f"{etiqueta} === CIUDAD justo despues de select_option: '{v1}'", flush=True)
             except Exception as e1:
-                print(f"No se pudo leer ciudad (momento 1): {e1}", flush=True)
+                print(f"{etiqueta} No se pudo leer ciudad (momento 1): {e1}", flush=True)
 
             page.wait_for_timeout(500)
 
             try:
                 v2 = page.evaluate("() => document.querySelector('#cCiudad').value")
-                print(f"=== CIUDAD despues de esperar 500ms: '{v2}'", flush=True)
+                print(f"{etiqueta} === CIUDAD despues de esperar 500ms: '{v2}'", flush=True)
             except Exception as e2:
-                print(f"No se pudo leer ciudad (momento 2): {e2}", flush=True)
+                print(f"{etiqueta} No se pudo leer ciudad (momento 2): {e2}", flush=True)
 
             # Se le da mas tiempo de sobra a la validacion del numero de
             # identificacion tambien, por si seguia pendiente.
@@ -415,14 +416,14 @@ def medellin_crear_usuario(datos):
 
             try:
                 v3 = page.evaluate("() => document.querySelector('#cCiudad').value")
-                print(f"=== CIUDAD despues de esperar 2000ms mas: '{v3}'", flush=True)
+                print(f"{etiqueta} === CIUDAD despues de esperar 2000ms mas: '{v3}'", flush=True)
             except Exception as e3:
-                print(f"No se pudo leer ciudad (momento 3): {e3}", flush=True)
+                print(f"{etiqueta} No se pudo leer ciudad (momento 3): {e3}", flush=True)
 
-            print("=== DIAGNOSTICO: peticiones de red (xhr/fetch) capturadas hasta ahora ===", flush=True)
+            print(f"{etiqueta} === DIAGNOSTICO: peticiones de red (xhr/fetch) capturadas hasta ahora ===", flush=True)
             for p in peticiones_capturadas:
-                print(p, flush=True)
-            print("=== FIN peticiones capturadas ===", flush=True)
+                print(etiqueta, p, flush=True)
+            print(f"{etiqueta} === FIN peticiones capturadas ===", flush=True)
 
             # DIAGNOSTICO -- antes de dar clic en "Siguiente", se revisa
             # si algun campo quedo marcado como invalido (la casilla
@@ -447,12 +448,12 @@ def medellin_crear_usuario(datos):
                     });
                     return resultado;
                 }""")
-                print("=== DIAGNOSTICO: estado de validacion de cada campo antes de Siguiente ===", flush=True)
+                print(f"{etiqueta} === DIAGNOSTICO: estado de validacion de cada campo antes de Siguiente ===", flush=True)
                 for c in estado_validacion:
-                    print(c, flush=True)
-                print("=== FIN DIAGNOSTICO validacion ===", flush=True)
+                    print(etiqueta, c, flush=True)
+                print(f"{etiqueta} === FIN DIAGNOSTICO validacion ===", flush=True)
             except Exception as e_diag:
-                print(f"No se pudo revisar el estado de validacion: {e_diag}", flush=True)
+                print(f"{etiqueta} No se pudo revisar el estado de validacion: {e_diag}", flush=True)
 
             # 9. Clic en "Siguiente"
             page.click("#inpBtnNext")
@@ -461,24 +462,24 @@ def medellin_crear_usuario(datos):
             # DIAGNOSTICO -- que paso despues de dar clic en Siguiente
             # (puede ser un segundo paso del formulario, un mensaje de
             # error, o una confirmacion de que el registro se completo).
-            print("=== DIAGNOSTICO: despues de clic en Siguiente ===", flush=True)
-            print("URL actual:", page.url, flush=True)
+            print(f"{etiqueta} === DIAGNOSTICO: despues de clic en Siguiente ===", flush=True)
+            print(f"{etiqueta} URL actual:", page.url, flush=True)
             try:
-                print("Texto visible de la pagina (primeros 2000 caracteres):", flush=True)
-                print(page.inner_text("body")[:2000], flush=True)
+                print(f"{etiqueta} Texto visible de la pagina (primeros 2000 caracteres):", flush=True)
+                print(etiqueta, page.inner_text("body")[:2000], flush=True)
             except Exception as e_txt:
-                print("No se pudo leer el texto de la pagina:", e_txt, flush=True)
-            print("=== FIN DIAGNOSTICO despues de Siguiente ===", flush=True)
+                print(f"{etiqueta} No se pudo leer el texto de la pagina:", e_txt, flush=True)
+            print(f"{etiqueta} === FIN DIAGNOSTICO despues de Siguiente ===", flush=True)
 
             resultado["exito"] = True
             resultado["mensaje"] = "Formulario enviado -- revisa los logs para confirmar el resultado real (puede haber un segundo paso)."
 
         except Exception as e:
-            print(f"Error en el flujo de Playwright para registro Medellin: {e}", flush=True)
+            print(f"{etiqueta} Error en el flujo de Playwright para registro Medellin: {e}", flush=True)
             resultado["mensaje"] = str(e)
             try:
-                print("=== DIAGNOSTICO: texto visible al momento del error ===", flush=True)
-                print(page.inner_text("body")[:2000], flush=True)
+                print(f"{etiqueta} === DIAGNOSTICO: texto visible al momento del error ===", flush=True)
+                print(etiqueta, page.inner_text("body")[:2000], flush=True)
             except Exception:
                 pass
         finally:
