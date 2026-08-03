@@ -2093,9 +2093,20 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     # el servidor ya cree que es el dia siguiente.
     fecha_consulta = datos.get("fecha_consulta")
     if fecha_consulta:
-        pys["B27"] = fecha_consulta - timedelta(hours=5)
+        fecha_expedicion = fecha_consulta - timedelta(hours=5)
     else:
-        pys["B27"] = datetime.utcnow() - timedelta(hours=5)
+        fecha_expedicion = datetime.utcnow() - timedelta(hours=5)
+    pys["B27"] = fecha_expedicion
+
+    # "FECHA DE EXPEDICIÓN" (la que se ve en el certificado final) en
+    # realidad NO sale de B27 -- sale de PYS!AA26, que en la plantilla
+    # traia la formula "=TODAY()". Esa formula la calcula LibreOffice al
+    # momento de convertir a PDF usando la hora DEL SERVIDOR (UTC), sin
+    # ningun ajuste posible desde Python -- por eso mostraba un dia
+    # adelantado en las noches. Se reemplaza esa formula por el valor ya
+    # calculado (con el ajuste de zona horaria de Colombia aplicado),
+    # sin mover la celda de lugar.
+    pys["AA26"] = fecha_expedicion
     pys["B28"] = estado_veh.get("marca", "")
     pys["B29"] = estado_veh.get("cilindraje", "")
     pys["B30"] = estado_veh.get("linea", "")
