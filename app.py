@@ -2073,6 +2073,12 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     fin    = estado_veh.get("periodoFinCertificacion", "")
 
     # A22:B31 -- informacion general
+    # A22 es la ETIQUETA "PERIODO DE CERTIFICACION" -- la plantilla la
+    # deja vacia esperando que el codigo la escriba (junto con el valor
+    # en B22); si se deja vacia, la formula de la hoja ESTADO DE CUENTA
+    # que la usa (UPPER(A22)) la interpreta como "0" en vez de texto
+    # vacio, y por eso aparecia "0" en vez de la etiqueta real.
+    pys["A22"] = "PERÍODO DE CERTIFICACIÓN"
     pys["B22"] = f"{inicio} a {fin}" if inicio and fin else ""
     pys["B23"] = estado_veh.get("placa", "")
     pys["B24"] = estado_veh.get("modelo", "")
@@ -2082,8 +2088,14 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     # consulto y se obtuvo este numero de certificado (guardada en
     # 'fecha_consulta'), no la fecha en que se genera el documento --
     # el numero de certificado es unico de esa consulta puntual.
+    # OJO: el servidor corre en UTC, pero la fecha debe ser la de
+    # Colombia (UTC-5) -- sin este ajuste, de 7pm a 12am hora Colombia
+    # el servidor ya cree que es el dia siguiente.
     fecha_consulta = datos.get("fecha_consulta")
-    pys["B27"] = fecha_consulta if fecha_consulta else datetime.now()
+    if fecha_consulta:
+        pys["B27"] = fecha_consulta - timedelta(hours=5)
+    else:
+        pys["B27"] = datetime.utcnow() - timedelta(hours=5)
     pys["B28"] = estado_veh.get("marca", "")
     pys["B29"] = estado_veh.get("cilindraje", "")
     pys["B30"] = estado_veh.get("linea", "")
