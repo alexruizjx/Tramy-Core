@@ -2093,10 +2093,7 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     # el servidor ya cree que es el dia siguiente.
     fecha_consulta = datos.get("fecha_consulta")
     if fecha_consulta:
-        fecha_expedicion = fecha_consulta - timedelta(hours=5)
-    else:
-        fecha_expedicion = datetime.utcnow() - timedelta(hours=5)
-    pys["B27"] = fecha_expedicion
+        pys["B27"] = fecha_consulta - timedelta(hours=5)
 
     # "FECHA DE EXPEDICIÓN" (la que se ve en el certificado final) en
     # realidad NO sale de B27 -- sale de PYS!AA26, que en la plantilla
@@ -2105,8 +2102,16 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     # ningun ajuste posible desde Python -- por eso mostraba un dia
     # adelantado en las noches. Se reemplaza esa formula por el valor ya
     # calculado (con el ajuste de zona horaria de Colombia aplicado),
-    # sin mover la celda de lugar.
-    pys["AA26"] = fecha_expedicion
+    # sin mover la celda de lugar. SIEMPRE se usa la fecha de HOY (no la
+    # fecha en que se hizo la consulta original), como se pidio.
+    # IMPORTANTE: se escribe SOLO la fecha (.date(), sin hora/minutos),
+    # porque AA26 tambien alimenta un VLOOKUP (via U24) que necesita
+    # coincidencia EXACTA contra una tabla de fechas -- escribir un
+    # datetime completo (con hora) rompia esa busqueda exacta, lo cual
+    # en cascada causaba que el documento saliera con muchas paginas de
+    # mas en vez de las 1-3 normales.
+    hoy_colombia = (datetime.utcnow() - timedelta(hours=5)).date()
+    pys["AA26"] = hoy_colombia
     pys["B28"] = estado_veh.get("marca", "")
     pys["B29"] = estado_veh.get("cilindraje", "")
     pys["B30"] = estado_veh.get("linea", "")
@@ -2287,6 +2292,14 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
         if nombre not in hojas_a_conservar:
             del wb[nombre]
     edc.sheet_state = "visible"
+    # PYS es una hoja de "datos de fondo" (solo alimenta formulas para
+    # ESTADO DE CUENTA) -- si queda visible, LibreOffice la imprime como
+    # paginas propias ademas de las de ESTADO DE CUENTA (confirmado: en
+    # un libro con muchas hojas/formulas, esto por si solo agregaba
+    # hasta 15 paginas de mas). Ocultarla no afecta ninguna formula (las
+    # hojas ocultas se siguen calculando igual), solo evita que se
+    # impriman sus propias paginas.
+    pys.sheet_state = "hidden"
     wb.active = wb.sheetnames.index("ESTADO DE CUENTA")
 
     # El texto se veia "gris suave" en vez de negro solido -- mismo
