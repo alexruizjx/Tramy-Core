@@ -9,3 +9,5 @@ Pillow
 boto3
 openpyxl
 pypdf
+pywebpush
+py-vapid
