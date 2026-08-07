@@ -1169,6 +1169,15 @@ def _dentro_de_horario(hora_inicio_str, hora_fin_str):
     return ahora >= h_ini or ahora <= h_fin  # rango que cruza la medianoche
 
 
+# Estado en vivo del programador automatico -- lo que el panel de
+# Ejecucion consulta para saber si de verdad esta corriendo ahora mismo
+# (no solo si esta "activado" en la configuracion).
+_programador_automatico_estado = {
+    "envigado_citas": {"ultima_revision": None, "dentro_de_horario": False, "ultimo_error": None},
+    "medellin_citas": {"ultima_revision": None, "dentro_de_horario": False, "ultimo_error": None},
+}
+
+
 def _programador_automatico_loop():
     """Hilo unico que corre para siempre desde que arranca el servidor.
     Cada 10 segundos revisa la configuracion de cada monitor (activo,
@@ -1181,7 +1190,9 @@ def _programador_automatico_loop():
 
             # --- Envigado ---
             cfg = _monitoreo_config_leer("envigado_citas")
-            if cfg and cfg["activo"] and _dentro_de_horario(cfg["hora_inicio"], cfg["hora_fin"]):
+            dentro_horario_env = bool(cfg) and _dentro_de_horario(cfg["hora_inicio"], cfg["hora_fin"])
+            _programador_automatico_estado["envigado_citas"]["dentro_de_horario"] = dentro_horario_env
+            if cfg and cfg["activo"] and dentro_horario_env:
                 if ahora_ts - ultimo_chequeo["envigado_citas"] >= cfg["intervalo_segundos"]:
                     ultimo_chequeo["envigado_citas"] = ahora_ts
                     try:
@@ -1195,12 +1206,17 @@ def _programador_automatico_loop():
                                 "/liquidacion.html"
                             )
                         _envigado_citas_monitoreo_estado["_auto_tenia_citas"] = hay_citas_ahora
+                        _programador_automatico_estado["envigado_citas"]["ultima_revision"] = datetime.now().isoformat() + "Z"
+                        _programador_automatico_estado["envigado_citas"]["ultimo_error"] = None
                     except Exception as e:
                         print(f"Error en programador automatico (Envigado): {e}", flush=True)
+                        _programador_automatico_estado["envigado_citas"]["ultimo_error"] = str(e)
 
             # --- Medellin ---
             cfg = _monitoreo_config_leer("medellin_citas")
-            if cfg and cfg["activo"] and _dentro_de_horario(cfg["hora_inicio"], cfg["hora_fin"]):
+            dentro_horario_med = bool(cfg) and _dentro_de_horario(cfg["hora_inicio"], cfg["hora_fin"])
+            _programador_automatico_estado["medellin_citas"]["dentro_de_horario"] = dentro_horario_med
+            if cfg and cfg["activo"] and dentro_horario_med:
                 if ahora_ts - ultimo_chequeo["medellin_citas"] >= cfg["intervalo_segundos"]:
                     ultimo_chequeo["medellin_citas"] = ahora_ts
                     if cfg["usuario"] and cfg["password"] and cfg["placa"]:
@@ -1221,8 +1237,11 @@ def _programador_automatico_loop():
                                     )
                             else:
                                 _medellin_citas_monitoreo_estado["ultimo_hallazgo"] = None
+                            _programador_automatico_estado["medellin_citas"]["ultima_revision"] = datetime.now().isoformat() + "Z"
+                            _programador_automatico_estado["medellin_citas"]["ultimo_error"] = None
                         except Exception as e:
                             print(f"Error en programador automatico (Medellin): {e}", flush=True)
+                            _programador_automatico_estado["medellin_citas"]["ultimo_error"] = str(e)
                     else:
                         print("Programador automatico Medellin activo pero faltan usuario/password/placa en la configuracion.", flush=True)
 
@@ -5049,7 +5068,10 @@ def monitoreo_config_obtener_endpoint():
     """Devuelve la configuracion actual de los monitores automaticos
     (activo, intervalo, horario, y para Medellin ademas si ya tiene
     credenciales guardadas -- NUNCA se devuelve la contraseña real por
-    este endpoint, solo si esta configurada o no)."""
+    este endpoint, solo si esta configurada o no). Tambien devuelve el
+    estado EN VIVO (ultima revision real hecha, si esta dentro del
+    horario ahora mismo), para que el panel pueda confirmar que de
+    verdad esta corriendo, no solo que esta "activado"."""
     envigado = _monitoreo_config_leer("envigado_citas") or {}
     medellin = _monitoreo_config_leer("medellin_citas") or {}
     return jsonify({
@@ -5059,6 +5081,9 @@ def monitoreo_config_obtener_endpoint():
             "intervalo_segundos": envigado.get("intervalo_segundos", 30),
             "hora_inicio": envigado.get("hora_inicio", "11:00"),
             "hora_fin": envigado.get("hora_fin", "16:00"),
+            "dentro_de_horario": _programador_automatico_estado["envigado_citas"]["dentro_de_horario"],
+            "ultima_revision": _programador_automatico_estado["envigado_citas"]["ultima_revision"],
+            "ultimo_error": _programador_automatico_estado["envigado_citas"]["ultimo_error"],
         },
         "medellin_citas": {
             "activo": medellin.get("activo", False),
@@ -5068,6 +5093,9 @@ def monitoreo_config_obtener_endpoint():
             "usuario": medellin.get("usuario") or "",
             "placa": medellin.get("placa") or "",
             "tiene_password": bool(medellin.get("password")),
+            "dentro_de_horario": _programador_automatico_estado["medellin_citas"]["dentro_de_horario"],
+            "ultima_revision": _programador_automatico_estado["medellin_citas"]["ultima_revision"],
+            "ultimo_error": _programador_automatico_estado["medellin_citas"]["ultimo_error"],
         },
     })
 
