@@ -8,6 +8,7 @@ import time
 import uuid
 import json
 import requests
+from pywebpush import webpush, WebPushException
 import threading
 import boto3
 from botocore.config import Config
@@ -31,6 +32,76 @@ R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 R2_ENDPOINT = os.environ.get("R2_ENDPOINT", "")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "")
+
+# --- Notificaciones Push ---
+VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "")
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
+VAPID_CLAIMS = {"sub": "mailto:soporte@tramy.app"}
+
+
+def guardar_suscripcion_push(endpoint, p256dh, auth):
+    """Guarda (o actualiza) una suscripcion push en la base de datos."""
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO push_subscriptions (endpoint, p256dh, auth)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (endpoint) DO UPDATE SET p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth
+        """, (endpoint, p256dh, auth))
+        conn.commit()
+        cur.close(); conn.close()
+        return True
+    except Exception as e:
+        print(f"Error guardando suscripcion push: {e}")
+        return False
+
+
+def enviar_notificacion_push(titulo, cuerpo, url="/"):
+    """Manda una notificacion push a TODAS las suscripciones guardadas
+    (todos los dispositivos que hayan activado las notificaciones). Si
+    una suscripcion ya no es valida (ej. la persona desinstalo la app o
+    el navegador la bloqueo), se borra sola de la base de datos."""
+    if not VAPID_PRIVATE_KEY:
+        print("Push no configurado (falta VAPID_PRIVATE_KEY) -- no se envia notificacion.", flush=True)
+        return
+
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT id, endpoint, p256dh, auth FROM push_subscriptions")
+        suscripciones = cur.fetchall()
+        cur.close(); conn.close()
+    except Exception as e:
+        print(f"Error leyendo suscripciones push: {e}", flush=True)
+        return
+
+    payload = json.dumps({"title": titulo, "body": cuerpo, "url": url, "icon": "/icon-192.png"})
+
+    for sub_id, endpoint, p256dh, auth in suscripciones:
+        try:
+            webpush(
+                subscription_info={
+                    "endpoint": endpoint,
+                    "keys": {"p256dh": p256dh, "auth": auth}
+                },
+                data=payload,
+                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims=dict(VAPID_CLAIMS),
+            )
+        except WebPushException as e:
+            print(f"Suscripcion push invalida, se borra: {e}", flush=True)
+            try:
+                conn2 = get_db_conn()
+                cur2 = conn2.cursor()
+                cur2.execute("DELETE FROM push_subscriptions WHERE id = %s", (sub_id,))
+                conn2.commit()
+                cur2.close(); conn2.close()
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"Error enviando push: {e}", flush=True)
+
 R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "")  # ej: https://docs.tramy.app
 
 def _r2_client():
@@ -962,13 +1033,25 @@ def _envigado_polling_citas(duracion_segundos, intervalo_segundos=30):
     ya existe (envigado_revisar_citas_disponibles), que guarda el
     resultado en la base de datos -- el aviso en Liquidacion y el boton
     de revision manual en Ejecucion ya leen de ahi, asi que no hace falta
-    nada adicional para que se vea el resultado."""
+    nada adicional para que se vea el resultado. Ademas, manda una
+    notificacion push -- pero solo quando PASA de "sin citas" a "con
+    citas" (no en cada ciclo de 30 segundos mientras sigan disponibles,
+    para no saturar de notificaciones repetidas)."""
+    tenia_citas_antes = False
     fin = time.time() + duracion_segundos
     while time.time() < fin:
         if _envigado_citas_monitoreo_estado["detener"]:
             break
         try:
-            envigado_revisar_citas_disponibles()
+            resultados, hubo_error = envigado_revisar_citas_disponibles()
+            hay_citas_ahora = bool(resultados) and not hubo_error
+            if hay_citas_ahora and not tenia_citas_antes:
+                enviar_notificacion_push(
+                    "¡Hay citas disponibles en Envigado!",
+                    "Se encontró disponibilidad para agendar. Revisa Tramy para más detalles.",
+                    "/liquidacion.html"
+                )
+            tenia_citas_antes = hay_citas_ahora
         except Exception as e:
             print(f"Error en monitoreo constante de citas Envigado: {e}", flush=True)
         time.sleep(intervalo_segundos)
@@ -992,7 +1075,8 @@ def _medellin_polling_citas(usuario, password, placa, id_servicio, duracion_segu
     """Revisa si hay citas disponibles en Medellin cada 'intervalo_segundos'
     (30 por defecto), durante 'duracion_segundos'. A diferencia de
     Envigado, aqui hay que volver a iniciar sesion en cada ciclo (cada
-    revision abre su propia sesion de Playwright)."""
+    revision abre su propia sesion de Playwright). Manda notificacion
+    push solo la PRIMERA vez que encuentra citas (no en cada ciclo)."""
     fin = time.time() + duracion_segundos
     while time.time() < fin:
         if _medellin_citas_monitoreo_estado["detener"]:
@@ -1000,10 +1084,18 @@ def _medellin_polling_citas(usuario, password, placa, id_servicio, duracion_segu
         try:
             hay_citas, detalle = medellin_hay_citas_disponibles(usuario, password, placa, id_servicio)
             if hay_citas:
+                ya_habia_hallazgo = _medellin_citas_monitoreo_estado["ultimo_hallazgo"] is not None
                 _medellin_citas_monitoreo_estado["ultimo_hallazgo"] = {
                     "detalle": detalle,
                     "encontrado_en": datetime.now().isoformat() + "Z",  # UTC -- el navegador lo convierte solo a hora local
                 }
+                if not ya_habia_hallazgo:
+                    sede = (detalle or {}).get("sede", "")
+                    enviar_notificacion_push(
+                        "¡Hay citas disponibles en Medellín!",
+                        f"Sede: {sede}. Revisa Tramy para más detalles." if sede else "Revisa Tramy para más detalles.",
+                        "/ejecucion.html"
+                    )
         except Exception as e:
             print(f"Error en monitoreo constante de citas Medellin: {e}", flush=True)
         time.sleep(intervalo_segundos)
@@ -4617,6 +4709,29 @@ def envigado_citas_disponibles_endpoint():
         import traceback
         print(traceback.format_exc(), flush=True)
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/push-vapid-public-key", methods=["GET"])
+def push_vapid_public_key_endpoint():
+    """Devuelve la llave publica VAPID -- esta es segura de compartir
+    (a diferencia de la privada), el navegador la necesita para crear
+    la suscripcion push."""
+    return jsonify({"publicKey": VAPID_PUBLIC_KEY})
+
+
+@app.route("/push-subscribe", methods=["POST"])
+def push_subscribe_endpoint():
+    """Guarda una suscripcion push nueva (mandada desde el navegador
+    despues de que la persona acepta recibir notificaciones)."""
+    datos = request.get_json(silent=True) or {}
+    endpoint = datos.get("endpoint", "")
+    keys = datos.get("keys", {})
+    p256dh = keys.get("p256dh", "")
+    auth = keys.get("auth", "")
+    if not endpoint or not p256dh or not auth:
+        return jsonify({"ok": False, "error": "Suscripcion incompleta."}), 400
+    ok = guardar_suscripcion_push(endpoint, p256dh, auth)
+    return jsonify({"ok": ok})
 
 
 @app.route("/medellin-citas-disponibles", methods=["GET"])
