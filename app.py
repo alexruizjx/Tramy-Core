@@ -1104,6 +1104,139 @@ def _medellin_polling_citas(usuario, password, placa, id_servicio, duracion_segu
     _medellin_citas_monitoreo_estado["detener"] = False
 
 
+# ============================================================
+# PROGRAMADOR AUTOMATICO 24/7 -- corre solo, sin que nadie tenga
+# que darle "Iniciar" cada dia. Revisa cada monitor SOLO dentro
+# de su horario configurado, con el intervalo que se haya puesto
+# en el panel de Ejecucion (se puede cambiar en caliente, sin
+# reiniciar el servidor -- se lee de la base de datos en cada
+# vuelta).
+# ============================================================
+
+def _monitoreo_config_leer(monitor):
+    """Lee la configuracion actual de un monitor (activo, intervalo,
+    horario, credenciales) desde la base de datos."""
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT activo, intervalo_segundos, hora_inicio, hora_fin, usuario, password, placa
+            FROM monitoreo_config WHERE monitor = %s
+        """, (monitor,))
+        fila = cur.fetchone()
+        cur.close(); conn.close()
+        if not fila:
+            return None
+        return {
+            "activo": fila[0], "intervalo_segundos": fila[1],
+            "hora_inicio": fila[2], "hora_fin": fila[3],
+            "usuario": fila[4], "password": fila[5], "placa": fila[6],
+        }
+    except Exception as e:
+        print(f"Error leyendo config de monitoreo ({monitor}): {e}", flush=True)
+        return None
+
+
+def _monitoreo_config_guardar(monitor, **campos):
+    """Actualiza uno o varios campos de la configuracion de un monitor."""
+    if not campos:
+        return False
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        sets = ", ".join(f"{k} = %s" for k in campos.keys())
+        valores = list(campos.values()) + [monitor]
+        cur.execute(f"UPDATE monitoreo_config SET {sets}, actualizado_en = NOW() WHERE monitor = %s", valores)
+        conn.commit()
+        cur.close(); conn.close()
+        return True
+    except Exception as e:
+        print(f"Error guardando config de monitoreo ({monitor}): {e}", flush=True)
+        return False
+
+
+def _dentro_de_horario(hora_inicio_str, hora_fin_str):
+    """Revisa si la hora actual EN COLOMBIA esta dentro del rango dado
+    (formato 'HH:MM'). Soporta rangos normales (ej 07:00-17:00)."""
+    ahora = (datetime.utcnow() - timedelta(hours=5)).time()
+    try:
+        h_ini = datetime.strptime(hora_inicio_str, "%H:%M").time()
+        h_fin = datetime.strptime(hora_fin_str, "%H:%M").time()
+    except Exception:
+        return False
+    if h_ini <= h_fin:
+        return h_ini <= ahora <= h_fin
+    return ahora >= h_ini or ahora <= h_fin  # rango que cruza la medianoche
+
+
+def _programador_automatico_loop():
+    """Hilo unico que corre para siempre desde que arranca el servidor.
+    Cada 10 segundos revisa la configuracion de cada monitor (activo,
+    horario, intervalo) y decide si le toca consultar en esta vuelta."""
+    ultimo_chequeo = {"envigado_citas": 0, "medellin_citas": 0}
+
+    while True:
+        try:
+            ahora_ts = time.time()
+
+            # --- Envigado ---
+            cfg = _monitoreo_config_leer("envigado_citas")
+            if cfg and cfg["activo"] and _dentro_de_horario(cfg["hora_inicio"], cfg["hora_fin"]):
+                if ahora_ts - ultimo_chequeo["envigado_citas"] >= cfg["intervalo_segundos"]:
+                    ultimo_chequeo["envigado_citas"] = ahora_ts
+                    try:
+                        resultados, hubo_error = envigado_revisar_citas_disponibles()
+                        hay_citas_ahora = bool(resultados) and not hubo_error
+                        ya_habia = _envigado_citas_monitoreo_estado.get("_auto_tenia_citas", False)
+                        if hay_citas_ahora and not ya_habia:
+                            enviar_notificacion_push(
+                                "¡Hay citas disponibles en Envigado!",
+                                "Se encontró disponibilidad para agendar. Revisa Tramy para más detalles.",
+                                "/liquidacion.html"
+                            )
+                        _envigado_citas_monitoreo_estado["_auto_tenia_citas"] = hay_citas_ahora
+                    except Exception as e:
+                        print(f"Error en programador automatico (Envigado): {e}", flush=True)
+
+            # --- Medellin ---
+            cfg = _monitoreo_config_leer("medellin_citas")
+            if cfg and cfg["activo"] and _dentro_de_horario(cfg["hora_inicio"], cfg["hora_fin"]):
+                if ahora_ts - ultimo_chequeo["medellin_citas"] >= cfg["intervalo_segundos"]:
+                    ultimo_chequeo["medellin_citas"] = ahora_ts
+                    if cfg["usuario"] and cfg["password"] and cfg["placa"]:
+                        try:
+                            hay_citas, detalle = medellin_hay_citas_disponibles(cfg["usuario"], cfg["password"], cfg["placa"])
+                            if hay_citas:
+                                ya_habia = _medellin_citas_monitoreo_estado["ultimo_hallazgo"] is not None
+                                _medellin_citas_monitoreo_estado["ultimo_hallazgo"] = {
+                                    "detalle": detalle,
+                                    "encontrado_en": datetime.now().isoformat() + "Z",
+                                }
+                                if not ya_habia:
+                                    sede = (detalle or {}).get("sede", "")
+                                    enviar_notificacion_push(
+                                        "¡Hay citas disponibles en Medellín!",
+                                        f"Sede: {sede}. Revisa Tramy para más detalles." if sede else "Revisa Tramy para más detalles.",
+                                        "/ejecucion.html"
+                                    )
+                            else:
+                                _medellin_citas_monitoreo_estado["ultimo_hallazgo"] = None
+                        except Exception as e:
+                            print(f"Error en programador automatico (Medellin): {e}", flush=True)
+                    else:
+                        print("Programador automatico Medellin activo pero faltan usuario/password/placa en la configuracion.", flush=True)
+
+        except Exception as e:
+            print(f"Error general en el programador automatico: {e}", flush=True)
+
+        time.sleep(10)
+
+
+# Se arranca UNA sola vez, apenas se carga la aplicacion (no depende de
+# que nadie visite ninguna pagina ni le de clic a nada).
+threading.Thread(target=_programador_automatico_loop, daemon=True).start()
+
+
 def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_monitor=1, numeros_vigilados=None):
     """Revisa el "monitor de turnos" de Envigado cada pocos segundos,
     durante 'duracion_segundos'. Cada vez que aparece un idGestionAtencion
@@ -4909,6 +5042,68 @@ def medellin_citas_detener_monitoreo_endpoint():
         return jsonify({"ok": False, "error": "No hay ningún monitoreo de citas de Medellín corriendo en este momento."}), 409
     _medellin_citas_monitoreo_estado["detener"] = True
     return jsonify({"ok": True, "mensaje": "Deteniendo el monitoreo de citas de Medellín..."})
+
+
+@app.route("/monitoreo-config", methods=["GET"])
+def monitoreo_config_obtener_endpoint():
+    """Devuelve la configuracion actual de los monitores automaticos
+    (activo, intervalo, horario, y para Medellin ademas si ya tiene
+    credenciales guardadas -- NUNCA se devuelve la contraseña real por
+    este endpoint, solo si esta configurada o no)."""
+    envigado = _monitoreo_config_leer("envigado_citas") or {}
+    medellin = _monitoreo_config_leer("medellin_citas") or {}
+    return jsonify({
+        "ok": True,
+        "envigado_citas": {
+            "activo": envigado.get("activo", False),
+            "intervalo_segundos": envigado.get("intervalo_segundos", 30),
+            "hora_inicio": envigado.get("hora_inicio", "11:00"),
+            "hora_fin": envigado.get("hora_fin", "16:00"),
+        },
+        "medellin_citas": {
+            "activo": medellin.get("activo", False),
+            "intervalo_segundos": medellin.get("intervalo_segundos", 60),
+            "hora_inicio": medellin.get("hora_inicio", "07:00"),
+            "hora_fin": medellin.get("hora_fin", "17:00"),
+            "usuario": medellin.get("usuario") or "",
+            "placa": medellin.get("placa") or "",
+            "tiene_password": bool(medellin.get("password")),
+        },
+    })
+
+
+@app.route("/monitoreo-config", methods=["POST"])
+def monitoreo_config_guardar_endpoint():
+    """Actualiza la configuracion de uno de los monitores automaticos
+    desde el panel de Ejecucion. Se manda solo el/los campos que
+    cambiaron -- los demas quedan como estaban."""
+    datos = request.get_json(silent=True) or {}
+    monitor = datos.get("monitor", "")
+    if monitor not in ("envigado_citas", "medellin_citas"):
+        return jsonify({"ok": False, "error": "Monitor inválido."}), 400
+
+    campos = {}
+    if "activo" in datos:
+        campos["activo"] = bool(datos["activo"])
+    if "intervalo_segundos" in datos:
+        try:
+            campos["intervalo_segundos"] = max(10, int(datos["intervalo_segundos"]))  # minimo 10s, por seguridad
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "Intervalo inválido."}), 400
+    if "hora_inicio" in datos:
+        campos["hora_inicio"] = datos["hora_inicio"]
+    if "hora_fin" in datos:
+        campos["hora_fin"] = datos["hora_fin"]
+    if monitor == "medellin_citas":
+        if "usuario" in datos:
+            campos["usuario"] = datos["usuario"]
+        if "password" in datos and datos["password"]:  # solo se actualiza si mandaron una nueva, nunca se borra sola
+            campos["password"] = datos["password"]
+        if "placa" in datos:
+            campos["placa"] = (datos["placa"] or "").upper().strip()
+
+    ok = _monitoreo_config_guardar(monitor, **campos)
+    return jsonify({"ok": ok})
 
 
 @app.route("/medellin-citas-estado-monitoreo", methods=["GET"])
