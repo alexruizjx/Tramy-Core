@@ -462,8 +462,25 @@ def medellin_crear_usuario(datos):
             # OJO: se hace ESTO primero, y Telefono/Ciudad AL FINAL --
             # se detecto que hacer clic en estos checkboxes reseteaba el
             # campo Ciudad si se seleccionaba antes.
-            page.click('label[for="cAcepto"]')
-            page.click('label[for="cNotifica"]')
+            # El checkbox "Acepto" tiene una etiqueta larga con varios
+            # links de por medio (politicas de uso, proteccion de
+            # datos) -- el clic normal a veces no cae en el lugar
+            # correcto de esa etiqueta y no llega a marcar el checkbox.
+            # Como el checkbox real esta oculto por CSS (sin tamaño en
+            # pantalla), tampoco se puede "forzar" un clic ahi -- se
+            # marca directo por JavaScript, disparando los eventos que
+            # el sitio pueda estar escuchando.
+            page.evaluate("""() => {
+                function marcar(id) {
+                    var el = document.getElementById(id);
+                    if (!el) return;
+                    el.checked = true;
+                    el.dispatchEvent(new Event('click', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                }
+                marcar('cAcepto');
+                marcar('cNotifica');
+            }""")
             page.wait_for_timeout(500)
 
             # DIAGNOSTICO -- confirmar que los checkboxes realmente
@@ -478,24 +495,8 @@ def medellin_crear_usuario(datos):
                     };
                 }""")
                 print(f"{etiqueta} === Estado real de los checkboxes: {estado_checks}", flush=True)
-                # Respaldo -- si el clic en la etiqueta no marco el
-                # checkbox de verdad (a veces pasa con checkboxes
-                # personalizados por CSS), se fuerza directo con check().
-                if not estado_checks.get('acepto'):
-                    print(f"{etiqueta} cAcepto no quedo marcado, forzando con check()...", flush=True)
-                    page.check('#cAcepto', force=True)
-                if not estado_checks.get('notifica'):
-                    print(f"{etiqueta} cNotifica no quedo marcado, forzando con check()...", flush=True)
-                    page.check('#cNotifica', force=True)
-                estado_checks_2 = page.evaluate("""() => {
-                    return {
-                        acepto: document.getElementById('cAcepto').checked,
-                        notifica: document.getElementById('cNotifica').checked,
-                    };
-                }""")
-                print(f"{etiqueta} === Estado de los checkboxes despues del respaldo: {estado_checks_2}", flush=True)
             except Exception as e_check:
-                print(f"{etiqueta} No se pudo revisar/forzar los checkboxes: {e_check}", flush=True)
+                print(f"{etiqueta} No se pudo revisar los checkboxes: {e_check}", flush=True)
 
             # 8. Telefono -- tambien parece validarse contra el servidor
             # (igual que el numero de identificacion), asi que se le da
