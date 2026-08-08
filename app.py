@@ -701,14 +701,14 @@ def medellin_crear_usuario(datos):
                             respuesta = "Falso"
                         elif "VEHICULOS REGISTRADOS" in texto or "VEHÍCULOS REGISTRADOS" in texto:
                             respuesta = "Verdadero" if perfil == "propietario" else "Falso"
-                        elif "PLACA" in texto:
-                            # Pregunta de "cual de las siguientes placas esta
-                            # a su nombre" -- estructura aun no confirmada
-                            # (puede no ser radio Verdadero/Falso sino un
-                            # select). Se deja registrado en el diagnostico
-                            # de abajo para poder verla y programarla bien.
-                            print(f"{etiqueta} *** Pregunta de PLACA detectada -- estructura aun no manejada. Perfil={perfil}, placa_propietario={placa_propietario}. Texto completo: {p['texto']}", flush=True)
-                            continue
+                        elif "PROPIEDAD" in texto and ("CUAL" in texto or "CÚAL" in texto or "CUÁL" in texto):
+                            # "¿Cual de los siguientes vehiculos es de su
+                            # propiedad?" -- las opciones son las placas
+                            # REALES que el sitio ya tiene asociadas a esa
+                            # cedula (varian por persona) mas un "N/A".
+                            # Comprador -> N/A. Propietario -> la placa
+                            # que coincida con placa_propietario.
+                            respuesta = "N/A" if perfil != "propietario" else placa_propietario
                         else:
                             print(f"{etiqueta} *** Pregunta NO reconocida (no se responde, revisar a mano): {p['texto']}", flush=True)
                             continue
