@@ -668,13 +668,31 @@ def medellin_crear_usuario(datos):
                             var opciones = document.querySelectorAll('input[name="{nombre_radio}"]');
                             opciones.forEach(function(op) {{
                                 if (op.value === "{respuesta}") {{
-                                    document.querySelector('label[for="' + op.id + '"]').click();
+                                    op.checked = true;
+                                    op.dispatchEvent(new Event('click', {{bubbles: true}}));
+                                    op.dispatchEvent(new Event('change', {{bubbles: true}}));
                                 }}
                             }});
                         }}""")
                         print(f"{etiqueta} Pregunta '{p['texto'][:60]}...' respondida: {respuesta}", flush=True)
 
                     page.wait_for_timeout(500)
+
+                    # Confirmar que las respuestas realmente quedaron
+                    # marcadas (el mismo problema que tuvimos antes con
+                    # los checkboxes de Acepto/Notifica -- el clic en la
+                    # etiqueta a veces no marca el radio de verdad).
+                    try:
+                        estado_radios_final = page.evaluate("""() => {
+                            var resultado = {};
+                            document.querySelectorAll('input[type=radio]:checked').forEach(function(r) {
+                                resultado[r.name] = r.value;
+                            });
+                            return resultado;
+                        }""")
+                        print(f"{etiqueta} === Estado real de las respuestas marcadas: {estado_radios_final} ===", flush=True)
+                    except Exception as e_check_radios:
+                        print(f"{etiqueta} No se pudo confirmar el estado de las respuestas: {e_check_radios}", flush=True)
 
                     # DIAGNOSTICO -- volcar el HTML completo de la zona de
                     # preguntas, por si aparecio la pregunta de la placa
