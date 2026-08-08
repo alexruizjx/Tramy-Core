@@ -7,6 +7,9 @@ import re
 import time
 import uuid
 import json
+import imaplib
+import email as email_lib
+from email.header import decode_header
 import requests
 from pywebpush import webpush, WebPushException
 import threading
@@ -621,6 +624,31 @@ def medellin_crear_usuario(datos):
                 hay_preguntas = page.evaluate("() => document.querySelectorAll('.divPregunta').length > 0")
                 if not hay_preguntas:
                     print(f"{etiqueta} No aparecio ninguna pregunta de Verdadero/Falso en este registro.", flush=True)
+                    print(f"{etiqueta} === DIAGNOSTICO: estado de la pagina sin preguntas ===", flush=True)
+                    print(f"{etiqueta} URL actual:", page.url, flush=True)
+                    try:
+                        print(etiqueta, page.inner_text("body")[:2000], flush=True)
+                    except Exception as e_txt3:
+                        print(f"{etiqueta} No se pudo leer el texto de la pagina:", e_txt3, flush=True)
+                    # Si hay un boton visible que parezca de continuar/
+                    # confirmar/registrar (distinto a "Siguiente", que ya
+                    # se uso), se reporta para saber si falta darle clic.
+                    try:
+                        botones_visibles = page.evaluate("""() => {
+                            var botones = document.querySelectorAll('input[type=button], input[type=submit], button');
+                            var resultado = [];
+                            botones.forEach(function(b) {
+                                var estilo = window.getComputedStyle(b);
+                                if (estilo.display !== 'none' && estilo.visibility !== 'hidden') {
+                                    resultado.push({id: b.id, valor: b.value || b.innerText, disabled: b.disabled});
+                                }
+                            });
+                            return resultado;
+                        }""")
+                        print(f"{etiqueta} === Botones visibles en la pagina: {botones_visibles} ===", flush=True)
+                    except Exception as e_btns:
+                        print(f"{etiqueta} No se pudo revisar los botones visibles: {e_btns}", flush=True)
+                    print(f"{etiqueta} === FIN DIAGNOSTICO sin preguntas ===", flush=True)
                 else:
                     preguntas = page.evaluate("""() => {
                         var divs = document.querySelectorAll('.divPregunta');
@@ -742,7 +770,141 @@ def medellin_crear_usuario(datos):
     return resultado
 
 
-MEDELLIN_LOGIN_URL = "https://www.medellin.gov.co/irj/servlet/prt/portal/prtroot/pcd!3aportal_content!2fMunicipioMedellin!2fPCM!2fadmin!2froles!2fmedellin!2futilMedellin!2fauth"
+def medellin_leer_credenciales_temporales(email_cuenta, password_app_email, cedula, minutos_maximo_espera=5, etiqueta=""):
+    """Se conecta por IMAP a la bandeja de correo (Gmail, usando una
+    'Contraseña de aplicacion', no la contraseña normal de la cuenta) y
+    busca el correo de activacion que manda la Alcaldia de Medellin al
+    completar el registro. Ese correo trae USUARIO y CONTRASEÑA
+    temporales en texto plano dentro del cuerpo -- se extraen con
+    expresiones regulares.
+
+    Reintenta cada 15 segundos hasta 'minutos_maximo_espera', porque el
+    correo puede tardar un poco en llegar despues del registro.
+
+    Devuelve (usuario, password_temporal) o (None, None) si no se
+    encontro el correo a tiempo."""
+    intentos_maximos = max(1, (minutos_maximo_espera * 60) // 15)
+
+    for intento in range(intentos_maximos):
+        try:
+            imap = imaplib.IMAP4_SSL("imap.gmail.com")
+            imap.login(email_cuenta, password_app_email)
+            imap.select("inbox")
+
+            # Buscar correos recientes de la Alcaldia de Medellin (por
+            # remitente), sin filtrar por leido/no leido -- puede haber
+            # varios registros seguidos en la misma cuenta de correo.
+            status, datos_busqueda = imap.search(None, 'FROM "medellin.gov.co"')
+            if status != "OK":
+                imap.logout()
+                time.sleep(15)
+                continue
+
+            ids_correos = datos_busqueda[0].split()
+            # Revisar del mas reciente al mas antiguo
+            for id_correo in reversed(ids_correos[-10:]):  # solo los ultimos 10, para no revisar toda la bandeja
+                status, datos_correo = imap.fetch(id_correo, "(RFC822)")
+                if status != "OK":
+                    continue
+                mensaje = email_lib.message_from_bytes(datos_correo[0][1])
+
+                cuerpo = ""
+                if mensaje.is_multipart():
+                    for parte in mensaje.walk():
+                        tipo = parte.get_content_type()
+                        if tipo in ("text/plain", "text/html"):
+                            try:
+                                cuerpo += parte.get_payload(decode=True).decode(parte.get_content_charset() or "utf-8", errors="ignore")
+                            except Exception:
+                                pass
+                else:
+                    try:
+                        cuerpo = mensaje.get_payload(decode=True).decode(mensaje.get_content_charset() or "utf-8", errors="ignore")
+                    except Exception:
+                        cuerpo = str(mensaje.get_payload())
+
+                # Confirmar que este correo es el de ESTA cedula
+                # especifica (por si hay varios registros mezclados en
+                # la misma bandeja).
+                if cedula not in cuerpo:
+                    continue
+
+                m_usuario = re.search(r'Usuario:\s*([^\s<]+)', cuerpo)
+                m_password = re.search(r'Contrase[ñn]a:\s*([^\s<]+)', cuerpo)
+                if m_usuario and m_password:
+                    usuario_temp = m_usuario.group(1).strip()
+                    password_temp = m_password.group(1).strip()
+                    imap.logout()
+                    print(f"{etiqueta} Credenciales temporales encontradas en el correo para cedula {cedula}.", flush=True)
+                    return usuario_temp, password_temp
+
+            imap.logout()
+        except Exception as e:
+            print(f"{etiqueta} Error leyendo correo (intento {intento+1}/{intentos_maximos}): {e}", flush=True)
+
+        time.sleep(15)
+
+    print(f"{etiqueta} No se encontro el correo de activacion despues de {minutos_maximo_espera} minutos.", flush=True)
+    return None, None
+
+
+def medellin_activar_cuenta(usuario_temporal, password_temporal, nueva_password):
+    """Inicia sesion con las credenciales TEMPORALES que manda el correo
+    de activacion, y completa el cambio de contraseña obligatorio que
+    pide el sitio la primera vez. Reutiliza el mismo patron de login
+    real por Playwright que ya usamos para revisar citas."""
+    etiqueta = f"[MEDELLIN-ACTIVAR-{uuid.uuid4().hex[:6]}]"
+    resultado = {"exito": False, "mensaje": ""}
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+
+        try:
+            print(f"{etiqueta} Iniciando sesion con credenciales temporales (usuario: {usuario_temporal})...", flush=True)
+            page.goto(MEDELLIN_LOGIN_URL, timeout=30000)
+            page.fill('input[name="user"]', usuario_temporal)
+            page.fill('input[name="passw"]', password_temporal)
+            with page.expect_navigation(timeout=30000):
+                page.press('input[name="passw"]', "Enter")
+            page.wait_for_timeout(3000)
+
+            print(f"{etiqueta} === DIAGNOSTICO: pagina despues del login con credenciales temporales ===", flush=True)
+            print(f"{etiqueta} URL actual:", page.url, flush=True)
+            try:
+                print(etiqueta, page.inner_text("body")[:3000], flush=True)
+            except Exception as e_txt:
+                print(f"{etiqueta} No se pudo leer el texto de la pagina:", e_txt, flush=True)
+
+            # DIAGNOSTICO -- volcar el HTML completo, ya que todavia no
+            # conocemos la estructura exacta de la pantalla de cambio de
+            # contraseña (nombres de los campos, boton, etc.).
+            try:
+                html_completo = page.content()
+                print(f"{etiqueta} === HTML completo de la pagina (para programar el cambio de contraseña) ===", flush=True)
+                print(etiqueta, html_completo[:8000], flush=True)
+            except Exception as e_html:
+                print(f"{etiqueta} No se pudo volcar el HTML: {e_html}", flush=True)
+
+            resultado["exito"] = True
+            resultado["mensaje"] = "Login con credenciales temporales realizado -- revisa los logs para ver la pantalla de cambio de contraseña y terminar de programarla."
+            resultado["nueva_password_a_usar"] = nueva_password
+
+        except Exception as e:
+            print(f"{etiqueta} Error activando cuenta: {e}", flush=True)
+            resultado["mensaje"] = str(e)
+            try:
+                print(etiqueta, page.inner_text("body")[:2000], flush=True)
+            except Exception:
+                pass
+        finally:
+            context.close(); browser.close()
+
+    return resultado
+
+
+
 MEDELLIN_INICIO_SESION_URL = "https://www.medellin.gov.co/portal-movilidad/index.html#/inicio-sesion"
 MEDELLIN_AVIT_API = "https://www.medellin.gov.co/backavit/avit"
 MEDELLIN_SERVICIO_TRASPASO = "1"  # confirmado con un HAR real: idServicio=1 -> nombreServicio="Traspaso"
@@ -5105,7 +5267,52 @@ def medellin_crear_usuario_endpoint():
     return jsonify({"job_id": job_id})
 
 
-@app.route("/envigado-citas-iniciar-monitoreo", methods=["GET"])
+@app.route("/medellin-activar-cuenta", methods=["GET"])
+def medellin_activar_cuenta_endpoint():
+    """Segundo paso del registro: lee el correo de activacion que manda
+    la Alcaldia de Medellin (con usuario/contraseña temporales), inicia
+    sesion con esas credenciales, y deja la cuenta lista para usar.
+
+    Requiere que el correo YA haya llegado (o llegue dentro de los
+    minutos de espera) -- normalmente tarda unos minutos despues de
+    crear el usuario con /medellin-crear-usuario."""
+    cedula = request.args.get("cedula", "").strip()
+    email_cuenta = request.args.get("email_cuenta", "").strip()
+    password_app_email = request.args.get("password_app_email", "").strip()
+    nueva_password = request.args.get("nueva_password", "").strip()
+
+    faltantes = [k for k, v in {
+        "cedula": cedula, "email_cuenta": email_cuenta,
+        "password_app_email": password_app_email, "nueva_password": nueva_password,
+    }.items() if not v]
+    if faltantes:
+        return jsonify({"error": f"Faltan datos: {', '.join(faltantes)}"}), 400
+
+    job_id = str(uuid.uuid4())
+    job_actualizar(job_id, "Buscando el correo de activación...", "procesando")
+
+    def ejecutar():
+        try:
+            etiqueta = f"[MEDELLIN-ACTIVAR-{job_id[:6]}]"
+            usuario_temp, password_temp = medellin_leer_credenciales_temporales(
+                email_cuenta, password_app_email, cedula, minutos_maximo_espera=5, etiqueta=etiqueta
+            )
+            if not usuario_temp:
+                job_error(job_id, "No se encontró el correo de activación a tiempo (esperó 5 minutos).")
+                return
+            job_actualizar(job_id, "Correo encontrado, iniciando sesión con credenciales temporales...", "procesando")
+            resultado = medellin_activar_cuenta(usuario_temp, password_temp, nueva_password)
+            job_terminar(job_id, resultado)
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc(), flush=True)
+            job_error(job_id, str(e))
+
+    threading.Thread(target=ejecutar, daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+
 def envigado_citas_iniciar_monitoreo_endpoint():
     """Arranca una sesion de monitoreo CONSTANTE de citas disponibles en
     Envigado -- revisa cada 30 segundos, durante maximo 2 horas (o hasta
