@@ -596,9 +596,30 @@ def medellin_crear_usuario(datos):
             except Exception as e_diag:
                 print(f"{etiqueta} No se pudo revisar el estado de validacion: {e_diag}", flush=True)
 
-            # 9. Clic en "Siguiente"
-            page.click("#inpBtnNext")
-            page.wait_for_timeout(3000)
+            # 9. Clic en "Siguiente" -- CON REINTENTOS. Confirmado (con
+            # una persona real llenando el formulario a mano sin ningun
+            # problema) que el sitio SI funciona bien -- el problema es
+            # que la automatizacion a veces le da clic demasiado rapido,
+            # antes de que alguna validacion interna del sitio termine
+            # de asentarse (algo que un humano no hace, porque
+            # naturalmente se toma mas tiempo entre acciones). Por eso:
+            # se espera un poco extra antes del primer clic, y si
+            # despues de darle clic la pagina no cambio de contenido
+            # (senal de que se quedo pegada en el mismo paso), se
+            # reintenta con esperas cada vez mas largas.
+            page.wait_for_timeout(2000)  # dar tiempo de sobra a que termine de asentarse la validacion de todos los campos
+            contenido_antes_siguiente = page.inner_text("body")
+            esperas_reintento = [3000, 5000, 8000]  # cada vuelta espera un poco mas que la anterior
+            for intento_siguiente, espera_ms in enumerate(esperas_reintento):
+                page.click("#inpBtnNext")
+                page.wait_for_timeout(espera_ms)
+                contenido_despues_siguiente = page.inner_text("body")
+                if contenido_despues_siguiente != contenido_antes_siguiente:
+                    print(f"{etiqueta} Clic en Siguiente avanzo la pagina (intento {intento_siguiente+1}, espero {espera_ms}ms).", flush=True)
+                    break
+                print(f"{etiqueta} Clic en Siguiente NO parece haber avanzado (intento {intento_siguiente+1}/{len(esperas_reintento)}, espero {espera_ms}ms), reintentando...", flush=True)
+            else:
+                print(f"{etiqueta} *** Clic en Siguiente no avanzo despues de {len(esperas_reintento)} intentos -- se continua de todas formas.", flush=True)
 
             # DIAGNOSTICO -- que paso despues de dar clic en Siguiente
             # (puede ser un segundo paso del formulario, un mensaje de
@@ -748,8 +769,19 @@ def medellin_crear_usuario(datos):
                         except Exception:
                             pass
 
-                        page.click("#inpBtnQ")
-                        page.wait_for_timeout(3000)
+                        page.wait_for_timeout(2000)  # dar tiempo de sobra a que se asienten las respuestas marcadas
+                        contenido_antes_validar = page.inner_text("body")
+                        esperas_reintento_validar = [3000, 5000, 8000]
+                        for intento_validar, espera_ms_v in enumerate(esperas_reintento_validar):
+                            page.click("#inpBtnQ")
+                            page.wait_for_timeout(espera_ms_v)
+                            contenido_despues_validar = page.inner_text("body")
+                            if contenido_despues_validar != contenido_antes_validar:
+                                print(f"{etiqueta} Clic en Validar respuestas avanzo la pagina (intento {intento_validar+1}, espero {espera_ms_v}ms).", flush=True)
+                                break
+                            print(f"{etiqueta} Clic en Validar respuestas NO parece haber avanzado (intento {intento_validar+1}/{len(esperas_reintento_validar)}, espero {espera_ms_v}ms), reintentando...", flush=True)
+                        else:
+                            print(f"{etiqueta} *** Clic en Validar respuestas no avanzo despues de {len(esperas_reintento_validar)} intentos -- se continua de todas formas.", flush=True)
 
                         try:
                             disabled_despues = page.evaluate("() => document.querySelector('#inpBtnQ') ? document.querySelector('#inpBtnQ').disabled : 'boton ya no existe'")
