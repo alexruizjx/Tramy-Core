@@ -466,6 +466,37 @@ def medellin_crear_usuario(datos):
             page.click('label[for="cNotifica"]')
             page.wait_for_timeout(500)
 
+            # DIAGNOSTICO -- confirmar que los checkboxes realmente
+            # quedaron marcados (el diagnostico de validacion de campos
+            # no los revisa, porque su fila no tiene la misma estructura
+            # que los demas campos).
+            try:
+                estado_checks = page.evaluate("""() => {
+                    return {
+                        acepto: document.getElementById('cAcepto').checked,
+                        notifica: document.getElementById('cNotifica').checked,
+                    };
+                }""")
+                print(f"{etiqueta} === Estado real de los checkboxes: {estado_checks}", flush=True)
+                # Respaldo -- si el clic en la etiqueta no marco el
+                # checkbox de verdad (a veces pasa con checkboxes
+                # personalizados por CSS), se fuerza directo con check().
+                if not estado_checks.get('acepto'):
+                    print(f"{etiqueta} cAcepto no quedo marcado, forzando con check()...", flush=True)
+                    page.check('#cAcepto', force=True)
+                if not estado_checks.get('notifica'):
+                    print(f"{etiqueta} cNotifica no quedo marcado, forzando con check()...", flush=True)
+                    page.check('#cNotifica', force=True)
+                estado_checks_2 = page.evaluate("""() => {
+                    return {
+                        acepto: document.getElementById('cAcepto').checked,
+                        notifica: document.getElementById('cNotifica').checked,
+                    };
+                }""")
+                print(f"{etiqueta} === Estado de los checkboxes despues del respaldo: {estado_checks_2}", flush=True)
+            except Exception as e_check:
+                print(f"{etiqueta} No se pudo revisar/forzar los checkboxes: {e_check}", flush=True)
+
             # 8. Telefono -- tambien parece validarse contra el servidor
             # (igual que el numero de identificacion), asi que se le da
             # tiempo de sobra despues de escribirlo.
