@@ -738,7 +738,9 @@ def medellin_crear_usuario(datos):
 
                     # Clic en "Validar respuestas" (si existe el boton --
                     # puede que la pantalla sea distinta si hay una
-                    # pregunta de placa sin responder).
+                    # pregunta de placa sin responder). CON REINTENTOS,
+                    # igual que "Siguiente" -- el sitio a veces no
+                    # avanza al primer clic.
                     if page.locator("#inpBtnQ").count() > 0:
                         try:
                             disabled_antes = page.evaluate("() => document.querySelector('#inpBtnQ').disabled")
@@ -747,7 +749,7 @@ def medellin_crear_usuario(datos):
                             pass
 
                         page.click("#inpBtnQ")
-                        page.wait_for_timeout(5000)
+                        page.wait_for_timeout(3000)
 
                         try:
                             disabled_despues = page.evaluate("() => document.querySelector('#inpBtnQ') ? document.querySelector('#inpBtnQ').disabled : 'boton ya no existe'")
@@ -5324,7 +5326,41 @@ def medellin_activar_cuenta_endpoint():
     return jsonify({"job_id": job_id})
 
 
+@app.route("/medellin-activar-cuenta-directo", methods=["GET"])
+def medellin_activar_cuenta_directo_endpoint():
+    """Version simplificada de /medellin-activar-cuenta -- en vez de leer
+    el correo automaticamente, recibe el usuario y contraseña temporal
+    directamente (el usuario los copia del correo y los manda aqui a
+    mano). Util mientras la lectura automatica de correo no este
+    disponible (ej. si la cuenta de correo quedo bloqueada)."""
+    usuario_temporal = request.args.get("usuario_temporal", "").strip()
+    password_temporal = request.args.get("password_temporal", "").strip()
+    nueva_password = request.args.get("nueva_password", "").strip()
 
+    faltantes = [k for k, v in {
+        "usuario_temporal": usuario_temporal, "password_temporal": password_temporal,
+        "nueva_password": nueva_password,
+    }.items() if not v]
+    if faltantes:
+        return jsonify({"error": f"Faltan datos: {', '.join(faltantes)}"}), 400
+
+    job_id = str(uuid.uuid4())
+    job_actualizar(job_id, "Iniciando sesión con credenciales temporales...", "procesando")
+
+    def ejecutar():
+        try:
+            resultado = medellin_activar_cuenta(usuario_temporal, password_temporal, nueva_password)
+            job_terminar(job_id, resultado)
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc(), flush=True)
+            job_error(job_id, str(e))
+
+    threading.Thread(target=ejecutar, daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/envigado-citas-iniciar-monitoreo", methods=["GET"])
 def envigado_citas_iniciar_monitoreo_endpoint():
     """Arranca una sesion de monitoreo CONSTANTE de citas disponibles en
     Envigado -- revisa cada 30 segundos, durante maximo 2 horas (o hasta
