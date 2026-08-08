@@ -1023,13 +1023,16 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
             "--single-process", "--no-zygote", "--disable-setuid-sandbox"
         ])
         proxy_config = None
-        if usar_proxy and IPROYAL_USER and IPROYAL_PASS:
-            proxy_config = {
-                "server": f"http://{IPROYAL_HOST}:{IPROYAL_PORT}",
-                "username": IPROYAL_USER,
-                "password": IPROYAL_PASS,
-            }
-            print(f"{etiqueta} Usando proxy residencial de IPRoyal para esta consulta.", flush=True)
+        if usar_proxy:
+            if IPROYAL_USER and IPROYAL_PASS:
+                proxy_config = {
+                    "server": f"http://{IPROYAL_HOST}:{IPROYAL_PORT}",
+                    "username": IPROYAL_USER,
+                    "password": IPROYAL_PASS,
+                }
+                print(f"{etiqueta} Usando proxy residencial de IPRoyal para esta consulta.", flush=True)
+            else:
+                print(f"{etiqueta} *** ALERTA: se pidio usar el proxy, pero faltan las credenciales de IPRoyal en las variables de entorno (IPROYAL_USER/IPROYAL_PASS) -- esta consulta va SIN proxy, usando la IP normal del servidor.", flush=True)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
             viewport={"width": 1366, "height": 900},
