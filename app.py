@@ -1078,6 +1078,10 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
             )
             puntos = resp_puntos.json()
             print(f"{etiqueta} Puntos de atencion encontrados: {puntos}", flush=True)
+            nombres_sedes_reales = [p.get("nombreSubsede", "") for p in puntos]
+            print(f"{etiqueta} === Nombres EXACTOS de sede que devuelve el sitio ahora mismo: {nombres_sedes_reales} ===", flush=True)
+            if sede_deseada:
+                print(f"{etiqueta} Sede que se esta buscando (filtro): '{sede_deseada}'", flush=True)
 
             if not puntos:
                 return False, {"mensaje": "No hay ningun punto de atencion ofreciendo este servicio en este momento."}
@@ -5628,6 +5632,18 @@ def medellin_citas_estado_monitoreo_endpoint():
         "fin_esperado": _medellin_citas_monitoreo_estado["fin_esperado"],
         "ultimo_hallazgo": _medellin_citas_monitoreo_estado["ultimo_hallazgo"],
     })
+
+
+@app.route("/medellin-citas-resetear-aviso", methods=["GET"])
+def medellin_citas_resetear_aviso_endpoint():
+    """Olvida el ultimo hallazgo guardado (tanto del monitoreo manual
+    como del programador automatico, que comparten el mismo estado) --
+    asi, si la MISMA disponibilidad sigue ahi (nunca desaparecio), la
+    proxima revision lo vuelve a contar como 'nuevo' y manda el aviso
+    de nuevo (sonido/vibracion/push), en vez de quedarse callado hasta
+    que la disponibilidad desaparezca y reaparezca sola."""
+    _medellin_citas_monitoreo_estado["ultimo_hallazgo"] = None
+    return jsonify({"ok": True, "mensaje": "Aviso reiniciado -- la próxima vez que se detecte disponibilidad, se avisará de nuevo."})
 
 
 @app.route("/envigado-citas-ultimo-resultado", methods=["GET"])
