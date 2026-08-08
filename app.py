@@ -611,7 +611,13 @@ def medellin_crear_usuario(datos):
             contenido_antes_siguiente = page.inner_text("body")
             esperas_reintento = [3000, 5000, 8000]  # cada vuelta espera un poco mas que la anterior
             for intento_siguiente, espera_ms in enumerate(esperas_reintento):
-                page.click("#inpBtnNext")
+                if page.locator("#inpBtnNext").count() == 0:
+                    print(f"{etiqueta} El boton 'Siguiente' ya no existe -- la pagina avanzo.", flush=True)
+                    break
+                try:
+                    page.click("#inpBtnNext", force=True, timeout=5000)
+                except Exception as e_click_sig:
+                    print(f"{etiqueta} No se pudo hacer clic en Siguiente (probablemente deshabilitado temporalmente): {e_click_sig}", flush=True)
                 page.wait_for_timeout(espera_ms)
                 contenido_despues_siguiente = page.inner_text("body")
                 if contenido_despues_siguiente != contenido_antes_siguiente:
@@ -773,7 +779,21 @@ def medellin_crear_usuario(datos):
                         contenido_antes_validar = page.inner_text("body")
                         esperas_reintento_validar = [3000, 5000, 8000]
                         for intento_validar, espera_ms_v in enumerate(esperas_reintento_validar):
-                            page.click("#inpBtnQ")
+                            # Si el boton ya no existe en la pagina, es
+                            # señal de que SI avanzo (la pantalla cambio
+                            # de verdad), no hace falta seguir intentando.
+                            if page.locator("#inpBtnQ").count() == 0:
+                                print(f"{etiqueta} El boton 'Validar respuestas' ya no existe -- la pagina avanzo.", flush=True)
+                                break
+                            # force=True porque el boton a veces queda
+                            # deshabilitado brevemente mientras el sitio
+                            # revisa las respuestas -- sin esto, Playwright
+                            # se queda hasta 30 segundos esperando a que se
+                            # habilite y termina fallando con timeout.
+                            try:
+                                page.click("#inpBtnQ", force=True, timeout=5000)
+                            except Exception as e_click_validar:
+                                print(f"{etiqueta} No se pudo hacer clic (boton probablemente deshabilitado temporalmente): {e_click_validar}", flush=True)
                             page.wait_for_timeout(espera_ms_v)
                             contenido_despues_validar = page.inner_text("body")
                             if contenido_despues_validar != contenido_antes_validar:
@@ -951,6 +971,7 @@ def medellin_activar_cuenta(usuario_temporal, password_temporal, nueva_password)
 
 
 
+MEDELLIN_LOGIN_URL = "https://www.medellin.gov.co/irj/servlet/prt/portal/prtroot/pcd!3aportal_content!2fMunicipioMedellin!2fPCM!2fadmin!2froles!2fmedellin!2futilMedellin!2fauth"
 MEDELLIN_INICIO_SESION_URL = "https://www.medellin.gov.co/portal-movilidad/index.html#/inicio-sesion"
 MEDELLIN_AVIT_API = "https://www.medellin.gov.co/backavit/avit"
 MEDELLIN_SERVICIO_TRASPASO = "1"  # confirmado con un HAR real: idServicio=1 -> nombreServicio="Traspaso"
