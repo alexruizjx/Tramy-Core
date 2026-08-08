@@ -73,8 +73,9 @@ def enviar_notificacion_push(titulo, cuerpo, url="/"):
     (todos los dispositivos que hayan activado las notificaciones). Si
     una suscripcion ya no es valida (ej. la persona desinstalo la app o
     el navegador la bloqueo), se borra sola de la base de datos."""
+    print(f"[PUSH] Intentando enviar notificacion: '{titulo}' -- '{cuerpo}'", flush=True)
     if not VAPID_PRIVATE_KEY:
-        print("Push no configurado (falta VAPID_PRIVATE_KEY) -- no se envia notificacion.", flush=True)
+        print("[PUSH] No configurado (falta VAPID_PRIVATE_KEY) -- no se envia notificacion.", flush=True)
         return
 
     try:
@@ -84,8 +85,12 @@ def enviar_notificacion_push(titulo, cuerpo, url="/"):
         suscripciones = cur.fetchall()
         cur.close(); conn.close()
     except Exception as e:
-        print(f"Error leyendo suscripciones push: {e}", flush=True)
+        print(f"[PUSH] Error leyendo suscripciones push: {e}", flush=True)
         return
+
+    print(f"[PUSH] {len(suscripciones)} suscripcion(es) encontrada(s) en la base de datos.", flush=True)
+    if not suscripciones:
+        print("[PUSH] No hay ninguna suscripcion guardada -- nadie ha activado las notificaciones, o se borraron por invalidas.", flush=True)
 
     payload = json.dumps({"title": titulo, "body": cuerpo, "url": url, "icon": "/icon-192.png"})
 
@@ -100,8 +105,9 @@ def enviar_notificacion_push(titulo, cuerpo, url="/"):
                 vapid_private_key=VAPID_PRIVATE_KEY,
                 vapid_claims=dict(VAPID_CLAIMS),
             )
+            print(f"[PUSH] ✓ Enviada correctamente a la suscripcion id={sub_id}.", flush=True)
         except WebPushException as e:
-            print(f"Suscripcion push invalida, se borra: {e}", flush=True)
+            print(f"[PUSH] Suscripcion id={sub_id} invalida, se borra: {e}", flush=True)
             try:
                 conn2 = get_db_conn()
                 cur2 = conn2.cursor()
@@ -111,7 +117,7 @@ def enviar_notificacion_push(titulo, cuerpo, url="/"):
             except Exception:
                 pass
         except Exception as e:
-            print(f"Error enviando push: {e}", flush=True)
+            print(f"[PUSH] Error enviando a la suscripcion id={sub_id}: {e}", flush=True)
 
 R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "")  # ej: https://docs.tramy.app
 
