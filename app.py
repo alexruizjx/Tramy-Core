@@ -609,8 +609,106 @@ def medellin_crear_usuario(datos):
                 print(f"{etiqueta} No se pudo leer el texto de la pagina:", e_txt, flush=True)
             print(f"{etiqueta} === FIN DIAGNOSTICO despues de Siguiente ===", flush=True)
 
+            # 10. SEGUNDO PASO -- preguntas de Verdadero/Falso. IMPORTANTE:
+            # estas preguntas son FIJAS (no se despliegan preguntas nuevas
+            # segun las respuestas que se den), pero la CANTIDAD que
+            # aparece varia entre 0 y 3 segun cada registro -- a veces no
+            # sale ninguna, a veces solo 1 o 2. Por eso el codigo no
+            # asume ids fijos (radio0/radio1/etc.), sino que lee el texto
+            # de cada pregunta que SI aparezca y responde segun ese
+            # texto.
+            try:
+                hay_preguntas = page.evaluate("() => document.querySelectorAll('.divPregunta').length > 0")
+                if not hay_preguntas:
+                    print(f"{etiqueta} No aparecio ninguna pregunta de Verdadero/Falso en este registro.", flush=True)
+                else:
+                    preguntas = page.evaluate("""() => {
+                        var divs = document.querySelectorAll('.divPregunta');
+                        var resultado = [];
+                        divs.forEach(function(div) {
+                            var ul = div.nextElementSibling;
+                            var nombreRadio = null;
+                            if (ul) {
+                                var primerInput = ul.querySelector('input[type=radio]');
+                                if (primerInput) nombreRadio = primerInput.name;
+                            }
+                            resultado.push({texto: div.innerText.trim(), nombreRadio: nombreRadio});
+                        });
+                        return resultado;
+                    }""")
+                    print(f"{etiqueta} === Preguntas detectadas en este registro: {preguntas} ===", flush=True)
+
+                    perfil = (datos.get("perfil_usuario") or "").strip().lower()  # "propietario" o "comprador"
+                    placa_propietario = (datos.get("placa_propietario") or "").strip().upper()
+
+                    for p in preguntas:
+                        texto = p["texto"].upper()
+                        nombre_radio = p["nombreRadio"]
+                        if not nombre_radio:
+                            print(f"{etiqueta} Pregunta sin radios detectados (revisar a mano): {p['texto']}", flush=True)
+                            continue
+
+                        if "ACUERDOS DE PAGO" in texto:
+                            respuesta = "Falso"
+                        elif "VEHICULOS REGISTRADOS" in texto or "VEHÍCULOS REGISTRADOS" in texto:
+                            respuesta = "Verdadero" if perfil == "propietario" else "Falso"
+                        elif "PLACA" in texto:
+                            # Pregunta de "cual de las siguientes placas esta
+                            # a su nombre" -- estructura aun no confirmada
+                            # (puede no ser radio Verdadero/Falso sino un
+                            # select). Se deja registrado en el diagnostico
+                            # de abajo para poder verla y programarla bien.
+                            print(f"{etiqueta} *** Pregunta de PLACA detectada -- estructura aun no manejada. Perfil={perfil}, placa_propietario={placa_propietario}. Texto completo: {p['texto']}", flush=True)
+                            continue
+                        else:
+                            print(f"{etiqueta} *** Pregunta NO reconocida (no se responde, revisar a mano): {p['texto']}", flush=True)
+                            continue
+
+                        page.evaluate(f"""() => {{
+                            var opciones = document.querySelectorAll('input[name="{nombre_radio}"]');
+                            opciones.forEach(function(op) {{
+                                if (op.value === "{respuesta}") {{
+                                    document.querySelector('label[for="' + op.id + '"]').click();
+                                }}
+                            }});
+                        }}""")
+                        print(f"{etiqueta} Pregunta '{p['texto'][:60]}...' respondida: {respuesta}", flush=True)
+
+                    page.wait_for_timeout(500)
+
+                    # DIAGNOSTICO -- volcar el HTML completo de la zona de
+                    # preguntas, por si aparecio la pregunta de la placa
+                    # (o cualquier otra que no se haya visto antes), para
+                    # poder revisar su estructura exacta.
+                    try:
+                        html_preguntas = page.evaluate("""() => {
+                            var cont = document.querySelector('.divContPreguntas');
+                            return cont ? cont.outerHTML : null;
+                        }""")
+                        print(f"{etiqueta} === HTML completo de la zona de preguntas ===", flush=True)
+                        print(etiqueta, html_preguntas, flush=True)
+                    except Exception as e_html:
+                        print(f"{etiqueta} No se pudo volcar el HTML de preguntas: {e_html}", flush=True)
+
+                    # Clic en "Validar respuestas" (si existe el boton --
+                    # puede que la pantalla sea distinta si hay una
+                    # pregunta de placa sin responder).
+                    if page.locator("#inpBtnQ").count() > 0:
+                        page.click("#inpBtnQ")
+                        page.wait_for_timeout(3000)
+
+                        print(f"{etiqueta} === DIAGNOSTICO: despues de Validar respuestas ===", flush=True)
+                        print(f"{etiqueta} URL actual:", page.url, flush=True)
+                        try:
+                            print(etiqueta, page.inner_text("body")[:2000], flush=True)
+                        except Exception as e_txt2:
+                            print(f"{etiqueta} No se pudo leer el texto de la pagina:", e_txt2, flush=True)
+                        print(f"{etiqueta} === FIN DIAGNOSTICO despues de Validar respuestas ===", flush=True)
+            except Exception as e_paso2:
+                print(f"{etiqueta} Error revisando/respondiendo las preguntas: {e_paso2}", flush=True)
+
             resultado["exito"] = True
-            resultado["mensaje"] = "Formulario enviado -- revisa los logs para confirmar el resultado real (puede haber un segundo paso)."
+            resultado["mensaje"] = "Formulario enviado -- revisa los logs para confirmar el resultado real (puede haber un tercer paso)."
 
         except Exception as e:
             print(f"{etiqueta} Error en el flujo de Playwright para registro Medellin: {e}", flush=True)
@@ -4967,6 +5065,11 @@ def medellin_crear_usuario_endpoint():
     faltantes = [k for k, v in datos.items() if not v]
     if faltantes:
         return jsonify({"error": f"Faltan datos: {', '.join(faltantes)}"}), 400
+
+    # Estos dos campos son opcionales (dependen del perfil), asi que se
+    # agregan DESPUES de la revision de campos obligatorios de arriba.
+    datos["perfil_usuario"] = request.args.get("perfil_usuario", "").strip().lower()  # "propietario" o "comprador"
+    datos["placa_propietario"] = request.args.get("placa_propietario", "").strip().upper()
 
     job_id = str(uuid.uuid4())
     job_actualizar(job_id, "Iniciando registro en el portal de Medellín...", "procesando")
