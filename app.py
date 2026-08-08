@@ -740,8 +740,20 @@ def medellin_crear_usuario(datos):
                     # puede que la pantalla sea distinta si hay una
                     # pregunta de placa sin responder).
                     if page.locator("#inpBtnQ").count() > 0:
+                        try:
+                            disabled_antes = page.evaluate("() => document.querySelector('#inpBtnQ').disabled")
+                            print(f"{etiqueta} Boton 'Validar respuestas' deshabilitado ANTES del clic: {disabled_antes}", flush=True)
+                        except Exception:
+                            pass
+
                         page.click("#inpBtnQ")
-                        page.wait_for_timeout(3000)
+                        page.wait_for_timeout(5000)
+
+                        try:
+                            disabled_despues = page.evaluate("() => document.querySelector('#inpBtnQ') ? document.querySelector('#inpBtnQ').disabled : 'boton ya no existe'")
+                            print(f"{etiqueta} Boton 'Validar respuestas' deshabilitado DESPUES del clic: {disabled_despues}", flush=True)
+                        except Exception:
+                            pass
 
                         print(f"{etiqueta} === DIAGNOSTICO: despues de Validar respuestas ===", flush=True)
                         print(f"{etiqueta} URL actual:", page.url, flush=True)
