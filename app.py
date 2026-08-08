@@ -38,6 +38,14 @@ R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "")
 
 # --- Notificaciones Push ---
 VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "")
+
+# --- Proxy residencial (IPRoyal) -- se usa SOLO los sabados durante el
+# monitoreo intensivo de citas de Medellin, para evitar que el sitio
+# bloquee la IP fija del servidor por exceso de peticiones seguidas.
+IPROYAL_HOST = os.environ.get("IPROYAL_HOST", "geo.iproyal.com")
+IPROYAL_PORT = os.environ.get("IPROYAL_PORT", "12321")
+IPROYAL_USER = os.environ.get("IPROYAL_USER", "")
+IPROYAL_PASS = os.environ.get("IPROYAL_PASS", "")
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_CLAIMS = {"sub": "mailto:soporte@tramy.app"}
 
@@ -977,7 +985,7 @@ MEDELLIN_AVIT_API = "https://www.medellin.gov.co/backavit/avit"
 MEDELLIN_SERVICIO_TRASPASO = "1"  # confirmado con un HAR real: idServicio=1 -> nombreServicio="Traspaso"
 
 
-def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLIN_SERVICIO_TRASPASO, sede_deseada=None):
+def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLIN_SERVICIO_TRASPASO, sede_deseada=None, usar_proxy=False):
     """Revisa si hay citas disponibles para un servicio (por defecto
     'Traspaso') en el portal 'Movilidad en Linea' de Medellin. A
     diferencia de Envigado, este portal EXIGE iniciar sesion antes de
@@ -995,6 +1003,11 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
     distinguir mayusculas/minusculas (ej. 'sao paulo' coincide con
     'Punto de atención Sao Paulo'). Si se deja vacio, se revisan todas
     las sedes como antes.
+    'usar_proxy' (opcional): si es True, la conexion pasa por el proxy
+    residencial de IPRoyal (IP distinta en cada peticion) en vez de la
+    IP fija del servidor -- pensado para las ventanas de monitoreo muy
+    frecuente (ej. cada 30 segundos), donde el sitio de Medellin puede
+    bloquear la IP fija por exceso de peticiones seguidas.
     Devuelve una tupla (hay_citas: bool, detalle: dict|None)."""
     etiqueta = f"[MEDELLIN-CITAS-{uuid.uuid4().hex[:6]}]"
 
@@ -1003,9 +1016,18 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
             "--single-process", "--no-zygote", "--disable-setuid-sandbox"
         ])
+        proxy_config = None
+        if usar_proxy and IPROYAL_USER and IPROYAL_PASS:
+            proxy_config = {
+                "server": f"http://{IPROYAL_HOST}:{IPROYAL_PORT}",
+                "username": IPROYAL_USER,
+                "password": IPROYAL_PASS,
+            }
+            print(f"{etiqueta} Usando proxy residencial de IPRoyal para esta consulta.", flush=True)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
             viewport={"width": 1366, "height": 900},
+            proxy=proxy_config,
         )
         page = context.new_page()
 
@@ -1465,6 +1487,15 @@ _medellin_citas_monitoreo_estado = {
     "ultimo_hallazgo": None,
 }
 
+# Estado del monitor "espejo" que SIEMPRE usa el proxy de IPRoyal --
+# separado por completo del monitor normal de arriba, para que el
+# usuario sepa con certeza cual de los dos esta gastando saldo del
+# proxy y cual no.
+_medellin_citas_proxy_monitoreo_estado = {
+    "activo": False, "inicio": None, "fin_esperado": None, "detener": False,
+    "ultimo_hallazgo": None,
+}
+
 
 def _medellin_polling_citas(usuario, password, placa, id_servicio, duracion_segundos, intervalo_segundos=30, sede_deseada=None):
     """Revisa si hay citas disponibles en Medellin cada 'intervalo_segundos'
@@ -1571,6 +1602,7 @@ def _dentro_de_horario(hora_inicio_str, hora_fin_str):
 _programador_automatico_estado = {
     "envigado_citas": {"ultima_revision": None, "dentro_de_horario": False, "ultimo_error": None},
     "medellin_citas": {"ultima_revision": None, "dentro_de_horario": False, "ultimo_error": None},
+    "medellin_citas_proxy": {"ultima_revision": None, "dentro_de_horario": False, "ultimo_error": None},
 }
 
 
@@ -1578,7 +1610,7 @@ def _programador_automatico_loop():
     """Hilo unico que corre para siempre desde que arranca el servidor.
     Cada 10 segundos revisa la configuracion de cada monitor (activo,
     horario, intervalo) y decide si le toca consultar en esta vuelta."""
-    ultimo_chequeo = {"envigado_citas": 0, "medellin_citas": 0}
+    ultimo_chequeo = {"envigado_citas": 0, "medellin_citas": 0, "medellin_citas_proxy": 0}
 
     while True:
         try:
@@ -1640,6 +1672,43 @@ def _programador_automatico_loop():
                             _programador_automatico_estado["medellin_citas"]["ultimo_error"] = str(e)
                     else:
                         print("Programador automatico Medellin activo pero faltan usuario/password/placa en la configuracion.", flush=True)
+
+            # --- Medellin (ESPEJO, siempre con proxy de IPRoyal) ---
+            # Modulo identico al de arriba, pero completamente separado
+            # -- este SIEMPRE gasta saldo del proxy, mientras el de
+            # arriba nunca lo toca. Asi el usuario sabe con certeza cual
+            # de los dos esta usando el proxy en cada momento.
+            cfg_p = _monitoreo_config_leer("medellin_citas_proxy")
+            dentro_horario_med_p = bool(cfg_p) and _dentro_de_horario(cfg_p["hora_inicio"], cfg_p["hora_fin"])
+            _programador_automatico_estado["medellin_citas_proxy"]["dentro_de_horario"] = dentro_horario_med_p
+            if cfg_p and cfg_p["activo"] and dentro_horario_med_p:
+                if ahora_ts - ultimo_chequeo["medellin_citas_proxy"] >= cfg_p["intervalo_segundos"]:
+                    ultimo_chequeo["medellin_citas_proxy"] = ahora_ts
+                    if cfg_p["usuario"] and cfg_p["password"] and cfg_p["placa"]:
+                        try:
+                            hay_citas_p, detalle_p = medellin_hay_citas_disponibles(cfg_p["usuario"], cfg_p["password"], cfg_p["placa"], sede_deseada=cfg_p.get("sede"), usar_proxy=True)
+                            if hay_citas_p:
+                                ya_habia_p = _medellin_citas_proxy_monitoreo_estado["ultimo_hallazgo"] is not None
+                                _medellin_citas_proxy_monitoreo_estado["ultimo_hallazgo"] = {
+                                    "detalle": detalle_p,
+                                    "encontrado_en": datetime.now().isoformat() + "Z",
+                                }
+                                if not ya_habia_p:
+                                    sede_p = (detalle_p or {}).get("sede", "")
+                                    enviar_notificacion_push(
+                                        "¡Hay citas disponibles en Medellín! (proxy)",
+                                        f"Sede: {sede_p}. Revisa Tramy para más detalles." if sede_p else "Revisa Tramy para más detalles.",
+                                        "/ejecucion.html"
+                                    )
+                            else:
+                                _medellin_citas_proxy_monitoreo_estado["ultimo_hallazgo"] = None
+                            _programador_automatico_estado["medellin_citas_proxy"]["ultima_revision"] = datetime.now().isoformat() + "Z"
+                            _programador_automatico_estado["medellin_citas_proxy"]["ultimo_error"] = None
+                        except Exception as e:
+                            print(f"Error en programador automatico (Medellin proxy): {e}", flush=True)
+                            _programador_automatico_estado["medellin_citas_proxy"]["ultimo_error"] = str(e)
+                    else:
+                        print("Programador automatico Medellin (proxy) activo pero faltan usuario/password/placa en la configuracion.", flush=True)
 
         except Exception as e:
             print(f"Error general en el programador automatico: {e}", flush=True)
@@ -5557,6 +5626,7 @@ def monitoreo_config_obtener_endpoint():
     verdad esta corriendo, no solo que esta "activado"."""
     envigado = _monitoreo_config_leer("envigado_citas") or {}
     medellin = _monitoreo_config_leer("medellin_citas") or {}
+    medellin_proxy = _monitoreo_config_leer("medellin_citas_proxy") or {}
     return jsonify({
         "ok": True,
         "envigado_citas": {
@@ -5581,6 +5651,19 @@ def monitoreo_config_obtener_endpoint():
             "ultima_revision": _programador_automatico_estado["medellin_citas"]["ultima_revision"],
             "ultimo_error": _programador_automatico_estado["medellin_citas"]["ultimo_error"],
         },
+        "medellin_citas_proxy": {
+            "activo": medellin_proxy.get("activo", False),
+            "intervalo_segundos": medellin_proxy.get("intervalo_segundos", 30),
+            "hora_inicio": medellin_proxy.get("hora_inicio", "07:00"),
+            "hora_fin": medellin_proxy.get("hora_fin", "17:00"),
+            "usuario": medellin_proxy.get("usuario") or "",
+            "placa": medellin_proxy.get("placa") or "",
+            "sede": medellin_proxy.get("sede") or "",
+            "tiene_password": bool(medellin_proxy.get("password")),
+            "dentro_de_horario": _programador_automatico_estado["medellin_citas_proxy"]["dentro_de_horario"],
+            "ultima_revision": _programador_automatico_estado["medellin_citas_proxy"]["ultima_revision"],
+            "ultimo_error": _programador_automatico_estado["medellin_citas_proxy"]["ultimo_error"],
+        },
     })
 
 
@@ -5591,7 +5674,7 @@ def monitoreo_config_guardar_endpoint():
     cambiaron -- los demas quedan como estaban."""
     datos = request.get_json(silent=True) or {}
     monitor = datos.get("monitor", "")
-    if monitor not in ("envigado_citas", "medellin_citas"):
+    if monitor not in ("envigado_citas", "medellin_citas", "medellin_citas_proxy"):
         return jsonify({"ok": False, "error": "Monitor inválido."}), 400
 
     campos = {}
@@ -5606,7 +5689,7 @@ def monitoreo_config_guardar_endpoint():
         campos["hora_inicio"] = datos["hora_inicio"]
     if "hora_fin" in datos:
         campos["hora_fin"] = datos["hora_fin"]
-    if monitor == "medellin_citas":
+    if monitor in ("medellin_citas", "medellin_citas_proxy"):
         if "usuario" in datos:
             campos["usuario"] = datos["usuario"]
         if "password" in datos and datos["password"]:  # solo se actualiza si mandaron una nueva, nunca se borra sola
@@ -5634,6 +5717,18 @@ def medellin_citas_estado_monitoreo_endpoint():
     })
 
 
+@app.route("/medellin-citas-proxy-ultimo-hallazgo", methods=["GET"])
+def medellin_citas_proxy_ultimo_hallazgo_endpoint():
+    """Igual que el de arriba, pero para el monitor ESPEJO (el que
+    siempre usa el proxy de IPRoyal) -- estado completamente aparte,
+    para que el aviso sonoro/push de cada uno funcione de forma
+    independiente."""
+    return jsonify({
+        "ok": True,
+        "ultimo_hallazgo": _medellin_citas_proxy_monitoreo_estado["ultimo_hallazgo"],
+    })
+
+
 @app.route("/medellin-citas-resetear-aviso", methods=["GET"])
 def medellin_citas_resetear_aviso_endpoint():
     """Olvida el ultimo hallazgo guardado (tanto del monitoreo manual
@@ -5643,6 +5738,13 @@ def medellin_citas_resetear_aviso_endpoint():
     de nuevo (sonido/vibracion/push), en vez de quedarse callado hasta
     que la disponibilidad desaparezca y reaparezca sola."""
     _medellin_citas_monitoreo_estado["ultimo_hallazgo"] = None
+    return jsonify({"ok": True, "mensaje": "Aviso reiniciado -- la próxima vez que se detecte disponibilidad, se avisará de nuevo."})
+
+
+@app.route("/medellin-citas-proxy-resetear-aviso", methods=["GET"])
+def medellin_citas_proxy_resetear_aviso_endpoint():
+    """Igual que el de arriba, pero para el monitor ESPEJO (proxy)."""
+    _medellin_citas_proxy_monitoreo_estado["ultimo_hallazgo"] = None
     return jsonify({"ok": True, "mensaje": "Aviso reiniciado -- la próxima vez que se detecte disponibilidad, se avisará de nuevo."})
 
 
