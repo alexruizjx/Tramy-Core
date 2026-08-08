@@ -977,7 +977,7 @@ MEDELLIN_AVIT_API = "https://www.medellin.gov.co/backavit/avit"
 MEDELLIN_SERVICIO_TRASPASO = "1"  # confirmado con un HAR real: idServicio=1 -> nombreServicio="Traspaso"
 
 
-def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLIN_SERVICIO_TRASPASO):
+def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLIN_SERVICIO_TRASPASO, sede_deseada=None):
     """Revisa si hay citas disponibles para un servicio (por defecto
     'Traspaso') en el portal 'Movilidad en Linea' de Medellin. A
     diferencia de Envigado, este portal EXIGE iniciar sesion antes de
@@ -989,6 +989,12 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
     real) en vez de interactuar con la interfaz paso a paso.
     'usuario' es el numero de documento con el que se inicia sesion (el
     campo 'username' del login coincide con el numero de documento).
+    'sede_deseada' (opcional): si se manda, solo se avisa cuando ESA
+    sede especifica tiene citas -- las demas sedes se ignoran por
+    completo (ni siquiera se revisan). Coincide por texto parcial, sin
+    distinguir mayusculas/minusculas (ej. 'sao paulo' coincide con
+    'Punto de atención Sao Paulo'). Si se deja vacio, se revisan todas
+    las sedes como antes.
     Devuelve una tupla (hay_citas: bool, detalle: dict|None)."""
     etiqueta = f"[MEDELLIN-CITAS-{uuid.uuid4().hex[:6]}]"
 
@@ -1077,7 +1083,13 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
                 return False, {"mensaje": "No hay ningun punto de atencion ofreciendo este servicio en este momento."}
 
             # 6. Para cada punto de atencion, revisar fechas disponibles.
+            # Si se pidio una sede especifica, se saltan las demas por
+            # completo (ni siquiera se consultan sus fechas).
             for punto in puntos:
+                nombre_sede = punto.get("nombreSubsede", "")
+                if sede_deseada and sede_deseada.strip().lower() not in nombre_sede.lower():
+                    continue
+
                 id_subsede = punto.get("idSubsede")
                 resp_fechas = page.request.post(
                     f"{MEDELLIN_AVIT_API}/citas/getFechasDisponibles",
@@ -1090,10 +1102,12 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
                     headers=headers_json,
                 )
                 fechas = resp_fechas.json()
-                print(f"{etiqueta} Fechas disponibles en '{punto.get('nombreSubsede')}': {fechas}", flush=True)
+                print(f"{etiqueta} Fechas disponibles en '{nombre_sede}': {fechas}", flush=True)
                 if fechas:
-                    return True, {"sede": punto.get("nombreSubsede"), "id_subsede": id_subsede, "fechas": fechas}
+                    return True, {"sede": nombre_sede, "id_subsede": id_subsede, "fechas": fechas}
 
+            if sede_deseada:
+                return False, {"mensaje": f"Se reviso la sede '{sede_deseada}', no tiene fechas disponibles ahora mismo."}
             return False, {"mensaje": "Se revisaron todos los puntos de atencion, ninguno tiene fechas disponibles ahora mismo."}
 
         except Exception as e:
@@ -1448,7 +1462,7 @@ _medellin_citas_monitoreo_estado = {
 }
 
 
-def _medellin_polling_citas(usuario, password, placa, id_servicio, duracion_segundos, intervalo_segundos=30):
+def _medellin_polling_citas(usuario, password, placa, id_servicio, duracion_segundos, intervalo_segundos=30, sede_deseada=None):
     """Revisa si hay citas disponibles en Medellin cada 'intervalo_segundos'
     (30 por defecto), durante 'duracion_segundos'. A diferencia de
     Envigado, aqui hay que volver a iniciar sesion en cada ciclo (cada
@@ -1459,7 +1473,7 @@ def _medellin_polling_citas(usuario, password, placa, id_servicio, duracion_segu
         if _medellin_citas_monitoreo_estado["detener"]:
             break
         try:
-            hay_citas, detalle = medellin_hay_citas_disponibles(usuario, password, placa, id_servicio)
+            hay_citas, detalle = medellin_hay_citas_disponibles(usuario, password, placa, id_servicio, sede_deseada=sede_deseada)
             if hay_citas:
                 ya_habia_hallazgo = _medellin_citas_monitoreo_estado["ultimo_hallazgo"] is not None
                 _medellin_citas_monitoreo_estado["ultimo_hallazgo"] = {
@@ -1497,7 +1511,7 @@ def _monitoreo_config_leer(monitor):
         conn = get_db_conn()
         cur = conn.cursor()
         cur.execute("""
-            SELECT activo, intervalo_segundos, hora_inicio, hora_fin, usuario, password, placa
+            SELECT activo, intervalo_segundos, hora_inicio, hora_fin, usuario, password, placa, sede
             FROM monitoreo_config WHERE monitor = %s
         """, (monitor,))
         fila = cur.fetchone()
@@ -1508,6 +1522,7 @@ def _monitoreo_config_leer(monitor):
             "activo": fila[0], "intervalo_segundos": fila[1],
             "hora_inicio": fila[2], "hora_fin": fila[3],
             "usuario": fila[4], "password": fila[5], "placa": fila[6],
+            "sede": fila[7],
         }
     except Exception as e:
         print(f"Error leyendo config de monitoreo ({monitor}): {e}", flush=True)
@@ -1598,7 +1613,7 @@ def _programador_automatico_loop():
                     ultimo_chequeo["medellin_citas"] = ahora_ts
                     if cfg["usuario"] and cfg["password"] and cfg["placa"]:
                         try:
-                            hay_citas, detalle = medellin_hay_citas_disponibles(cfg["usuario"], cfg["password"], cfg["placa"])
+                            hay_citas, detalle = medellin_hay_citas_disponibles(cfg["usuario"], cfg["password"], cfg["placa"], sede_deseada=cfg.get("sede"))
                             if hay_citas:
                                 ya_habia = _medellin_citas_monitoreo_estado["ultimo_hallazgo"] is not None
                                 _medellin_citas_monitoreo_estado["ultimo_hallazgo"] = {
@@ -5272,6 +5287,7 @@ def medellin_citas_disponibles_endpoint():
     password = request.args.get("password", "").strip()
     placa = request.args.get("placa", "").upper().strip()
     id_servicio = request.args.get("id_servicio", MEDELLIN_SERVICIO_TRASPASO).strip()
+    sede_deseada = request.args.get("sede", "").strip() or None
 
     if not all([usuario, password, placa]):
         return jsonify({"error": "Faltan datos: usuario, password, placa"}), 400
@@ -5281,7 +5297,7 @@ def medellin_citas_disponibles_endpoint():
 
     def ejecutar():
         try:
-            hay_citas, detalle = medellin_hay_citas_disponibles(usuario, password, placa, id_servicio)
+            hay_citas, detalle = medellin_hay_citas_disponibles(usuario, password, placa, id_servicio, sede_deseada=sede_deseada)
             job_terminar(job_id, {"hay_citas": hay_citas, "detalle": detalle})
         except Exception as e:
             import traceback
@@ -5487,6 +5503,7 @@ def medellin_citas_iniciar_monitoreo_endpoint():
     password = request.args.get("password", "").strip()
     placa = request.args.get("placa", "").upper().strip()
     id_servicio = request.args.get("id_servicio", MEDELLIN_SERVICIO_TRASPASO).strip()
+    sede_deseada = request.args.get("sede", "").strip() or None
     if not all([usuario, password, placa]):
         return jsonify({"error": "Faltan datos: usuario, password, placa"}), 400
 
@@ -5504,6 +5521,7 @@ def medellin_citas_iniciar_monitoreo_endpoint():
     threading.Thread(
         target=_medellin_polling_citas,
         args=(usuario, password, placa, id_servicio, duracion_segundos),
+        kwargs={"sede_deseada": sede_deseada},
         daemon=True
     ).start()
 
@@ -5553,6 +5571,7 @@ def monitoreo_config_obtener_endpoint():
             "hora_fin": medellin.get("hora_fin", "17:00"),
             "usuario": medellin.get("usuario") or "",
             "placa": medellin.get("placa") or "",
+            "sede": medellin.get("sede") or "",
             "tiene_password": bool(medellin.get("password")),
             "dentro_de_horario": _programador_automatico_estado["medellin_citas"]["dentro_de_horario"],
             "ultima_revision": _programador_automatico_estado["medellin_citas"]["ultima_revision"],
@@ -5590,6 +5609,8 @@ def monitoreo_config_guardar_endpoint():
             campos["password"] = datos["password"]
         if "placa" in datos:
             campos["placa"] = (datos["placa"] or "").upper().strip()
+        if "sede" in datos:
+            campos["sede"] = (datos["sede"] or "").strip()
 
     ok = _monitoreo_config_guardar(monitor, **campos)
     return jsonify({"ok": ok})
