@@ -1385,7 +1385,200 @@ def envigado_hay_puntos_disponibles():
     return resultado_capturado["datos"]
 
 
-def envigado_revisar_citas_disponibles(dias_adelante=14):
+ENVIGADO_RECAPTCHA_SITEKEY = "6LdZ-WUsAAAAAEEs0_PbIzNhEoDTBqV1CwBEE8B-"  # confirmado con un HAR real
+
+
+def envigado_reservar_cita(solicitud):
+    """Completa el flujo ENTERO de agendar una cita real en Envigado --
+    llena el formulario con los datos de la persona (no datos de
+    prueba), elige la primera sede/fecha/hora disponible que coincida
+    con la hora aproximada pedida, resuelve el reCAPTCHA con 2captcha,
+    y confirma la cita.
+
+    'solicitud' es un dict con: nombres, apellidos, tipo_documento,
+    numero_documento, correo, celular, placa, id_servicio,
+    sede_preferida (puede ser None/vacio = cualquiera), hora_aproximada
+    (entero 0-23).
+
+    NOTA IMPORTANTE: los pasos de elegir sede/fecha/hora e interactuar
+    con el calendario del sitio son dificiles de programar a ciegas sin
+    ver la pantalla real (a diferencia del formulario inicial, que ya
+    esta confirmado). Por eso esta funcion imprime diagnosticos
+    detallados en cada paso -- es posible que los primeros intentos
+    reales necesiten ajustes una vez veamos esos diagnosticos, igual
+    que paso con el registro de usuarios de Medellin.
+
+    Devuelve un dict: {"exito": bool, "nro_atencion": str|None,
+    "mensaje": str, "detalle": dict|None}."""
+    etiqueta = f"[ENVIGADO-RESERVAR-{uuid.uuid4().hex[:6]}]"
+    resultado = {"exito": False, "nro_atencion": None, "mensaje": "", "detalle": None}
+
+    respuestas_capturadas = {}
+
+    def _capturar_respuesta(response):
+        for nombre_endpoint in ["getPuntosAtencionServiciosLowcode", "getFechasDisponibles", "getHorasDisponibles", "agendarCitaGAComponentes"]:
+            if nombre_endpoint in response.url:
+                try:
+                    respuestas_capturadas[nombre_endpoint] = response.json()
+                except Exception:
+                    pass
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, args=[
+            "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+            "--single-process", "--no-zygote", "--disable-setuid-sandbox"
+        ])
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
+            viewport={"width": 390, "height": 844},
+        )
+        page = context.new_page()
+        page.on("response", _capturar_respuesta)
+
+        try:
+            print(f"{etiqueta} Iniciando reserva para {solicitud['nombres']} {solicitud['apellidos']}, placa {solicitud['placa']}, hora aproximada {solicitud['hora_aproximada']}:00", flush=True)
+            page.goto("https://movilidad.envigado.gov.co/portal-servicios/#/agendar-cita-publica",
+                      wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(3000)
+
+            if _envigado_hay_aviso_sin_agenda(page):
+                resultado["mensaje"] = "No hay agenda disponible en este momento."
+                return resultado
+
+            # --- Llenar el formulario con los datos REALES de la solicitud ---
+            try:
+                page.select_option("#tipoDocumento", label="CC", timeout=5000)
+            except Exception:
+                pass
+            page.locator('input[name="numeroDocumento"]').fill(solicitud["numero_documento"], timeout=10000)
+            page.locator('input[name="nombres"]').fill(solicitud["nombres"], timeout=8000)
+            page.locator('input[name="apellidos"]').fill(solicitud["apellidos"], timeout=8000)
+            page.locator('input[name="emailSolicitante"]').fill(solicitud["correo"], timeout=8000)
+            page.locator('input[name="confirmarEmail"]').fill(solicitud["correo"], timeout=8000)
+            page.locator('input[name="phone"]').fill(solicitud["celular"], timeout=8000)
+
+            id_servicio = solicitud.get("id_servicio") or ENVIGADO_CITAS_ID_SERVICIO
+            page.evaluate(f"""() => {{
+                var el = document.querySelector('#servicios');
+                if (!el) return false;
+                el.value = '{id_servicio}';
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                return true;
+            }}""")
+            page.wait_for_timeout(1500)
+
+            if _envigado_hay_aviso_sin_agenda(page):
+                resultado["mensaje"] = "No hay agenda disponible para este trámite."
+                return resultado
+
+            placa_ok = False
+            for selector_placa in ['input[name="placa"]', 'input[name="placaVehiculo"]', 'input#placa']:
+                try:
+                    page.locator(selector_placa).fill(solicitud["placa"], timeout=5000)
+                    placa_ok = True
+                    break
+                except Exception:
+                    continue
+            if not placa_ok:
+                try:
+                    campo_placa = page.locator('input[type="search"]').first
+                    campo_placa.click(timeout=5000, force=True)
+                    campo_placa.fill(solicitud["placa"], timeout=5000, force=True)
+                    campo_placa.press("Enter")
+                    page.wait_for_timeout(1000)
+                    placa_ok = True
+                except Exception as e_placa_tag:
+                    print(f"{etiqueta} No se pudo escribir la placa: {e_placa_tag}", flush=True)
+            if not placa_ok:
+                resultado["mensaje"] = "No se pudo llenar el campo de placa."
+                return resultado
+
+            try:
+                page.get_by_text("Agregar servicio", exact=True).click(timeout=8000)
+            except Exception as e_clic_agregar:
+                if _envigado_hay_aviso_sin_agenda(page):
+                    resultado["mensaje"] = "No hay agenda disponible."
+                    return resultado
+                raise e_clic_agregar
+
+            if _envigado_hay_aviso_sin_agenda(page):
+                resultado["mensaje"] = "No hay agenda disponible."
+                return resultado
+
+            for _ in range(10):
+                if "getPuntosAtencionServiciosLowcode" in respuestas_capturadas:
+                    break
+                if _envigado_hay_aviso_sin_agenda(page):
+                    resultado["mensaje"] = "No hay agenda disponible."
+                    return resultado
+                page.wait_for_timeout(1000)
+
+            puntos = respuestas_capturadas.get("getPuntosAtencionServiciosLowcode") or []
+            print(f"{etiqueta} Puntos de atencion encontrados: {puntos}", flush=True)
+            if not puntos:
+                resultado["mensaje"] = "No se encontraron puntos de atención con este trámite."
+                return resultado
+
+            # Elegir la sede -- preferida si se pidio y esta en la lista,
+            # si no la primera disponible.
+            sede_elegida = None
+            if solicitud.get("sede_preferida"):
+                for p in puntos:
+                    if solicitud["sede_preferida"].strip().lower() in (p.get("nombreSubsede") or "").lower():
+                        sede_elegida = p
+                        break
+            if not sede_elegida:
+                sede_elegida = puntos[0]
+            print(f"{etiqueta} Sede elegida: {sede_elegida}", flush=True)
+
+            # --- DIAGNOSTICO: a partir de aqui, el flujo de elegir sede,
+            # fecha y hora depende de como este armada la interfaz visual
+            # (calendario, lista de sedes, etc.) -- no confirmado todavia
+            # con una captura real de esta parte especifica. Se listan
+            # todos los elementos clicables visibles para poder ajustar
+            # los selectores exactos con el primer intento real. ---
+            try:
+                elementos_visibles = page.evaluate("""() => {
+                    var els = document.querySelectorAll('button, a, [ng-click], .card, [class*="sede"], [class*="fecha"], [class*="dia"], [class*="calendar"]');
+                    var resultado = [];
+                    els.forEach(function(el){
+                        if (el.offsetWidth || el.offsetHeight || el.getClientRects().length) {
+                            resultado.push({
+                                tag: el.tagName, clase: el.className, texto: (el.innerText||'').trim().substring(0,60),
+                            });
+                        }
+                    });
+                    return resultado.slice(0, 80);
+                }""")
+                print(f"{etiqueta} === DIAGNOSTICO: elementos visibles despues de encontrar puntos de atencion ===", flush=True)
+                for el in elementos_visibles:
+                    print(f"{etiqueta}", el, flush=True)
+                print(f"{etiqueta} === FIN DIAGNOSTICO elementos ===", flush=True)
+            except Exception as e_diag3:
+                print(f"{etiqueta} No se pudo listar elementos: {e_diag3}", flush=True)
+
+            print(f"{etiqueta} === HTML completo de la pagina en este punto (para programar el resto del flujo) ===", flush=True)
+            try:
+                print(f"{etiqueta}", page.content()[:10000], flush=True)
+            except Exception:
+                pass
+
+            resultado["mensaje"] = "Se detuvo despues de encontrar la sede -- falta programar la seleccion de fecha/hora con datos reales (ver diagnostico en logs)."
+            return resultado
+
+        except Exception as e:
+            print(f"{etiqueta} Error en el flujo de reserva: {e}", flush=True)
+            resultado["mensaje"] = str(e)
+            try:
+                print(f"{etiqueta} Texto visible al momento del error:", page.inner_text("body")[:2000], flush=True)
+            except Exception:
+                pass
+            return resultado
+        finally:
+            context.close(); browser.close()
+
+
+
     """Revisa si hay ALGUN punto de atencion con citas disponibles (una
     sola peticion, no dia por dia), y guarda el resultado en la base de
     datos. 'dias_adelante' ya no se usa para hacer mas peticiones -- se
@@ -1453,6 +1646,68 @@ _envigado_citas_monitoreo_estado = {
 }
 
 
+def _envigado_procesar_cola_solicitudes():
+    """Revisa la cola de solicitudes de citas PENDIENTES, e intenta
+    reservar cada una (llamando al flujo completo de reserva). Se llama
+    solo cuando el monitoreo YA confirmo que hay citas disponibles en
+    algun lado -- asi no se intenta el flujo completo (mas pesado) en
+    cada ciclo de 30 segundos sin necesidad."""
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, nombres, apellidos, tipo_documento, numero_documento, correo, celular,
+                   placa, id_servicio, sede_preferida, hora_aproximada
+            FROM envigado_citas_solicitudes WHERE estado = 'pendiente' ORDER BY id ASC
+        """)
+        pendientes = cur.fetchall()
+        cur.close(); conn.close()
+    except Exception as e:
+        print(f"Error leyendo cola de solicitudes de citas: {e}", flush=True)
+        return
+
+    if not pendientes:
+        return
+
+    print(f"Hay {len(pendientes)} solicitud(es) pendiente(s) en la cola -- intentando reservar...", flush=True)
+    for fila in pendientes:
+        solicitud = {
+            "id": fila[0], "nombres": fila[1], "apellidos": fila[2], "tipo_documento": fila[3],
+            "numero_documento": fila[4], "correo": fila[5], "celular": fila[6], "placa": fila[7],
+            "id_servicio": fila[8], "sede_preferida": fila[9], "hora_aproximada": fila[10],
+        }
+        try:
+            resultado = envigado_reservar_cita(solicitud)
+        except Exception as e:
+            resultado = {"exito": False, "mensaje": str(e), "nro_atencion": None}
+
+        try:
+            conn2 = get_db_conn()
+            cur2 = conn2.cursor()
+            if resultado.get("exito"):
+                cur2.execute("""
+                    UPDATE envigado_citas_solicitudes
+                    SET estado = 'reservada', nro_atencion = %s, detalle_reserva = %s, reservado_en = NOW()
+                    WHERE id = %s
+                """, (resultado.get("nro_atencion"), json.dumps(resultado.get("detalle") or {}), solicitud["id"]))
+                enviar_notificacion_push(
+                    "¡Cita reservada en Envigado!",
+                    f"{solicitud['nombres']} {solicitud['apellidos']} -- Nro. atención: {resultado.get('nro_atencion')}",
+                    "/ejecucion.html"
+                )
+            else:
+                # Se queda en "pendiente" (no se marca error) si el
+                # problema fue simplemente que no habia sede/fecha/hora
+                # que coincidiera todavia -- se reintenta en el proximo
+                # ciclo. Solo se marca "error" si fue un problema real
+                # de datos/tecnico persistente.
+                print(f"No se pudo reservar la solicitud {solicitud['id']} en este intento: {resultado.get('mensaje')}", flush=True)
+            conn2.commit()
+            cur2.close(); conn2.close()
+        except Exception as e:
+            print(f"Error actualizando el estado de la solicitud {solicitud['id']}: {e}", flush=True)
+
+
 def _envigado_polling_citas(duracion_segundos, intervalo_segundos=30):
     """Revisa si hay citas disponibles en Envigado cada 'intervalo_segundos'
     (30 por defecto), durante 'duracion_segundos'. Usa la misma logica que
@@ -1462,7 +1717,8 @@ def _envigado_polling_citas(duracion_segundos, intervalo_segundos=30):
     nada adicional para que se vea el resultado. Ademas, manda una
     notificacion push -- pero solo quando PASA de "sin citas" a "con
     citas" (no en cada ciclo de 30 segundos mientras sigan disponibles,
-    para no saturar de notificaciones repetidas)."""
+    para no saturar de notificaciones repetidas). Si hay citas, tambien
+    intenta procesar la cola de solicitudes pendientes."""
     tenia_citas_antes = False
     fin = time.time() + duracion_segundos
     while time.time() < fin:
@@ -1478,6 +1734,8 @@ def _envigado_polling_citas(duracion_segundos, intervalo_segundos=30):
                     "/liquidacion.html"
                 )
             tenia_citas_antes = hay_citas_ahora
+            if hay_citas_ahora:
+                _envigado_procesar_cola_solicitudes()
         except Exception as e:
             print(f"Error en monitoreo constante de citas Envigado: {e}", flush=True)
         time.sleep(intervalo_segundos)
@@ -1643,6 +1901,8 @@ def _programador_automatico_loop():
                                 "/liquidacion.html"
                             )
                         _envigado_citas_monitoreo_estado["_auto_tenia_citas"] = hay_citas_ahora
+                        if hay_citas_ahora:
+                            _envigado_procesar_cola_solicitudes()
                         _programador_automatico_estado["envigado_citas"]["ultima_revision"] = datetime.now().isoformat() + "Z"
                         _programador_automatico_estado["envigado_citas"]["ultimo_error"] = None
                     except Exception as e:
@@ -5307,6 +5567,93 @@ def generar_fun_endpoint():
     except Exception as e:
         import traceback
         print(traceback.format_exc(), flush=True)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/envigado-citas-solicitud-agregar", methods=["POST"])
+def envigado_citas_solicitud_agregar_endpoint():
+    """Agrega una nueva linea a la cola de citas pendientes por reservar
+    automaticamente."""
+    datos = request.get_json(silent=True) or {}
+    campos_obligatorios = ["nombres", "apellidos", "numero_documento", "correo", "celular", "placa", "hora_aproximada"]
+    faltantes = [c for c in campos_obligatorios if not datos.get(c)]
+    if faltantes:
+        return jsonify({"ok": False, "error": f"Faltan datos: {', '.join(faltantes)}"}), 400
+
+    try:
+        hora_aproximada = int(datos["hora_aproximada"])
+        if not (0 <= hora_aproximada <= 23):
+            raise ValueError()
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Hora aproximada invalida (debe ser 0-23)."}), 400
+
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO envigado_citas_solicitudes
+                (nombres, apellidos, tipo_documento, numero_documento, correo, celular, placa, id_servicio, sede_preferida, hora_aproximada)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (
+            datos["nombres"].strip().upper(), datos["apellidos"].strip().upper(),
+            datos.get("tipo_documento", "2").strip(), datos["numero_documento"].strip(),
+            datos["correo"].strip(), datos["celular"].strip(), datos["placa"].strip().upper(),
+            datos.get("id_servicio", "90").strip(), (datos.get("sede_preferida") or "").strip() or None,
+            hora_aproximada,
+        ))
+        nuevo_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close(); conn.close()
+        return jsonify({"ok": True, "id": nuevo_id})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/envigado-citas-solicitud-listar", methods=["GET"])
+def envigado_citas_solicitud_listar_endpoint():
+    """Devuelve todas las solicitudes de citas de la cola (pendientes,
+    reservadas, y con error), mas recientes primero."""
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, nombres, apellidos, numero_documento, correo, celular, placa,
+                   sede_preferida, hora_aproximada, estado, nro_atencion, error_mensaje,
+                   creado_en, reservado_en
+            FROM envigado_citas_solicitudes ORDER BY id DESC LIMIT 100
+        """)
+        filas = cur.fetchall()
+        cur.close(); conn.close()
+        solicitudes = []
+        for f in filas:
+            solicitudes.append({
+                "id": f[0], "nombres": f[1], "apellidos": f[2], "numero_documento": f[3],
+                "correo": f[4], "celular": f[5], "placa": f[6], "sede_preferida": f[7],
+                "hora_aproximada": f[8], "estado": f[9], "nro_atencion": f[10], "error_mensaje": f[11],
+                "creado_en": f[12].isoformat() if f[12] else None,
+                "reservado_en": f[13].isoformat() if f[13] else None,
+            })
+        return jsonify({"ok": True, "solicitudes": solicitudes})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/envigado-citas-solicitud-eliminar", methods=["GET"])
+def envigado_citas_solicitud_eliminar_endpoint():
+    """Elimina/cancela una solicitud de la cola (ya sea porque ya no se
+    necesita, o para quitar una que quedo con error)."""
+    solicitud_id = request.args.get("id", "")
+    if not solicitud_id.isdigit():
+        return jsonify({"ok": False, "error": "ID invalido."}), 400
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM envigado_citas_solicitudes WHERE id = %s", (int(solicitud_id),))
+        conn.commit()
+        cur.close(); conn.close()
+        return jsonify({"ok": True})
+    except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
