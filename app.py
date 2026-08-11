@@ -3301,25 +3301,46 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     # "Observaciones" y "Avaluo para la vigencia" deben quedar SIEMPRE
     # juntos en la misma pagina, y nunca deben cortarse a la mitad -- se
     # fuerza un salto de pagina justo antes de "OBSERVACIONES" solo
-    # cuando de verdad hace falta. IMPORTANTE: esto no es simplemente
-    # "el total es muy grande" -- hay que considerar que, si la tabla de
-    # Declaraciones (tabla 1) ya se desbordo por su cuenta a una segunda
-    # pagina, puede quedar espacio de sobra en ESA misma pagina para
-    # Observaciones (tablas 2 y 3), y en ese caso NO hay que forzar otro
-    # salto (si no, Observaciones termina saltando a una TERCERA pagina
-    # sin necesidad, dejando espacio vacio sin usar en la segunda).
-    #
-    # Se modela con aritmetica modular: cuantas filas caben por pagina
-    # (calibrado con PDFs reales de la Gobernacion), y cuantas filas de
-    # la pagina actual ya se usaron con Declaraciones -- lo que sobra de
-    # esa cuenta es el espacio libre real que queda en la pagina donde
-    # Declaraciones termino.
-    FILAS_POR_PAGINA = 20  # calibrado: 18 declaraciones + 0 obs cabian bien; 16 + 12 (28) no cabian en una sola pagina
-    ESPACIO_FIJO_TABLA_4 = 3
-    espacio_necesario_obs = max_obs + ESPACIO_FIJO_TABLA_4
-    filas_usadas_pagina_actual = filas_declaraciones % FILAS_POR_PAGINA
-    espacio_libre_pagina_actual = FILAS_POR_PAGINA - filas_usadas_pagina_actual if filas_usadas_pagina_actual else FILAS_POR_PAGINA
-    if espacio_necesario_obs > espacio_libre_pagina_actual:
+    # cuando de verdad hace falta. IMPORTANTE: esto NO se basa en
+    # "cuantas filas caben", sino en el ESPACIO REAL en puntos que queda
+    # en la pagina justo despues de donde termino la tabla de
+    # Declaraciones -- si la tabla de Declaraciones ya se desbordo por
+    # su cuenta a una segunda pagina, puede quedar espacio de sobra en
+    # ESA misma pagina para Observaciones (tablas 2 y 3), y en ese caso
+    # no hay que forzar otro salto (si no, Observaciones salta a una
+    # TERCERA pagina sin necesidad, dejando espacio vacio en la
+    # segunda). Se usan las alturas REALES de cada fila (en puntos) de
+    # la hoja VISIBLE (ESTADO DE CUENTA -- la hoja PYS esta oculta en el
+    # PDF final, asi que sus alturas no afectan el diseño impreso).
+    def _altura_filas_pts(ws, fila_inicio, fila_fin, defecto=15.0):
+        total = 0.0
+        for r in range(fila_inicio, fila_fin + 1):
+            h = ws.row_dimensions[r].height
+            total += h if h is not None else defecto
+        return total
+
+    # Alto util real de una pagina carta con los margenes de esta
+    # plantilla (792pt de alto - margenes superior/inferior en puntos).
+    # Calibrado ademas con un caso limite real: "18 declaraciones + 0
+    # observaciones" cabia por muy poco en una sola pagina.
+    ALTO_PAGINA_PT = 792.0
+    ALTO_UTIL_PT = ALTO_PAGINA_PT - (edc.page_margins.top * 72) - (edc.page_margins.bottom * 72)
+
+    altura_antes_declaraciones = _altura_filas_pts(edc, 1, FILA_DECL_INICIO - 1)
+    altura_una_fila_declaracion = edc.row_dimensions[FILA_DECL_INICIO].height or 21.0
+    altura_gap_y_titulo_obs = _altura_filas_pts(edc, FILA_DECL_FIN + 1, 76)  # filas 48..76: espacio + titulo "OBSERVACIONES" + encabezados
+    altura_una_fila_obs = edc.row_dimensions[53].height or 21.0
+    altura_tabla4 = _altura_filas_pts(edc, 77, 79)  # Periodo/Valor/Fecha/Firma
+
+    altura_hasta_fin_declaraciones = altura_antes_declaraciones + (filas_declaraciones * altura_una_fila_declaracion)
+    # Cuanto de esa altura cae en la pagina ACTUAL (modulo el alto util
+    # de una pagina) -- lo que sobra hasta completar una pagina es el
+    # espacio libre real que queda donde termino Declaraciones.
+    altura_usada_pagina_actual = altura_hasta_fin_declaraciones % ALTO_UTIL_PT
+    espacio_libre_pagina_actual = ALTO_UTIL_PT - altura_usada_pagina_actual
+
+    altura_necesaria_obs = altura_gap_y_titulo_obs + (max_obs * altura_una_fila_obs) + altura_tabla4
+    if altura_necesaria_obs > espacio_libre_pagina_actual:
         edc.row_breaks.append(Break(id=50))  # quiebre despues de la fila 50 -> "OBSERVACIONES" (fila 51, con su titulo) arranca en pagina nueva
 
     hojas_a_conservar = {"PYS", "ESTADO DE CUENTA"}
