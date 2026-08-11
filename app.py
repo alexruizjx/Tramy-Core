@@ -1588,39 +1588,103 @@ def envigado_reservar_cita(solicitud):
                 sede_elegida = puntos[0]
             print(f"{etiqueta} Sede elegida: {sede_elegida}", flush=True)
 
-            # --- DIAGNOSTICO: a partir de aqui, el flujo de elegir sede,
-            # fecha y hora depende de como este armada la interfaz visual
-            # (calendario, lista de sedes, etc.) -- no confirmado todavia
-            # con una captura real de esta parte especifica. Se listan
-            # todos los elementos clicables visibles para poder ajustar
-            # los selectores exactos con el primer intento real. ---
+            # --- Elegir la sede en el <select> real ---
+            page.evaluate(f"""() => {{
+                var el = document.querySelector('#seleccione_punto_atencion');
+                if (!el) return false;
+                el.value = '{sede_elegida.get("idSubsede")}';
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                return true;
+            }}""")
+            page.wait_for_timeout(1500)
+
+            for _ in range(10):
+                if "getFechasDisponibles" in respuestas_capturadas:
+                    break
+                page.wait_for_timeout(1000)
+            fechas_disponibles = respuestas_capturadas.get("getFechasDisponibles") or []
+            print(f"{etiqueta} Fechas disponibles en '{sede_elegida.get('nombreSubsede')}': {fechas_disponibles}", flush=True)
+            if not fechas_disponibles:
+                resultado["mensaje"] = f"La sede '{sede_elegida.get('nombreSubsede')}' no tiene fechas disponibles en este momento."
+                return resultado
+
+            # Se toma la PRIMERA fecha disponible (la mas cercana).
+            fecha_elegida = fechas_disponibles[0].get("diaAtencion")  # formato "DD/MM/YYYY", confirmado con el HAR
+            print(f"{etiqueta} Fecha elegida: {fecha_elegida}", flush=True)
+
+            # --- Elegir la fecha en el datepicker ---
+            respuestas_capturadas.pop("getHorasDisponibles", None)
+            page.evaluate(f"""() => {{
+                var el = document.querySelector('#agendarCitaDatePicker');
+                if (!el) return false;
+                el.value = '{fecha_elegida}';
+                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                return true;
+            }}""")
+            page.wait_for_timeout(1500)
+
+            for _ in range(10):
+                if "getHorasDisponibles" in respuestas_capturadas:
+                    break
+                page.wait_for_timeout(1000)
+            horas_disponibles = respuestas_capturadas.get("getHorasDisponibles") or []
+            print(f"{etiqueta} Horas disponibles para {fecha_elegida}: {horas_disponibles}", flush=True)
+            if not horas_disponibles:
+                resultado["mensaje"] = f"No se encontraron horas disponibles para el {fecha_elegida} (puede que el datepicker no haya respondido como se esperaba -- revisar diagnostico)."
+                return resultado
+
+            # Se busca la hora mas cercana a la hora aproximada pedida.
+            # 'horaIni' viene como numero tipo 1027 = 10:27 -- se compara
+            # solo la parte de la hora (// 100) contra la hora pedida, y
+            # si no hay coincidencia exacta se toma la mas cercana.
+            hora_pedida = int(solicitud["hora_aproximada"])
+            mejor_horario = min(
+                horas_disponibles,
+                key=lambda h: abs((h.get("horaIni", 0) // 100) - hora_pedida)
+            )
+            print(f"{etiqueta} Horario elegido (mas cercano a las {hora_pedida}:00): {mejor_horario}", flush=True)
+
+            # --- Elegir la hora en el <select> real ---
+            id_control_capacidad = mejor_horario.get("idControlCapacidad")
+            id_taquilla = mejor_horario.get("idTaquilla")
+            hora_ini_valor = mejor_horario.get("horaIni")
+            page.evaluate(f"""() => {{
+                var el = document.querySelector('#agendarCitaHoraIniSelect');
+                if (!el) return false;
+                el.value = '{hora_ini_valor}';
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                return true;
+            }}""")
+            page.wait_for_timeout(1000)
+
+            # --- DIAGNOSTICO: se detiene ANTES de resolver el reCAPTCHA
+            # y confirmar la cita de verdad -- primero hay que confirmar
+            # que la seleccion de sede/fecha/hora de arriba funciono bien
+            # (revisando estos logs), antes de dar el paso final que si
+            # aparta una cita real. ---
+            print(f"{etiqueta} === DIAGNOSTICO: estado antes de confirmar (aun NO se ha reservado nada) ===", flush=True)
+            print(f"{etiqueta} idControlCapacidad={id_control_capacidad}, idTaquilla={id_taquilla}, horaIni={hora_ini_valor}, fecha={fecha_elegida}", flush=True)
             try:
-                elementos_visibles = page.evaluate("""() => {
-                    var els = document.querySelectorAll('button, a, [ng-click], .card, [class*="sede"], [class*="fecha"], [class*="dia"], [class*="calendar"]');
+                print(f"{etiqueta} Texto visible de la pagina:", page.inner_text("body")[:2000], flush=True)
+            except Exception:
+                pass
+            try:
+                boton_confirmar = page.evaluate("""() => {
+                    var botones = document.querySelectorAll('button, input[type="button"], input[type="submit"]');
                     var resultado = [];
-                    els.forEach(function(el){
-                        if (el.offsetWidth || el.offsetHeight || el.getClientRects().length) {
-                            resultado.push({
-                                tag: el.tagName, clase: el.className, texto: (el.innerText||'').trim().substring(0,60),
-                            });
+                    botones.forEach(function(b){
+                        if (b.offsetWidth || b.offsetHeight || b.getClientRects().length) {
+                            resultado.push({tag: b.tagName, texto: (b.innerText||b.value||'').trim(), id: b.id||null});
                         }
                     });
-                    return resultado.slice(0, 80);
+                    return resultado;
                 }""")
-                print(f"{etiqueta} === DIAGNOSTICO: elementos visibles despues de encontrar puntos de atencion ===", flush=True)
-                for el in elementos_visibles:
-                    print(f"{etiqueta}", el, flush=True)
-                print(f"{etiqueta} === FIN DIAGNOSTICO elementos ===", flush=True)
-            except Exception as e_diag3:
-                print(f"{etiqueta} No se pudo listar elementos: {e_diag3}", flush=True)
-
-            print(f"{etiqueta} === HTML completo de la pagina en este punto (para programar el resto del flujo) ===", flush=True)
-            try:
-                print(f"{etiqueta}", page.content()[:10000], flush=True)
+                print(f"{etiqueta} Botones visibles en este punto: {boton_confirmar}", flush=True)
             except Exception:
                 pass
 
-            resultado["mensaje"] = "Se detuvo despues de encontrar la sede -- falta programar la seleccion de fecha/hora con datos reales (ver diagnostico en logs)."
+            resultado["mensaje"] = "Se detuvo justo antes de confirmar (a proposito) -- revisa el diagnostico en los logs para confirmar que sede/fecha/hora se eligieron bien, y avisa para programar el ultimo paso (captcha + confirmar)."
             return resultado
 
         except Exception as e:
