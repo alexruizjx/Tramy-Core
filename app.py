@@ -2959,6 +2959,113 @@ def generar_fun(datos, ruta_salida_pdf):
     os.remove(ruta_xlsm_temp)
 
 
+# --- Documentos de AppJX.xlsm para la pestaña Revision -- SOLO con datos
+# del vehiculo (no personas: comprador/vendedor/mandante/mandatario
+# quedan sin llenar por ahora). Mapa: clave usada en la URL -> (nombre
+# visible en el boton, nombre real de la hoja en AppJX.xlsm). El nombre
+# de hoja se confirmo comparando el contenido real de cada plantilla
+# (ej. "FORMULARIO (2)" menciona "DATOS DE LOS PROPIETARIOS" en plural y
+# un solo comprador -> es la de "dos vendedores").
+APPJX_DOCUMENTOS = {
+    "formulario":                    ("Formulario",                              "FORMULARIO"),
+    "formulario_dos_vendedores":     ("Formulario (dos vendedores)",             "FORMULARIO (2)"),
+    "formulario_dos_compradores":    ("Formulario (dos compradores)",            "FORMULARIO (3)"),
+    "compraventa":                   ("Compraventa",                             "COMPRA VENTA"),
+    "compraventa_dos_vendedores":    ("Compraventa (dos vendedores)",            "COMPRA VENTA (2)"),
+    "compraventa_dos_compradores":   ("Compraventa (dos compradores)",           "COMPRA VENTA (3)"),
+    "compraventa_persona_juridica":  ("Compraventa (persona jurídica vende)",    "COMPRA VENTA NIT"),
+    "mandato":                       ("Mandato",                                 "MANDATO"),
+    "mandato_persona_juridica":      ("Mandato (persona jurídica)",              "MANDATO NIT"),
+    "mandato_dos_vendedores":        ("Mandato (dos vendedores)",                "MANDATO (2)"),
+    "mandato_comprador_vendedor":    ("Mandato (comprador y vendedor)",          "MANDATO (3)"),
+    "traspaso_indeterminado":        ("Traspaso indeterminado",                  "INDETERMINADO"),
+    "revocatoria_indeterminado":     ("Revocatoria traspaso indeterminado",      "REVOCATORIA"),
+    "afirmacion_traspaso":           ("Afirmación de traspaso",                  "AFIRMACION"),
+    "levantamiento_prenda":          ("Levantamiento de prenda",                 "LEVANTAMIENTO PRENDA"),
+    "inscripcion_prenda":            ("Inscripción de prenda",                   "INSCRIPCION PRENDA"),
+    "acta_responsabilidad":          ("Acta de responsabilidad civil",           "ACTA RESPONSABILIDAD"),
+}
+
+
+def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salida_pdf):
+    """Genera en PDF cualquiera de los documentos de AppJX.xlsm listados
+    en APPJX_DOCUMENTOS, llenando SOLO los datos del vehiculo (placa,
+    marca, linea, modelo, etc. -- los mismos campos que ya usa el FUN).
+    Los datos de personas (comprador/vendedor/mandante/mandatario) se
+    dejan sin llenar por ahora."""
+    if clave_documento not in APPJX_DOCUMENTOS:
+        raise ValueError(f"Documento desconocido: {clave_documento}")
+    _, nombre_hoja = APPJX_DOCUMENTOS[clave_documento]
+
+    wb = _openpyxl.load_workbook(FUN_PLANTILLA, data_only=False, keep_vba=True)
+    hoja = wb[nombre_hoja]
+
+    # Igual que en generar_fun: algunas celdas quedan con una referencia
+    # externa rota ("[1]EXPORTAR!...") en vez de la referencia normal a
+    # la misma hoja -- se corrige antes de guardar.
+    for row in hoja.iter_rows():
+        for cell in row:
+            if isinstance(cell.value, str) and "[1]EXPORTAR!" in cell.value:
+                cell.value = cell.value.replace("[1]EXPORTAR!", "EXPORTAR!")
+            elif isinstance(cell.value, str) and "[1]DATOS!" in cell.value:
+                cell.value = cell.value.replace("[1]DATOS!", "DATOS!")
+
+    exportar = wb["EXPORTAR"]
+    exportar["D27"] = datos_vehiculo.get("placa", "")
+    exportar["D28"] = datos_vehiculo.get("servicio", "")
+    exportar["D29"] = datos_vehiculo.get("clase", "")
+    exportar["D30"] = datos_vehiculo.get("marca", "")
+    exportar["D31"] = datos_vehiculo.get("linea", "")
+    exportar["D32"] = datos_vehiculo.get("modelo", "")
+    exportar["D33"] = datos_vehiculo.get("color", "")
+    exportar["D34"] = datos_vehiculo.get("numero_serie", "")
+    exportar["D35"] = datos_vehiculo.get("numero_motor", "")
+    exportar["D36"] = datos_vehiculo.get("numero_chasis", "")
+    exportar["D37"] = datos_vehiculo.get("cilindrada", "")
+    exportar["D38"] = datos_vehiculo.get("carroceria", "")
+    exportar["D39"] = datos_vehiculo.get("combustible", "")
+    exportar["D40"] = datos_vehiculo.get("autoridad_transito", "")
+    exportar["D41"] = datos_vehiculo.get("capacidad", "")
+    exportar["D42"] = datos_vehiculo.get("vin", "")
+    exportar["D43"] = "SI" if datos_vehiculo.get("gravamenes_propiedad") else "NO"
+    exportar["D44"] = datos_vehiculo.get("fecha_matricula_inicial", "")
+
+    # Los datos de personas (asesor/propietario/comprador, filas 3-22) no
+    # se llenan por ahora -- se dejan en blanco en vez de la formula
+    # original, para que no aparezca "Err:507" en el documento (la
+    # formula VLOOKUP falla sin un valor de busqueda valido).
+    for fila in list(range(3, 7)) + list(range(8, 15)) + list(range(16, 23)):
+        exportar.cell(row=fila, column=4).value = ""  # columna D
+        exportar.cell(row=fila, column=7).value = ""  # columna G (el "otro" propietario/comprador)
+
+    hojas_a_conservar = {nombre_hoja, "EXPORTAR", "DATOS"}
+    for nombre in list(wb.sheetnames):
+        if nombre not in hojas_a_conservar:
+            del wb[nombre]
+    hoja.sheet_state = "visible"
+    # EXPORTAR y DATOS deben seguir EXISTIENDO (las formulas de la hoja
+    # del documento las necesitan), pero OCULTAS -- si no, LibreOffice
+    # las imprime tambien como paginas propias ademas del documento real
+    # (EXPORTAR sola ya son decenas de paginas de "MENU").
+    exportar.sheet_state = "hidden"
+    if "DATOS" in wb.sheetnames:
+        wb["DATOS"].sheet_state = "hidden"
+    wb.active = wb.sheetnames.index(nombre_hoja)
+
+    id_temp = str(uuid.uuid4())[:8]
+    ruta_xlsm_temp = f"/tmp/_appjxdoc_{id_temp}.xlsm"
+    wb.save(ruta_xlsm_temp)
+
+    subprocess.run([
+        "soffice", "--headless", "--convert-to", "pdf",
+        "--outdir", os.path.dirname(ruta_salida_pdf), ruta_xlsm_temp
+    ], check=True, timeout=90)
+
+    generado = os.path.join(os.path.dirname(ruta_salida_pdf), f"_appjxdoc_{id_temp}.pdf")
+    shutil.move(generado, ruta_salida_pdf)
+    os.remove(ruta_xlsm_temp)
+
+
 def _moneda(valor):
     """Formatea un valor numerico como texto de moneda '$ X,XXX,XXX' para
     la declaracion manual."""
@@ -5776,6 +5883,50 @@ def generar_fun_endpoint():
     try:
         generar_fun(datos, ruta_pdf_local)
         nombre_remoto = f"fun/{placa}_{id_doc}.pdf"
+        url = subir_a_r2(ruta_pdf_local, nombre_remoto)
+        os.remove(ruta_pdf_local)
+        return jsonify({"ok": True, "url": url})
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc(), flush=True)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/appjx-documentos-listar", methods=["GET"])
+def appjx_documentos_listar_endpoint():
+    """Devuelve la lista de documentos disponibles de AppJX.xlsm (clave +
+    nombre visible), para armar los botones en la pestaña Revision."""
+    return jsonify({
+        "ok": True,
+        "documentos": [
+            {"clave": clave, "nombre": nombre}
+            for clave, (nombre, _hoja) in APPJX_DOCUMENTOS.items()
+        ]
+    })
+
+
+@app.route("/appjx-generar-documento", methods=["POST"])
+def appjx_generar_documento_endpoint():
+    """Genera cualquiera de los documentos de AppJX.xlsm, llenando SOLO
+    los datos del vehiculo -- recibe los datos por POST igual que
+    /generar-fun, para usar justo lo que el usuario tiene en pantalla en
+    ese momento (sin depender de que el vehiculo ya este guardado en la
+    base de datos)."""
+    datos = request.get_json(silent=True) or {}
+    clave_documento = datos.get("documento", "")
+    if clave_documento not in APPJX_DOCUMENTOS:
+        return jsonify({"ok": False, "error": "Documento desconocido."}), 400
+
+    placa = (datos.get("placa") or "SINPLACA").upper().strip()
+    if not os.path.exists(FUN_PLANTILLA):
+        return jsonify({"ok": False, "error": "No se encontró la plantilla AppJX.xlsm en el servidor."}), 500
+
+    id_doc = str(uuid.uuid4())[:10]
+    ruta_pdf_local = f"/tmp/APPJXDOC_{placa}_{id_doc}.pdf"
+
+    try:
+        generar_documento_vehiculo_appjx(clave_documento, datos, ruta_pdf_local)
+        nombre_remoto = f"appjx-doc/{clave_documento}_{placa}_{id_doc}.pdf"
         url = subir_a_r2(ruta_pdf_local, nombre_remoto)
         os.remove(ruta_pdf_local)
         return jsonify({"ok": True, "url": url})
