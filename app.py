@@ -1532,15 +1532,20 @@ def envigado_reservar_cita(solicitud):
                 except Exception:
                     continue
             if not placa_ok:
-                try:
-                    campo_placa = page.locator('input[type="search"]').first
-                    campo_placa.click(timeout=5000, force=True)
-                    campo_placa.fill(solicitud["placa"], timeout=5000, force=True)
-                    campo_placa.press("Enter")
-                    page.wait_for_timeout(1000)
-                    placa_ok = True
-                except Exception as e_placa_tag:
-                    print(f"{etiqueta} No se pudo escribir la placa: {e_placa_tag}", flush=True)
+                for intento_placa in range(3):
+                    try:
+                        campo_placa = page.locator('input[type="search"]').first
+                        campo_placa.wait_for(state="attached", timeout=5000)
+                        page.wait_for_timeout(500)
+                        campo_placa.click(timeout=5000, force=True)
+                        campo_placa.fill(solicitud["placa"], timeout=5000, force=True)
+                        campo_placa.press("Enter")
+                        page.wait_for_timeout(1000)
+                        placa_ok = True
+                        break
+                    except Exception as e_placa_tag:
+                        print(f"{etiqueta} No se pudo escribir la placa (intento {intento_placa+1}/3): {e_placa_tag}", flush=True)
+                        page.wait_for_timeout(1500)
             if not placa_ok:
                 resultado["mensaje"] = "No se pudo llenar el campo de placa."
                 return resultado
