@@ -5872,6 +5872,57 @@ def envigado_citas_solicitud_eliminar_endpoint():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/envigado-citas-solicitud-probar-ahora", methods=["GET"])
+def envigado_citas_solicitud_probar_ahora_endpoint():
+    """Fuerza el intento de reserva de UNA solicitud especifica de la
+    cola AHORA MISMO, sin esperar a que el monitoreo automatico detecte
+    citas primero -- util para probar/depurar el flujo de reserva sin
+    depender de que aparezcan citas reales por casualidad. No cambia el
+    estado en la base de datos (la solicitud sigue pendiente despues,
+    sin importar el resultado) -- es solo para ver el diagnostico en los
+    logs."""
+    solicitud_id = request.args.get("id", "")
+    if not solicitud_id.isdigit():
+        return jsonify({"ok": False, "error": "ID invalido."}), 400
+
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, nombres, apellidos, tipo_documento, numero_documento, correo, celular,
+                   placa, id_servicio, sede_preferida, hora_aproximada
+            FROM envigado_citas_solicitudes WHERE id = %s
+        """, (int(solicitud_id),))
+        fila = cur.fetchone()
+        cur.close(); conn.close()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    if not fila:
+        return jsonify({"ok": False, "error": "No se encontró esa solicitud."}), 404
+
+    solicitud = {
+        "id": fila[0], "nombres": fila[1], "apellidos": fila[2], "tipo_documento": fila[3],
+        "numero_documento": fila[4], "correo": fila[5], "celular": fila[6], "placa": fila[7],
+        "id_servicio": fila[8], "sede_preferida": fila[9], "hora_aproximada": fila[10],
+    }
+
+    job_id = str(uuid.uuid4())
+    job_actualizar(job_id, "Probando el flujo de reserva (forzado, sin esperar deteccion)...", "procesando")
+
+    def ejecutar():
+        try:
+            resultado = envigado_reservar_cita(solicitud)
+            job_terminar(job_id, resultado)
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc(), flush=True)
+            job_error(job_id, str(e))
+
+    threading.Thread(target=ejecutar, daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
 @app.route("/envigado-citas-disponibles", methods=["GET"])
 def envigado_citas_disponibles_endpoint():
     """Revisa en vivo las dos sedes de Envigado (Vegas y City Plaza) para
