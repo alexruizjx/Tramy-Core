@@ -2655,6 +2655,7 @@ import subprocess
 import shutil
 from openpyxl.styles import PatternFill, Alignment, Border, Side, Font
 from openpyxl.worksheet.pagebreak import Break
+from openpyxl.cell.cell import MergedCell
 import openpyxl as _openpyxl
 import copy
 
@@ -3037,6 +3038,24 @@ def _moneda_pys(valor):
         return "$\xa00"
 
 
+def _escribir_celda_segura(ws, fila, columna, valor):
+    """Igual que ws.cell(row=fila, column=columna, value=valor), pero
+    sin fallar si esa celda resulta ser parte de un rango combinado (una
+    'MergedCell', que en openpyxl es de solo lectura -- solo la celda
+    superior-izquierda del combinado se puede escribir). Si la celda
+    pedida esta combinada, se escribe en la celda ancla del combinado en
+    su lugar. Esto hace que la funcion no se rompa si en el futuro se
+    combinan celdas nuevas en la plantilla (como paso con AppJX.xlsm)."""
+    celda = ws.cell(row=fila, column=columna)
+    if isinstance(celda, MergedCell):
+        for rango in ws.merged_cells.ranges:
+            if celda.coordinate in rango:
+                ws.cell(row=rango.min_row, column=rango.min_col, value=valor)
+                return
+        return  # no deberia pasar, pero por seguridad no se rompe
+    celda.value = valor
+
+
 def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     """Genera el documento Estado de Cuenta (certificado de paz y salvo),
     a partir de la plantilla AppJX.xlsm real (hojas PYS + ESTADO DE
@@ -3099,21 +3118,21 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     declaraciones = datos.get("lista_detalle_pagos", []) or []
     fila = 35
     for d in declaraciones:
-        pys.cell(row=fila, column=1,  value=d.get("tipoLiquidacion", ""))
-        pys.cell(row=fila, column=2,  value=d.get("formularioLiquidacion", ""))
+        _escribir_celda_segura(pys, fila, 1,  d.get("tipoLiquidacion", ""))
+        _escribir_celda_segura(pys, fila, 2,  d.get("formularioLiquidacion", ""))
         fecha_pago = d.get("fechaPago")
         if fecha_pago:
             try:
-                pys.cell(row=fila, column=3, value=datetime.utcfromtimestamp(fecha_pago / 1000))
+                _escribir_celda_segura(pys, fila, 3, datetime.utcfromtimestamp(fecha_pago / 1000))
             except (TypeError, ValueError, OSError):
-                pys.cell(row=fila, column=3, value="")
-        pys.cell(row=fila, column=4,  value=_moneda_pys(d.get("impuesto", 0)))
-        pys.cell(row=fila, column=5,  value=_moneda_pys(d.get("sancion", 0)))
-        pys.cell(row=fila, column=6,  value=_moneda_pys(d.get("descuento", 0)))
-        pys.cell(row=fila, column=7,  value=_moneda_pys(d.get("interesMora", 0)))
-        pys.cell(row=fila, column=8,  value=_moneda_pys(d.get("totalPagar", 0)))
-        pys.cell(row=fila, column=9,  value=_moneda_pys(d.get("avaluoComercial", 0)))
-        pys.cell(row=fila, column=10, value=d.get("vigencia", ""))
+                _escribir_celda_segura(pys, fila, 3, "")
+        _escribir_celda_segura(pys, fila, 4,  _moneda_pys(d.get("impuesto", 0)))
+        _escribir_celda_segura(pys, fila, 5,  _moneda_pys(d.get("sancion", 0)))
+        _escribir_celda_segura(pys, fila, 6,  _moneda_pys(d.get("descuento", 0)))
+        _escribir_celda_segura(pys, fila, 7,  _moneda_pys(d.get("interesMora", 0)))
+        _escribir_celda_segura(pys, fila, 8,  _moneda_pys(d.get("totalPagar", 0)))
+        _escribir_celda_segura(pys, fila, 9,  _moneda_pys(d.get("avaluoComercial", 0)))
+        _escribir_celda_segura(pys, fila, 10, d.get("vigencia", ""))
         fila += 1
 
     # M22.. / O22.. / P22.. -- procesos fiscales, bloqueos, novedades
@@ -3123,10 +3142,10 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
 
     for i, p in enumerate(procesos):
         texto = f"{p.get('descripcionProcesoFiscal', '')} ({p.get('vigencia', '')})"
-        pys.cell(row=22 + i, column=13, value=texto)  # M
+        _escribir_celda_segura(pys, 22 + i, 13, texto)  # M
     for i, b in enumerate(bloqueos):
         texto = f"{b.get('descripcionBloqueo', '')} ({b.get('vigencia', '')})"
-        pys.cell(row=22 + i, column=15, value=texto)  # O
+        _escribir_celda_segura(pys, 22 + i, 15, texto)  # O
     for i, n in enumerate(novedades):
         if isinstance(n, dict):
             descripcion = n.get("descripcionNovedad", "")
@@ -3140,7 +3159,7 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
             texto = f"{descripcion} - {fecha_fmt}" if fecha_fmt else descripcion
         else:
             texto = str(n)
-        pys.cell(row=22 + i, column=16, value=texto)  # P
+        _escribir_celda_segura(pys, 22 + i, 16, texto)  # P
 
     # "El vehiculo no presenta observaciones" solo si las 3 listas estan
     # vacias -- si hay cualquier cosa, se quita ese aviso.
@@ -3154,7 +3173,7 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     # para cuando la condicion es falsa, y en ese caso Excel/LibreOffice
     # muestra el texto literal "FALSE" en vez de dejarlo vacio.
     for r in range(53, 73):
-        edc.cell(row=r, column=1, value="")
+        _escribir_celda_segura(edc, r, 1, "")
 
     # Borde suelto (resto de la plantilla) que cortaba visualmente el
     # texto "Tipos de declaraciones..." justo en la palabra "Corrección".
