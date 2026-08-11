@@ -3300,21 +3300,26 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
 
     # "Observaciones" y "Avaluo para la vigencia" deben quedar SIEMPRE
     # juntos en la misma pagina, y nunca deben cortarse a la mitad -- se
-    # fuerza un salto de pagina justo antes de "OBSERVACIONES" cuando el
-    # TOTAL combinado (declaraciones + observaciones) es demasiado grande
-    # para caber junto con las primeras 2 tablas en una sola pagina.
-    # Calibrado con un PDF real de la Gobernacion: 16 declaraciones + 12
-    # filas de observaciones (total 28) YA NO cabian en una sola pagina
-    # (se cortaba "Observaciones" a la mitad); mientras que 18
-    # declaraciones + 0 observaciones (total 18) si cabian bien.
-    # La tabla 4 (Avaluo/Periodo/Firma) ocupa un espacio fijo minimo
-    # incluso cuando Observaciones esta vacia (max_obs=0) -- por eso
-    # entra un "peso" fijo (ESPACIO_FIJO_TABLA_4) en la cuenta, no solo la
-    # cantidad de observaciones. Calibrado con un caso limite real: 18
-    # declaraciones + 0 observaciones ya se desbordaba por muy poco.
+    # fuerza un salto de pagina justo antes de "OBSERVACIONES" solo
+    # cuando de verdad hace falta. IMPORTANTE: esto no es simplemente
+    # "el total es muy grande" -- hay que considerar que, si la tabla de
+    # Declaraciones (tabla 1) ya se desbordo por su cuenta a una segunda
+    # pagina, puede quedar espacio de sobra en ESA misma pagina para
+    # Observaciones (tablas 2 y 3), y en ese caso NO hay que forzar otro
+    # salto (si no, Observaciones termina saltando a una TERCERA pagina
+    # sin necesidad, dejando espacio vacio sin usar en la segunda).
+    #
+    # Se modela con aritmetica modular: cuantas filas caben por pagina
+    # (calibrado con PDFs reales de la Gobernacion), y cuantas filas de
+    # la pagina actual ya se usaron con Declaraciones -- lo que sobra de
+    # esa cuenta es el espacio libre real que queda en la pagina donde
+    # Declaraciones termino.
+    FILAS_POR_PAGINA = 20  # calibrado: 18 declaraciones + 0 obs cabian bien; 16 + 12 (28) no cabian en una sola pagina
     ESPACIO_FIJO_TABLA_4 = 3
-    UMBRAL_TOTAL_PARA_SALTO = 20
-    if (filas_declaraciones + max_obs + ESPACIO_FIJO_TABLA_4) > UMBRAL_TOTAL_PARA_SALTO:
+    espacio_necesario_obs = max_obs + ESPACIO_FIJO_TABLA_4
+    filas_usadas_pagina_actual = filas_declaraciones % FILAS_POR_PAGINA
+    espacio_libre_pagina_actual = FILAS_POR_PAGINA - filas_usadas_pagina_actual if filas_usadas_pagina_actual else FILAS_POR_PAGINA
+    if espacio_necesario_obs > espacio_libre_pagina_actual:
         edc.row_breaks.append(Break(id=50))  # quiebre despues de la fila 50 -> "OBSERVACIONES" (fila 51, con su titulo) arranca en pagina nueva
 
     hojas_a_conservar = {"PYS", "ESTADO DE CUENTA"}
