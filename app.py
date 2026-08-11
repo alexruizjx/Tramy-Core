@@ -3328,16 +3328,32 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
 
     altura_antes_declaraciones = _altura_filas_pts(edc, 1, FILA_DECL_INICIO - 1)
     altura_una_fila_declaracion = edc.row_dimensions[FILA_DECL_INICIO].height or 21.0
-    altura_gap_y_titulo_obs = _altura_filas_pts(edc, FILA_DECL_FIN + 1, 76)  # filas 48..76: espacio + titulo "OBSERVACIONES" + encabezados
+    altura_gap_y_titulo_obs = _altura_filas_pts(edc, FILA_DECL_FIN + 1, 52)  # filas 48..52: espacio + titulo "OBSERVACIONES" + encabezados de columna (SIN incluir las filas de datos 53+, esas se cuentan aparte con max_obs)
     altura_una_fila_obs = edc.row_dimensions[53].height or 21.0
     altura_tabla4 = _altura_filas_pts(edc, 77, 79)  # Periodo/Valor/Fecha/Firma
 
-    altura_hasta_fin_declaraciones = altura_antes_declaraciones + (filas_declaraciones * altura_una_fila_declaracion)
-    # Cuanto de esa altura cae en la pagina ACTUAL (modulo el alto util
-    # de una pagina) -- lo que sobra hasta completar una pagina es el
-    # espacio libre real que queda donde termino Declaraciones.
-    altura_usada_pagina_actual = altura_hasta_fin_declaraciones % ALTO_UTIL_PT
-    espacio_libre_pagina_actual = ALTO_UTIL_PT - altura_usada_pagina_actual
+    altura_declaraciones_total = filas_declaraciones * altura_una_fila_declaracion
+    # La PAGINA 1 tiene MENOS espacio disponible para Declaraciones que
+    # las paginas siguientes, porque el encabezado ("INFORMACION
+    # GENERAL", etc.) ocupa espacio ahi y NO se repite en la pagina 2 en
+    # adelante -- por eso no se puede usar un modulo simple sobre el
+    # total acumulado desde el principio (eso asumia que todas las
+    # paginas tienen la misma capacidad, lo cual fallaba cuando
+    # Declaraciones era tan larga que se desbordaba mas alla de la
+    # pagina 2).
+    capacidad_pagina1_para_declaraciones = ALTO_UTIL_PT - altura_antes_declaraciones
+    if altura_declaraciones_total <= capacidad_pagina1_para_declaraciones:
+        # Todas las declaraciones caben en la pagina 1 -- el espacio
+        # libre que queda ahi es el resto despues del encabezado + tabla.
+        espacio_libre_pagina_actual = ALTO_UTIL_PT - altura_antes_declaraciones - altura_declaraciones_total
+    else:
+        # Se desbordo mas alla de la pagina 1 -- de ahi en adelante cada
+        # pagina nueva arranca con capacidad COMPLETA (sin el encabezado
+        # de la pagina 1), asi que se calcula cuanto sobra despues de
+        # llenar paginas completas con el resto.
+        resto_tras_pagina1 = altura_declaraciones_total - capacidad_pagina1_para_declaraciones
+        resto_en_pagina_actual = resto_tras_pagina1 % ALTO_UTIL_PT
+        espacio_libre_pagina_actual = ALTO_UTIL_PT - resto_en_pagina_actual
 
     altura_necesaria_obs = altura_gap_y_titulo_obs + (max_obs * altura_una_fila_obs) + altura_tabla4
     if altura_necesaria_obs > espacio_libre_pagina_actual:
