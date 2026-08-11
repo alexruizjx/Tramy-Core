@@ -3045,16 +3045,38 @@ def _desfusionar_zona_tabla(ws, fila_inicio, fila_fin, columnas):
     abarca VARIAS filas de esa tabla, escribir en cada fila por separado
     terminaba pisando el valor anterior (todas las filas de una misma
     fusion apuntan a la misma celda 'ancla') -- en vez de eso, se separa
-    la fusion de una vez para que cada fila quede independiente."""
+    la fusion de una vez para que cada fila quede independiente.
+
+    Ademas, vuelve a aplicar un borde fino explicito a CADA celda del
+    ANCHO COMPLETO de las fusiones que se separan (no solo a la columna
+    que se estaba buscando) -- las celdas combinadas en Excel suelen
+    usar la propiedad 'outline' (que solo se ve bien mientras siguen
+    fusionadas) en vez de un borde normal en cada celda individual, asi
+    que al separar una fusion de varias columnas de ancho (ej. A:O),
+    solo la celda ancla (A) tenia borde propio -- las demas (B a O)
+    quedaban sin ninguno, dando la apariencia de seguir combinadas."""
     columnas = set(columnas)
     rangos_a_quitar = []
+    columnas_con_borde = set(columnas)  # se va ampliando con el ancho real de cada fusion encontrada
     for rango in list(ws.merged_cells.ranges):
         si_se_cruza = (rango.min_row <= fila_fin and rango.max_row >= fila_inicio
                        and any(c in columnas for c in range(rango.min_col, rango.max_col + 1)))
         if si_se_cruza:
             rangos_a_quitar.append(str(rango))
+            columnas_con_borde.update(range(rango.min_col, rango.max_col + 1))
     for rango_texto in rangos_a_quitar:
         ws.unmerge_cells(rango_texto)
+
+    borde_fino = Side(style="thin", color="FF000000")
+    columna_izq = min(columnas_con_borde)
+    columna_der = max(columnas_con_borde)
+    for fila in range(fila_inicio, fila_fin + 1):
+        for columna in columnas_con_borde:
+            ws.cell(row=fila, column=columna).border = Border(
+                left=borde_fino if columna == columna_izq else None,
+                right=borde_fino if columna == columna_der else None,
+                top=borde_fino, bottom=borde_fino,
+            )
 
 
 def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
