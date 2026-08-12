@@ -3002,13 +3002,19 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
 
     # Igual que en generar_fun: algunas celdas quedan con una referencia
     # externa rota ("[1]EXPORTAR!...") en vez de la referencia normal a
-    # la misma hoja -- se corrige antes de guardar.
+    # la misma hoja -- se corrige antes de guardar. Aprovechando el mismo
+    # recorrido, tambien se quita el pie de pagina "Juridicox.com..." --
+    # ese texto empuja el contenido justo un poco mas alla de una pagina,
+    # generando una segunda pagina casi vacia (con solo el titulo y ese
+    # pie repetidos).
     for row in hoja.iter_rows():
         for cell in row:
             if isinstance(cell.value, str) and "[1]EXPORTAR!" in cell.value:
                 cell.value = cell.value.replace("[1]EXPORTAR!", "EXPORTAR!")
             elif isinstance(cell.value, str) and "[1]DATOS!" in cell.value:
                 cell.value = cell.value.replace("[1]DATOS!", "DATOS!")
+            elif isinstance(cell.value, str) and "JURIDICOX.COM" in cell.value.upper():
+                cell.value = ""
 
     exportar = wb["EXPORTAR"]
     exportar["D27"] = datos_vehiculo.get("placa", "")
@@ -3063,11 +3069,14 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         # W41/AG41 muestran el texto de "traslado de cuenta" via formula
         # (=EXPORTAR!D51) -- LibreOffice no siempre recalcula esa formula
         # en la conversion a PDF, asi que se escribe vacio DIRECTAMENTE en
-        # la celda visible en vez de depender de la formula.
-        hoja["W41"].value = ""
-        hoja["W41"].fill = sin_relleno
-        hoja["AG41"].value = ""
-        hoja["AG41"].fill = sin_relleno
+        # la celda visible en vez de depender de la formula. Protegido por
+        # si acaso en "(2)"/"(3)" esa celda resulta combinada distinto.
+        for celda_fija in ("W41", "AG41"):
+            try:
+                hoja[celda_fija].value = ""
+            except AttributeError:
+                pass
+            hoja[celda_fija].fill = sin_relleno
 
         # Igual que generar_fun: las celdas de "referencia simple" (que
         # no son formulas de EXPORTAR, sino texto/numero directo, como
@@ -3101,6 +3110,24 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     exportar.sheet_state = "hidden"
     if "DATOS" in wb.sheetnames:
         wb["DATOS"].sheet_state = "hidden"
+
+    # Todos estos documentos deben salir en UNA sola pagina -- ninguno
+    # tenia "ajustar a una pagina" configurado en la plantilla, asi que
+    # el area usada (aunque sea por muy poco, ej. una fila de formato
+    # sin texto) se desbordaba a una segunda pagina casi vacia (con el
+    # titulo y pie de pagina repetidos, que es lo unico que trae esa
+    # pagina de mas). Se fuerza a que siempre quepa en 1x1 paginas.
+    # NOTA: se evita la propiedad "hoja.page_setup.fitToPage" porque
+    # tiene un bug interno en openpyxl (intenta usar el worksheet padre,
+    # que a veces no esta enlazado) -- se marca directo en
+    # sheet_properties.pageSetUpPr en su lugar.
+    hoja.page_setup.fitToWidth = 1
+    hoja.page_setup.fitToHeight = 1
+    if hoja.sheet_properties.pageSetUpPr is None:
+        from openpyxl.worksheet.properties import PageSetupProperties
+        hoja.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+    else:
+        hoja.sheet_properties.pageSetUpPr.fitToPage = True
     wb.active = wb.sheetnames.index(nombre_hoja)
 
     id_temp = str(uuid.uuid4())[:8]
