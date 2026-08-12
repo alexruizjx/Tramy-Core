@@ -3029,14 +3029,65 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     exportar["D42"] = datos_vehiculo.get("vin", "")
     exportar["D43"] = "SI" if datos_vehiculo.get("gravamenes_propiedad") else "NO"
     exportar["D44"] = datos_vehiculo.get("fecha_matricula_inicial", "")
+    exportar["D51"] = ""  # traslado_municipio -- vacio explicito, si no la formula '=EXPORTAR!D51' en FORMULARIO muestra "0" (una celda totalmente vacia, sin ni siquiera comillas vacias, se lee como cero en una referencia directa)
 
     # Los datos de personas (asesor/propietario/comprador, filas 3-22) no
     # se llenan por ahora -- se dejan en blanco en vez de la formula
     # original, para que no aparezca "Err:507" en el documento (la
     # formula VLOOKUP falla sin un valor de busqueda valido).
     for fila in list(range(3, 7)) + list(range(8, 15)) + list(range(16, 23)):
-        exportar.cell(row=fila, column=4).value = ""  # columna D
-        exportar.cell(row=fila, column=7).value = ""  # columna G (el "otro" propietario/comprador)
+        celda_d = exportar.cell(row=fila, column=4)  # columna D
+        celda_d.value = ""
+        celda_d.number_format = "General"  # algunas (ej. telefono/documento) tienen formato "0", que muestra "0" en vez de vacio
+        celda_g = exportar.cell(row=fila, column=7)  # columna G (el "otro" propietario/comprador)
+        celda_g.value = ""
+        celda_g.number_format = "General"
+
+    # Las 3 hojas de FORMULARIO tienen casillas que se resaltan en verde
+    # segun el tramite/clase/combustible/servicio del vehiculo. Primero
+    # se limpia CUALQUIER resaltado que pudiera haber (por si la plantilla
+    # trae algo marcado de una prueba anterior), y despues se vuelve a
+    # aplicar SOLO segun los datos reales de este vehiculo. El resaltado
+    # de TRAMITE no aplica todavia (esta herramienta aun no deja elegir
+    # un tramite) -- si se agrega mas adelante, ya queda listo: basta con
+    # mandar datos_vehiculo["tramite"].
+    if nombre_hoja in ("FORMULARIO", "FORMULARIO (2)", "FORMULARIO (3)"):
+        sin_relleno = PatternFill(fill_type=None)
+        for mapa_celdas in (CELDAS_TRAMITE, CELDAS_CLASE, CELDAS_COMBUSTIBLE, CELDAS_SERVICIO):
+            for celdas in mapa_celdas.values():
+                for celda in celdas:
+                    hoja[celda].fill = sin_relleno
+        for celda in CELDA_OTROS_TRAMITE:
+            hoja[celda].fill = sin_relleno
+        hoja["W38"].fill = sin_relleno  # bloque "ESPECIFIQUE LA PALABRA OTRO..." (combinado W38:AK40)
+        # W41/AG41 muestran el texto de "traslado de cuenta" via formula
+        # (=EXPORTAR!D51) -- LibreOffice no siempre recalcula esa formula
+        # en la conversion a PDF, asi que se escribe vacio DIRECTAMENTE en
+        # la celda visible en vez de depender de la formula.
+        hoja["W41"].value = ""
+        hoja["W41"].fill = sin_relleno
+        hoja["AG41"].value = ""
+        hoja["AG41"].fill = sin_relleno
+
+        # Igual que generar_fun: las celdas de "referencia simple" (que
+        # no son formulas de EXPORTAR, sino texto/numero directo, como
+        # documento/telefono del propietario y comprador) tambien deben
+        # quedar en blanco cuando no hay ese dato -- si no, algunas
+        # aparecen como "0" en vez de vacio.
+        for celda, clave in CELDAS_REFERENCIA_SIMPLE.items():
+            if not datos_vehiculo.get(clave):
+                try:
+                    hoja[celda] = ""
+                except Exception:
+                    pass
+
+        _fun_marcar_checkboxes(hoja, CELDAS_CLASE, datos_vehiculo.get("clase", ""))
+        _fun_marcar_checkboxes(hoja, CELDAS_COMBUSTIBLE, datos_vehiculo.get("combustible", ""))
+        _fun_marcar_checkboxes(hoja, CELDAS_SERVICIO, datos_vehiculo.get("servicio", ""))
+        if datos_vehiculo.get("tramite"):
+            _fun_marcar_checkboxes(hoja, CELDAS_TRAMITE, datos_vehiculo["tramite"])
+            if "TRASLADO" in _fun_normalizar(datos_vehiculo["tramite"]):
+                hoja["W38"].fill = VERDE_MARCA
 
     hojas_a_conservar = {nombre_hoja, "EXPORTAR", "DATOS"}
     for nombre in list(wb.sheetnames):
