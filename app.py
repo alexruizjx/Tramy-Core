@@ -3002,19 +3002,13 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
 
     # Igual que en generar_fun: algunas celdas quedan con una referencia
     # externa rota ("[1]EXPORTAR!...") en vez de la referencia normal a
-    # la misma hoja -- se corrige antes de guardar. Aprovechando el mismo
-    # recorrido, tambien se quita el pie de pagina "Juridicox.com..." --
-    # ese texto empuja el contenido justo un poco mas alla de una pagina,
-    # generando una segunda pagina casi vacia (con solo el titulo y ese
-    # pie repetidos).
+    # la misma hoja -- se corrige antes de guardar.
     for row in hoja.iter_rows():
         for cell in row:
             if isinstance(cell.value, str) and "[1]EXPORTAR!" in cell.value:
                 cell.value = cell.value.replace("[1]EXPORTAR!", "EXPORTAR!")
             elif isinstance(cell.value, str) and "[1]DATOS!" in cell.value:
                 cell.value = cell.value.replace("[1]DATOS!", "DATOS!")
-            elif isinstance(cell.value, str) and "JURIDICOX.COM" in cell.value.upper():
-                cell.value = ""
 
     exportar = wb["EXPORTAR"]
     exportar["D27"] = datos_vehiculo.get("placa", "")
@@ -3036,6 +3030,8 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     exportar["D43"] = "SI" if datos_vehiculo.get("gravamenes_propiedad") else "NO"
     exportar["D44"] = datos_vehiculo.get("fecha_matricula_inicial", "")
     exportar["D51"] = ""  # traslado_municipio -- vacio explicito, si no la formula '=EXPORTAR!D51' en FORMULARIO muestra "0" (una celda totalmente vacia, sin ni siquiera comillas vacias, se lee como cero en una referencia directa)
+    exportar["D24"] = ""  # precio -- la plantilla trae un valor de prueba guardado (9.000.000); se deja vacio para que se llene a mano en el documento impreso
+    exportar["D24"].number_format = "General"
 
     # Los datos de personas (asesor/propietario/comprador, filas 3-22) no
     # se llenan por ahora -- se dejan en blanco en vez de la formula
@@ -3048,6 +3044,23 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         celda_g = exportar.cell(row=fila, column=7)  # columna G (el "otro" propietario/comprador)
         celda_g.value = ""
         celda_g.number_format = "General"
+
+    # Las celdas DENTRO del documento (no en EXPORTAR) que muestran estos
+    # datos de personas dependen de que LibreOffice recalcule su formula
+    # al convertir a PDF -- eso no siempre pasa de forma confiable (igual
+    # que con el caso de "traslado" en FORMULARIO), asi que se escribe el
+    # valor vacio DIRECTAMENTE en la celda que se ve, en vez de confiar en
+    # que la formula se vuelva a calcular. Tambien se resetea el formato,
+    # por si tenia un formato numerico tipo "0" que fuerce a mostrar cero.
+    filas_persona_regex = re.compile(r"EXPORTAR!\$?D\$?([3-9]|1[0-9]|2[0-2]|24|51)\b")
+    for row in hoja.iter_rows():
+        for cell in row:
+            if isinstance(cell.value, str) and filas_persona_regex.search(cell.value):
+                try:
+                    cell.value = ""
+                except AttributeError:
+                    pass  # celda combinada -- no se puede escribir directo, se deja como esta
+                cell.number_format = "General"
 
     # Las 3 hojas de FORMULARIO tienen casillas que se resaltan en verde
     # segun el tramite/clase/combustible/servicio del vehiculo. Primero
@@ -3113,10 +3126,11 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
 
     # Todos estos documentos deben salir en UNA sola pagina -- ninguno
     # tenia "ajustar a una pagina" configurado en la plantilla, asi que
-    # el area usada (aunque sea por muy poco, ej. una fila de formato
-    # sin texto) se desbordaba a una segunda pagina casi vacia (con el
-    # titulo y pie de pagina repetidos, que es lo unico que trae esa
-    # pagina de mas). Se fuerza a que siempre quepa en 1x1 paginas.
+    # el area usada se desbordaba a una segunda pagina casi vacia (con
+    # el titulo y un pie de pagina de marca repetidos -- ese pie
+    # resulto ser un elemento flotante, no una celda, asi que no se pudo
+    # recortar con precision; en vez de eso se encoge todo para que
+    # quepa siempre en una pagina).
     # NOTA: se evita la propiedad "hoja.page_setup.fitToPage" porque
     # tiene un bug interno en openpyxl (intenta usar el worksheet padre,
     # que a veces no esta enlazado) -- se marca directo en
