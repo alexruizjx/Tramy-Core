@@ -2642,8 +2642,7 @@ def _parsear_resultado_runt_vehiculo(page):
         "puertas": campo("Puertas"),
         "capacidad_carga": campo("Capacidad de Carga"),
         "peso_bruto_vehicular": campo("Peso Bruto Vehicular"),
-        "capacidad_pasajeros": campo("Capacidad de Pasajeros"),
-        "pasajeros_sentados": campo("Pasajeros Sentados"),
+        "capacidad_pasajeros": campo("Capacidad Pax Sentados") or campo("Capacidad de Pasajeros"),
         "numero_ejes": campo("Número de Ejes"),
         "estado_vehiculo": campo("Estado del vehículo"),
         "gravamenes_propiedad": campo("Gravámenes a la propiedad").upper() == "SI",
@@ -5681,7 +5680,7 @@ def guardar_vehiculo_ocr():
     cedula  = (data.get("cedula") or "").strip()
 
     campos_ocr_siempre = ["municipio", "propietario_tipo_documento", "propietario_cedula", "propietario_nombre", "ocr_limitacion_propiedad"]
-    campos_ocr_si_no_hay_runt = ["clase", "marca", "linea", "modelo", "cilindrada", "servicio", "carroceria"]
+    campos_ocr_si_no_hay_runt = ["clase", "marca", "linea", "modelo", "cilindrada", "servicio", "carroceria", "capacidad_pasajeros"]
 
     valores = {
         "municipio": data.get("municipio"),
@@ -5696,6 +5695,7 @@ def guardar_vehiculo_ocr():
         "cilindrada": data.get("cilindrada"),
         "servicio": data.get("servicio"),
         "carroceria": data.get("carroceria"),
+        "capacidad_pasajeros": data.get("capacidad"),
     }
 
     try:
