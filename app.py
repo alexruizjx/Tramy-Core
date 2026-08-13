@@ -2986,6 +2986,23 @@ APPJX_DOCUMENTOS = {
     "acta_responsabilidad":          ("Acta de responsabilidad civil",           "ACTA RESPONSABILIDAD"),
 }
 
+# Celda dentro de cada documento que muestra la linea de datos de la
+# empresa (referencia "=DATOS!W2" en la plantilla original) -- se
+# confirmo revisando las 17 hojas una por una. Se usa para escribir el
+# valor de forma directa (en vez de depender de que se recalcule la
+# formula, que no siempre pasa de forma confiable al convertir a PDF).
+APPJX_CELDA_LINEA_EMPRESA = {
+    "formulario": "A51", "formulario_dos_vendedores": "A52", "formulario_dos_compradores": "A48",
+    "compraventa": "A35", "compraventa_dos_vendedores": "A36", "compraventa_dos_compradores": "A37",
+    "compraventa_persona_juridica": "A35",
+    "mandato": "A49", "mandato_persona_juridica": "A49",
+    "mandato_dos_vendedores": "A46", "mandato_comprador_vendedor": "A46",
+    "traspaso_indeterminado": "A47", "revocatoria_indeterminado": "A46",
+    "afirmacion_traspaso": "A46",
+    "levantamiento_prenda": "A42", "inscripcion_prenda": "A42",
+    "acta_responsabilidad": "A44",
+}
+
 
 def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salida_pdf):
     """Genera en PDF cualquiera de los documentos de AppJX.xlsm listados
@@ -3032,6 +3049,24 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     exportar["D51"] = ""  # traslado_municipio -- vacio explicito, si no la formula '=EXPORTAR!D51' en FORMULARIO muestra "0" (una celda totalmente vacia, sin ni siquiera comillas vacias, se lee como cero en una referencia directa)
     exportar["D24"] = ""  # precio -- la plantilla trae un valor de prueba guardado (9.000.000); se deja vacio para que se llene a mano en el documento impreso
     exportar["D24"].number_format = "General"
+
+    # Linea de datos de la empresa (nombre, telefono, correo, etc.) que
+    # aparece al pie de cada documento -- se escribe en DATOS!W2 (por si
+    # algun otro lado de la plantilla la usa) Y TAMBIEN directo en la
+    # celda del documento actual que la muestra, ya que esa celda
+    # depende de que se recalcule "=DATOS!W2" y eso no siempre pasa de
+    # forma confiable al convertir a PDF (el mismo problema visto con
+    # las demas referencias directas).
+    linea_empresa = datos_vehiculo.get("linea_empresa", "")
+    if "DATOS" in wb.sheetnames:
+        wb["DATOS"]["W2"] = linea_empresa
+    celda_linea_empresa = APPJX_CELDA_LINEA_EMPRESA.get(clave_documento)
+    if celda_linea_empresa:
+        try:
+            hoja[celda_linea_empresa] = linea_empresa
+        except AttributeError:
+            pass  # celda combinada -- no se puede escribir directo
+        hoja[celda_linea_empresa].number_format = "General"
 
     # Los datos de personas (asesor/propietario/comprador, filas 3-22) no
     # se llenan por ahora -- se dejan en blanco en vez de la formula
