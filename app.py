@@ -3015,6 +3015,16 @@ APPJX_FILAS_ALTURA_EXTRA = {
     "MANDATO (3)": [5, 6],
 }
 
+# Celda dentro de cada documento que muestra la capacidad de pasajeros
+# (referencia "=EXPORTAR!D41" en la plantilla) -- solo los 7 documentos
+# listados aqui la muestran. Igual que con la linea de empresa, se
+# escribe directo por el mismo problema de recalculo de formulas.
+APPJX_CELDA_CAPACIDAD = {
+    "formulario": "W13", "formulario_dos_vendedores": "W13", "formulario_dos_compradores": "W13",
+    "compraventa": "B20", "compraventa_dos_vendedores": "B20",
+    "compraventa_dos_compradores": "B20", "compraventa_persona_juridica": "B20",
+}
+
 
 def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salida_pdf):
     """Genera en PDF cualquiera de los documentos de AppJX.xlsm listados
@@ -3055,7 +3065,15 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     exportar["D39"] = datos_vehiculo.get("combustible", "")
     exportar["D40"] = datos_vehiculo.get("autoridad_transito", "")
     _capacidad_pax = str(datos_vehiculo.get("capacidad", "") or "").strip()
-    exportar["D41"] = "" if _capacidad_pax in ("", "0") else _capacidad_pax
+    _capacidad_pax_final = "" if _capacidad_pax in ("", "0") else _capacidad_pax
+    exportar["D41"] = _capacidad_pax_final
+    celda_capacidad = APPJX_CELDA_CAPACIDAD.get(clave_documento)
+    if celda_capacidad:
+        try:
+            hoja[celda_capacidad] = _capacidad_pax_final
+        except AttributeError:
+            pass  # celda combinada -- no se puede escribir directo
+        hoja[celda_capacidad].number_format = "General"
     exportar["D42"] = datos_vehiculo.get("vin", "")
     exportar["D43"] = "SI" if datos_vehiculo.get("gravamenes_propiedad") else "NO"
     exportar["D44"] = datos_vehiculo.get("fecha_matricula_inicial", "")
