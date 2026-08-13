@@ -3003,6 +3003,18 @@ APPJX_CELDA_LINEA_EMPRESA = {
     "acta_responsabilidad": "A44",
 }
 
+# Filas de los 4 documentos de MANDATO que tienen un salto de linea
+# ("\n") dentro del texto de la celda, pero se quedaron con la altura de
+# fila de una sola linea -- por eso el texto se veia apeñuscado (la
+# segunda linea se montaba encima de la fila de abajo). Se les da mas
+# alto para que las 2 lineas quepan bien.
+APPJX_FILAS_ALTURA_EXTRA = {
+    "MANDATO": [3, 7, 21],
+    "MANDATO NIT": [3, 8, 22],
+    "MANDATO (2)": [3, 5, 21],
+    "MANDATO (3)": [5, 6],
+}
+
 
 def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salida_pdf):
     """Genera en PDF cualquiera de los documentos de AppJX.xlsm listados
@@ -3067,6 +3079,13 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         except AttributeError:
             pass  # celda combinada -- no se puede escribir directo
         hoja[celda_linea_empresa].number_format = "General"
+
+    # En los 4 documentos de MANDATO, algunas filas tienen texto con
+    # salto de linea interno pero se quedaron con altura de una sola
+    # linea -- se les da mas espacio para que no se vean apeñuscadas.
+    for fila in APPJX_FILAS_ALTURA_EXTRA.get(nombre_hoja, []):
+        alto_actual = hoja.row_dimensions[fila].height or 15
+        hoja.row_dimensions[fila].height = max(alto_actual, 30)
 
     # Los datos de personas (asesor/propietario/comprador, filas 3-22) no
     # se llenan por ahora -- se dejan en blanco en vez de la formula
