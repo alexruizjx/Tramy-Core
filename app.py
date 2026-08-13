@@ -3054,7 +3054,8 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     exportar["D38"] = datos_vehiculo.get("carroceria", "")
     exportar["D39"] = datos_vehiculo.get("combustible", "")
     exportar["D40"] = datos_vehiculo.get("autoridad_transito", "")
-    exportar["D41"] = datos_vehiculo.get("capacidad", "")
+    _capacidad_pax = str(datos_vehiculo.get("capacidad", "") or "").strip()
+    exportar["D41"] = "" if _capacidad_pax in ("", "0") else _capacidad_pax
     exportar["D42"] = datos_vehiculo.get("vin", "")
     exportar["D43"] = "SI" if datos_vehiculo.get("gravamenes_propiedad") else "NO"
     exportar["D44"] = datos_vehiculo.get("fecha_matricula_inicial", "")
