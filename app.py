@@ -1086,9 +1086,32 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
         )
         page = context.new_page()
 
+        # Los proxies residenciales rotan a una IP distinta (de una
+        # persona real) en cada conexion nueva -- algunas de esas IPs
+        # fallan o estan desconectadas, sin que eso signifique que el
+        # proxy este mal configurado. Si la PRIMERA carga de pagina falla
+        # por el tunel del proxy, se cierra el contexto y se abre uno
+        # NUEVO (que debería tocar una IP distinta al azar), hasta 3
+        # veces, antes de rendirse.
+        ERRORES_TUNEL_PROXY = ("ERR_TUNNEL_CONNECTION_FAILED", "ERR_PROXY_CONNECTION_FAILED", "ERR_PROXY_AUTH_UNSUPPORTED")
+        for intento_proxy in range(3):
+            try:
+                page.goto(MEDELLIN_INICIO_SESION_URL, wait_until="load", timeout=45000)
+                break  # la pagina cargo bien, no hace falta reintentar
+            except Exception as e_goto_inicial:
+                if proxy_config and any(err in str(e_goto_inicial) for err in ERRORES_TUNEL_PROXY) and intento_proxy < 2:
+                    print(f"{etiqueta} Fallo el tunel del proxy (intento {intento_proxy+1}/3) -- probando con una IP nueva...", flush=True)
+                    context.close()
+                    context = browser.new_context(
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                        viewport={"width": 1366, "height": 900},
+                        proxy=proxy_config,
+                    )
+                    page = context.new_page()
+                    continue
+                raise  # no es un error de tunel, o ya se agotaron los intentos -- se deja que falle normal
+
         try:
-            # 1. Cargar la pagina de inicio de sesion primero.
-            page.goto(MEDELLIN_INICIO_SESION_URL, wait_until="load", timeout=45000)
             page.wait_for_timeout(2000)
 
             # 2. Login -- OJO: el login real del sitio es un ENVIO DE
@@ -6520,6 +6543,34 @@ def medellin_activar_cuenta_endpoint():
 
     threading.Thread(target=ejecutar, daemon=True).start()
     return jsonify({"job_id": job_id})
+
+
+@app.route("/diagnostico-proxy-iproyal", methods=["GET"])
+def diagnostico_proxy_iproyal_endpoint():
+    """Endpoint TEMPORAL de diagnostico -- corre exactamente el comando
+    curl que pidio el soporte de IPRoyal, directo desde el servidor de
+    Railway, para descartar si el problema es de Playwright/Chromium o
+    de la conexion misma entre Railway y el proxy."""
+    if not (IPROYAL_USER and IPROYAL_PASS):
+        return jsonify({"error": "Faltan las credenciales de IPRoyal en las variables de entorno."}), 400
+
+    proxy_url = f"http://{IPROYAL_USER}:{IPROYAL_PASS}@{IPROYAL_HOST}:{IPROYAL_PORT}"
+    try:
+        resultado = subprocess.run(
+            ["curl", "-v", "--proxy", proxy_url, "--max-time", "30",
+             "https://www.medellin.gov.co/portal-movilidad/index.html"],
+            capture_output=True, text=True, timeout=35
+        )
+        return jsonify({
+            "ok": True,
+            "codigo_salida": resultado.returncode,
+            "salida_estandar": resultado.stdout[-2000:],
+            "salida_error_detallada": resultado.stderr[-4000:],
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "error": "Timeout -- el comando tardo mas de 35 segundos sin responder."}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/medellin-activar-cuenta-directo", methods=["GET"])
