@@ -425,7 +425,13 @@ def medellin_crear_usuario(datos):
                 pass
         page.on("response", _capturar_peticion)
 
-        try:
+        MAX_INTENTOS_COMPLETOS = 3  # si el formulario se queda pegado, se recarga la pagina y se vuelve a llenar todo desde cero, hasta esta cantidad de veces
+        for intento_completo in range(MAX_INTENTOS_COMPLETOS):
+          try:
+            if intento_completo > 0:
+                print(f"{etiqueta} *** Reintento completo {intento_completo+1}/{MAX_INTENTOS_COMPLETOS}: recargando la pagina y llenando el formulario desde cero...", flush=True)
+                peticiones_capturadas.clear()
+
             page.goto(MEDELLIN_REGISTRO_URL, wait_until="load", timeout=60000)
             page.wait_for_timeout(2000)
 
@@ -623,7 +629,7 @@ def medellin_crear_usuario(datos):
             # reintenta con esperas cada vez mas largas.
             page.wait_for_timeout(2000)  # dar tiempo de sobra a que termine de asentarse la validacion de todos los campos
             contenido_antes_siguiente = page.inner_text("body")
-            esperas_reintento = [3000, 5000, 8000]  # cada vuelta espera un poco mas que la anterior
+            esperas_reintento = [3000, 5000, 8000]  # reintentos rapidos aqui -- si esto no alcanza, se recarga TODO desde cero (ver mas abajo)
             for intento_siguiente, espera_ms in enumerate(esperas_reintento):
                 if page.locator("#inpBtnNext").count() == 0:
                     print(f"{etiqueta} El boton 'Siguiente' ya no existe -- la pagina avanzo.", flush=True)
@@ -639,7 +645,10 @@ def medellin_crear_usuario(datos):
                     break
                 print(f"{etiqueta} Clic en Siguiente NO parece haber avanzado (intento {intento_siguiente+1}/{len(esperas_reintento)}, espero {espera_ms}ms), reintentando...", flush=True)
             else:
-                print(f"{etiqueta} *** Clic en Siguiente no avanzo despues de {len(esperas_reintento)} intentos -- se continua de todas formas.", flush=True)
+                if intento_completo < MAX_INTENTOS_COMPLETOS - 1:
+                    print(f"{etiqueta} *** Clic en Siguiente no avanzo despues de {len(esperas_reintento)} intentos -- se recarga la pagina y se reintenta el registro COMPLETO desde cero.", flush=True)
+                    continue
+                print(f"{etiqueta} *** Clic en Siguiente no avanzo despues de {len(esperas_reintento)} intentos, y ya se agotaron los {MAX_INTENTOS_COMPLETOS} reintentos completos -- se continua de todas formas.", flush=True)
 
             # DIAGNOSTICO -- que paso despues de dar clic en Siguiente
             # (puede ser un segundo paso del formulario, un mensaje de
@@ -835,8 +844,9 @@ def medellin_crear_usuario(datos):
 
             resultado["exito"] = True
             resultado["mensaje"] = "Formulario enviado -- revisa los logs para confirmar el resultado real (puede haber un tercer paso)."
+            break  # exito -- no hace falta reintentar el registro completo de nuevo
 
-        except Exception as e:
+          except Exception as e:
             print(f"{etiqueta} Error en el flujo de Playwright para registro Medellin: {e}", flush=True)
             resultado["mensaje"] = str(e)
             try:
@@ -844,8 +854,14 @@ def medellin_crear_usuario(datos):
                 print(etiqueta, page.inner_text("body")[:2000], flush=True)
             except Exception:
                 pass
-        finally:
-            context.close(); browser.close()
+            if intento_completo < MAX_INTENTOS_COMPLETOS - 1:
+                print(f"{etiqueta} *** Se reintenta el registro completo desde cero tras este error.", flush=True)
+                continue
+        # El navegador se cierra UNA sola vez, despues de todos los
+        # intentos completos (no dentro del bucle, para no cerrarlo a
+        # mitad de un reintento -- "continue" adentro del bucle deja el
+        # mismo navegador/pagina abiertos para el siguiente intento).
+        context.close(); browser.close()
 
     return resultado
 
