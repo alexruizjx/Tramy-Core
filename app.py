@@ -2564,9 +2564,15 @@ def _extraer_tarjetas_runt(page):
                 });
                 card.querySelectorAll('div.col-12').forEach(div => {
                     const labs = div.querySelectorAll('label');
-                    if (labs.length >= 2) {
-                        const label = labs[0].innerText.replace(/:\\s*$/, '').trim();
-                        const value = labs[1].innerText.trim();
+                    // Se procesan de a PARES (0,1) (2,3) (4,5)... -- antes
+                    // solo se tomaba el primer par (indices 0 y 1) y se
+                    // ignoraban los demas, lo que mezclaba los valores
+                    // cuando habia varios campos parecidos juntos en el
+                    // mismo bloque (ej. 'Capacidad Pasajeros Sentados' y
+                    // 'Capacidad de Pasajeros' uno al lado del otro).
+                    for (let i = 0; i + 1 < labs.length; i += 2) {
+                        const label = labs[i].innerText.replace(/:\\s*$/, '').trim();
+                        const value = labs[i + 1].innerText.trim();
                         if (label) campos[label] = value;
                     }
                 });
