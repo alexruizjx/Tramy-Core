@@ -3218,30 +3218,85 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         alto_actual = hoja.row_dimensions[fila].height or 15
         hoja.row_dimensions[fila].height = max(alto_actual, 30)
 
-    # Los datos de personas (asesor/propietario/comprador, filas 3-22) no
-    # se llenan por ahora -- se dejan en blanco en vez de la formula
-    # original, para que no aparezca "Err:507" en el documento (la
-    # formula VLOOKUP falla sin un valor de busqueda valido).
-    for fila in list(range(3, 7)) + list(range(8, 15)) + list(range(16, 23)):
-        celda_d = exportar.cell(row=fila, column=4)  # columna D
-        celda_d.value = ""
-        celda_d.number_format = "General"  # algunas (ej. telefono/documento) tienen formato "0", que muestra "0" en vez de vacio
-        celda_g = exportar.cell(row=fila, column=7)  # columna G (el "otro" propietario/comprador)
-        celda_g.value = ""
-        celda_g.number_format = "General"
+    # Datos de personas (asesor/propietario/comprador) -- si se
+    # proporcionan (como dict con nombres/apellido/segundo_apellido/
+    # numero_documento/direccion/ciudad/telefono), se escriben DIRECTO en
+    # las celdas del documento -- igual que con los datos del vehiculo,
+    # se evita depender de la formula VLOOKUP (que ademas en la
+    # plantilla busca por NOMBRE, no por documento, lo cual es fragil).
+    # Si no se proporciona una persona para un rol, ese bloque queda en
+    # blanco (comportamiento anterior).
+    def _escribir_bloque_persona(fila_nombres, con_direccion, persona, columna=4):
+        p = persona or {}
+        filas_campos = [
+            (fila_nombres,     (p.get("nombres") or "")),
+            (fila_nombres + 1, (p.get("apellido") or "")),
+            (fila_nombres + 2, (p.get("segundo_apellido") or "")),
+            (fila_nombres + 3, (p.get("numero_documento") or "")),
+        ]
+        if con_direccion:
+            filas_campos += [
+                (fila_nombres + 4, (p.get("direccion") or "")),
+                (fila_nombres + 5, (p.get("ciudad") or "")),
+                (fila_nombres + 6, (p.get("telefono") or "")),
+            ]
+        for fila, valor in filas_campos:
+            celda = exportar.cell(row=fila, column=columna)
+            celda.value = valor
+            celda.number_format = "General"
+
+    _escribir_bloque_persona(3, con_direccion=False, persona=datos_vehiculo.get("asesor"), columna=4)
+    _escribir_bloque_persona(8, con_direccion=True, persona=datos_vehiculo.get("propietario"), columna=4)
+    _escribir_bloque_persona(8, con_direccion=True, persona=datos_vehiculo.get("otro_propietario"), columna=7)
+    _escribir_bloque_persona(16, con_direccion=True, persona=datos_vehiculo.get("comprador"), columna=4)
+    _escribir_bloque_persona(16, con_direccion=True, persona=datos_vehiculo.get("otro_comprador"), columna=7)
 
     # Las celdas DENTRO del documento (no en EXPORTAR) que muestran estos
     # datos de personas dependen de que LibreOffice recalcule su formula
     # al convertir a PDF -- eso no siempre pasa de forma confiable (igual
-    # que con el caso de "traslado" en FORMULARIO), asi que se escribe el
-    # valor vacio DIRECTAMENTE en la celda que se ve, en vez de confiar en
-    # que la formula se vuelva a calcular. Tambien se resetea el formato,
-    # por si tenia un formato numerico tipo "0" que fuerce a mostrar cero.
+    # que con el caso de "traslado" en FORMULARIO). Para los roles que
+    # SI tienen persona asignada, se confia en el recalculo normal (la
+    # celda de EXPORTAR ya tiene texto real, no vacio, asi que no debería
+    # dar el problema del "0"). Para los roles que quedaron SIN persona,
+    # se sigue escribiendo vacio directo en la celda que se ve, como
+    # antes, para que no aparezca "0".
+    rangos_por_rol = [
+        (3, 6, [4], datos_vehiculo.get("asesor")),
+        (8, 14, [4], datos_vehiculo.get("propietario")),
+        (8, 14, [7], datos_vehiculo.get("otro_propietario")),
+        (16, 22, [4], datos_vehiculo.get("comprador")),
+        (16, 22, [7], datos_vehiculo.get("otro_comprador")),
+    ]
+    filas_sin_persona = set()
+    for fila_ini, fila_fin, columnas, persona in rangos_por_rol:
+        if not persona:  # rol sin persona asignada -- sus filas quedan candidatas a vaciar
+            for f in range(fila_ini, fila_fin + 1):
+                for c in columnas:
+                    filas_sin_persona.add((f, c))
+
+    def _fila_columna_de_referencia_exportar(texto_formula):
+        """Extrae (fila, columna) de una referencia tipo 'EXPORTAR!D9' o
+        'EXPORTAR!$G$14' -- para saber si esa referencia cae en un rol
+        sin persona asignada."""
+        m = re.search(r"EXPORTAR!\$?([A-Z]+)\$?([0-9]+)", texto_formula)
+        if not m:
+            return None
+        col_letra, fila_texto = m.group(1), m.group(2)
+        return (int(fila_texto), _openpyxl.utils.column_index_from_string(col_letra))
+
     filas_persona_regex = re.compile(r"EXPORTAR!\$?D\$?([3-9]|1[0-9]|2[0-2]|24|51)\b")
     celdas_vaciadas = set()  # coordenadas (ej. "D5") que se dejaron vacias en esta pasada
     for row in hoja.iter_rows():
         for cell in row:
-            if isinstance(cell.value, str) and filas_persona_regex.search(cell.value):
+            if not isinstance(cell.value, str):
+                continue
+            ref = _fila_columna_de_referencia_exportar(cell.value)
+            es_referencia_persona = ref is not None and (
+                (3 <= ref[0] <= 6) or (8 <= ref[0] <= 14) or (16 <= ref[0] <= 22)
+            )
+            if es_referencia_persona and ref not in filas_sin_persona:
+                continue  # este rol SI tiene persona -- se deja que la formula muestre el dato real
+            if es_referencia_persona or filas_persona_regex.search(cell.value):
                 celdas_vaciadas.add(cell.coordinate)
                 try:
                     cell.value = ""
@@ -3302,13 +3357,34 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
                 pass
             hoja[celda_fija].fill = sin_relleno
 
+        # CELDAS_REFERENCIA_SIMPLE espera claves "planas" (ej.
+        # "propietario_nombres"), mientras que el resto de esta funcion
+        # recibe los datos de personas como diccionarios (ej.
+        # datos_vehiculo["propietario"] = {"nombres": ..., ...}) -- se
+        # traduce de un formato al otro aqui, solo para FORMULARIO.
+        for _rol, _prefijo in (("propietario", "propietario"), ("comprador", "comprador")):
+            _persona_rol = datos_vehiculo.get(_rol)
+            if _persona_rol:
+                datos_vehiculo[f"{_prefijo}_nombres"] = _persona_rol.get("nombres", "")
+                datos_vehiculo[f"{_prefijo}_primer_apellido"] = _persona_rol.get("apellido", "")
+                datos_vehiculo[f"{_prefijo}_segundo_apellido"] = _persona_rol.get("segundo_apellido", "")
+                datos_vehiculo[f"{_prefijo}_documento"] = _persona_rol.get("numero_documento", "")
+                datos_vehiculo[f"{_prefijo}_direccion"] = _persona_rol.get("direccion", "")
+                datos_vehiculo[f"{_prefijo}_ciudad"] = _persona_rol.get("ciudad", "")
+                datos_vehiculo[f"{_prefijo}_telefono"] = _persona_rol.get("telefono", "")
+
         # Igual que generar_fun: las celdas de "referencia simple" (que
         # no son formulas de EXPORTAR, sino texto/numero directo, como
         # documento/telefono del propietario y comprador) tambien deben
         # quedar en blanco cuando no hay ese dato -- si no, algunas
         # aparecen como "0" en vez de vacio.
         for celda, clave in CELDAS_REFERENCIA_SIMPLE.items():
-            if not datos_vehiculo.get(clave):
+            if datos_vehiculo.get(clave):
+                try:
+                    hoja[celda] = datos_vehiculo[clave]
+                except Exception:
+                    pass
+            else:
                 try:
                     hoja[celda] = ""
                 except Exception:
@@ -6193,6 +6269,82 @@ def generar_fun_endpoint():
     except Exception as e:
         import traceback
         print(traceback.format_exc(), flush=True)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/personas-buscar", methods=["GET"])
+def personas_buscar_endpoint():
+    """Busca personas por nombre o numero de documento (coincidencia
+    parcial) -- para el selector de Asesor/Propietario/Comprador al
+    generar un documento. Sin parametro 'q', devuelve las mas recientes."""
+    consulta = request.args.get("q", "").strip()
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        if consulta:
+            patron = f"%{consulta}%"
+            cur.execute("""
+                SELECT id, nombres, apellido, segundo_apellido, tipo_documento, numero_documento,
+                       direccion, ciudad, telefono, email
+                FROM personas
+                WHERE numero_documento ILIKE %s OR nombres ILIKE %s OR apellido ILIKE %s
+                ORDER BY actualizado_en DESC LIMIT 20
+            """, (patron, patron, patron))
+        else:
+            cur.execute("""
+                SELECT id, nombres, apellido, segundo_apellido, tipo_documento, numero_documento,
+                       direccion, ciudad, telefono, email
+                FROM personas ORDER BY actualizado_en DESC LIMIT 20
+            """)
+        filas = cur.fetchall()
+        cur.close(); conn.close()
+        personas = [{
+            "id": f[0], "nombres": f[1], "apellido": f[2], "segundo_apellido": f[3],
+            "tipo_documento": f[4], "numero_documento": f[5], "direccion": f[6],
+            "ciudad": f[7], "telefono": f[8], "email": f[9],
+        } for f in filas]
+        return jsonify({"ok": True, "personas": personas})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/personas-guardar", methods=["POST"])
+def personas_guardar_endpoint():
+    """Crea o actualiza una persona -- si ya existe alguien con ese
+    numero de documento, se actualizan sus datos (no se duplica)."""
+    datos = request.get_json(silent=True) or {}
+    numero_documento = (datos.get("numero_documento") or "").strip()
+    nombres = (datos.get("nombres") or "").strip()
+    if not numero_documento or not nombres:
+        return jsonify({"ok": False, "error": "Faltan nombres o número de documento."}), 400
+
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO personas (nombres, apellido, segundo_apellido, tipo_documento, numero_documento,
+                                   direccion, ciudad, telefono, email, notas, actualizado_en)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (numero_documento) DO UPDATE SET
+                nombres = EXCLUDED.nombres, apellido = EXCLUDED.apellido,
+                segundo_apellido = EXCLUDED.segundo_apellido, tipo_documento = EXCLUDED.tipo_documento,
+                direccion = EXCLUDED.direccion, ciudad = EXCLUDED.ciudad,
+                telefono = EXCLUDED.telefono, email = EXCLUDED.email,
+                notas = EXCLUDED.notas, actualizado_en = NOW()
+            RETURNING id
+        """, (
+            nombres.upper(), (datos.get("apellido") or "").strip().upper(),
+            (datos.get("segundo_apellido") or "").strip().upper(),
+            (datos.get("tipo_documento") or "CC").strip(), numero_documento,
+            (datos.get("direccion") or "").strip(), (datos.get("ciudad") or "").strip().upper(),
+            (datos.get("telefono") or "").strip(), (datos.get("email") or "").strip(),
+            (datos.get("notas") or "").strip(),
+        ))
+        persona_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close(); conn.close()
+        return jsonify({"ok": True, "id": persona_id})
+    except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
