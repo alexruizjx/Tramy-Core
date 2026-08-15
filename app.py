@@ -928,17 +928,32 @@ def medellin_leer_credenciales_temporales(email_cuenta, password_app_email, cedu
     return None, None
 
 
-def medellin_activar_cuenta(usuario_temporal, password_temporal, nueva_password):
+def medellin_activar_cuenta(usuario_temporal, password_temporal, nueva_password, usar_proxy=False):
     """Inicia sesion con las credenciales TEMPORALES que manda el correo
     de activacion, y completa el cambio de contraseña obligatorio que
     pide el sitio la primera vez. Reutiliza el mismo patron de login
-    real por Playwright que ya usamos para revisar citas."""
+    real por Playwright que ya usamos para revisar citas.
+    'usar_proxy': si es True, la conexion pasa por el proxy residencial
+    de IPRoyal en vez de la IP fija del servidor -- util porque el sitio
+    de Medellin ha bloqueado esa IP fija varias veces por exceso de
+    peticiones."""
     etiqueta = f"[MEDELLIN-ACTIVAR-{uuid.uuid4().hex[:6]}]"
     resultado = {"exito": False, "mensaje": ""}
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
-        context = browser.new_context()
+        proxy_config = None
+        if usar_proxy:
+            if IPROYAL_USER and IPROYAL_PASS:
+                proxy_config = {
+                    "server": f"http://{IPROYAL_HOST}:{IPROYAL_PORT}",
+                    "username": IPROYAL_USER,
+                    "password": IPROYAL_PASS,
+                }
+                print(f"{etiqueta} Usando proxy residencial de IPRoyal para esta consulta.", flush=True)
+            else:
+                print(f"{etiqueta} *** ALERTA: se pidio usar el proxy, pero faltan las credenciales de IPRoyal en las variables de entorno (IPROYAL_USER/IPROYAL_PASS) -- esta consulta va SIN proxy, usando la IP normal del servidor.", flush=True)
+        context = browser.new_context(proxy=proxy_config)
         page = context.new_page()
 
         try:
@@ -6465,7 +6480,7 @@ def medellin_activar_cuenta_endpoint():
                 job_error(job_id, "No se encontró el correo de activación a tiempo (esperó 5 minutos).")
                 return
             job_actualizar(job_id, "Correo encontrado, iniciando sesión con credenciales temporales...", "procesando")
-            resultado = medellin_activar_cuenta(usuario_temp, password_temp, nueva_password)
+            resultado = medellin_activar_cuenta(usuario_temp, password_temp, nueva_password, usar_proxy=True)
             job_terminar(job_id, resultado)
         except Exception as e:
             import traceback
@@ -6499,7 +6514,7 @@ def medellin_activar_cuenta_directo_endpoint():
 
     def ejecutar():
         try:
-            resultado = medellin_activar_cuenta(usuario_temporal, password_temporal, nueva_password)
+            resultado = medellin_activar_cuenta(usuario_temporal, password_temporal, nueva_password, usar_proxy=True)
             job_terminar(job_id, resultado)
         except Exception as e:
             import traceback
