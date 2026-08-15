@@ -2621,6 +2621,12 @@ def _parsear_resultado_runt_vehiculo(page):
 
     plano_lower = {k.lower(): v for k, v in plano.items()}
 
+    print(f"=== DIAGNOSTICO RUNT: campos relacionados a capacidad/pasajeros ===", flush=True)
+    for k, v in plano.items():
+        if "capacidad" in k.lower() or "pasajer" in k.lower() or "pax" in k.lower():
+            print(f"  '{k}' = '{v}'", flush=True)
+    print(f"=== FIN DIAGNOSTICO capacidad ===", flush=True)
+
     def campo(nombre):
         return plano_lower.get(nombre.lower(), "")
 
@@ -3125,14 +3131,40 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     # que la formula se vuelva a calcular. Tambien se resetea el formato,
     # por si tenia un formato numerico tipo "0" que fuerce a mostrar cero.
     filas_persona_regex = re.compile(r"EXPORTAR!\$?D\$?([3-9]|1[0-9]|2[0-2]|24|51)\b")
+    celdas_vaciadas = set()  # coordenadas (ej. "D5") que se dejaron vacias en esta pasada
     for row in hoja.iter_rows():
         for cell in row:
             if isinstance(cell.value, str) and filas_persona_regex.search(cell.value):
+                celdas_vaciadas.add(cell.coordinate)
                 try:
                     cell.value = ""
                 except AttributeError:
                     pass  # celda combinada -- no se puede escribir directo, se deja como esta
                 cell.number_format = "General"
+
+    # Algunas celdas no referencian EXPORTAR directamente, sino OTRA
+    # celda de la misma hoja que a su vez si referencia EXPORTAR (ej.
+    # "=D5", donde D5 es una de las celdas que se acaba de vaciar arriba)
+    # -- se repite unas cuantas vueltas para seguir esas cadenas, por si
+    # hay mas de un nivel (una celda que referencia a otra que
+    # referencia a otra).
+    referencia_local_regex = re.compile(r"^=\$?([A-Z]{1,3})\$?([0-9]+)$")
+    for _ in range(3):
+        nuevas = set()
+        for row in hoja.iter_rows():
+            for cell in row:
+                if isinstance(cell.value, str):
+                    m = referencia_local_regex.match(cell.value.strip())
+                    if m and m.group(1) + m.group(2) in celdas_vaciadas and cell.coordinate not in celdas_vaciadas:
+                        try:
+                            cell.value = ""
+                        except AttributeError:
+                            pass
+                        cell.number_format = "General"
+                        nuevas.add(cell.coordinate)
+        if not nuevas:
+            break
+        celdas_vaciadas |= nuevas
 
     # Las 3 hojas de FORMULARIO tienen casillas que se resaltan en verde
     # segun el tramite/clase/combustible/servicio del vehiculo. Primero
