@@ -2630,6 +2630,19 @@ def _parsear_resultado_runt_vehiculo(page):
     def campo(nombre):
         return plano_lower.get(nombre.lower(), "")
 
+    def campo_primero_valido(*nombres):
+        """Prueba varios nombres de campo en orden, y devuelve el primero
+        que tenga un valor real (ni vacio ni '0') -- por ejemplo, en el
+        RUNT 'Pasajeros Sentados' trae el dato real (ej. '4'), mientras
+        que 'Capacidad de Pasajeros' casi siempre viene en '0' aunque el
+        vehiculo si tenga capacidad -- sin este orden de prioridad, el
+        '0' se quedaba primero y tapaba el dato bueno."""
+        for nombre in nombres:
+            valor = campo(nombre)
+            if valor and valor.strip() != "0":
+                return valor
+        return ""
+
     datos = {
         "marca": campo("Marca"),
         "linea": campo("Línea"),
@@ -2648,7 +2661,7 @@ def _parsear_resultado_runt_vehiculo(page):
         "puertas": campo("Puertas"),
         "capacidad_carga": campo("Capacidad de Carga"),
         "peso_bruto_vehicular": campo("Peso Bruto Vehicular"),
-        "capacidad_pasajeros": campo("Capacidad Pax Sentados") or campo("Capacidad de Pasajeros"),
+        "capacidad_pasajeros": campo_primero_valido("Pasajeros Sentados", "Capacidad Pax Sentados", "Capacidad de Pasajeros"),
         "numero_ejes": campo("Número de Ejes"),
         "estado_vehiculo": campo("Estado del vehículo"),
         "gravamenes_propiedad": campo("Gravámenes a la propiedad").upper() == "SI",
