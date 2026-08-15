@@ -3101,6 +3101,25 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     exportar["D42"] = datos_vehiculo.get("vin", "")
     exportar["D43"] = "SI" if datos_vehiculo.get("gravamenes_propiedad") else "NO"
     exportar["D44"] = datos_vehiculo.get("fecha_matricula_inicial", "")
+
+    # Casilla "1. ORGANISMO DE TRANSITO" / "NOMBRE" -- solo existe en los
+    # 3 Formularios, en la celda AC2 (junto a la etiqueta "NOMBRE" en
+    # AA2). Se escribe directo (no via EXPORTAR) porque esta celda no
+    # tenia ninguna formula/referencia en la plantilla original.
+    if nombre_hoja in ("FORMULARIO", "FORMULARIO (2)", "FORMULARIO (3)"):
+        hoja["AC2"] = datos_vehiculo.get("autoridad_transito", "")
+
+    # Afirmacion de Traspaso tiene una celda con la fecha de hoy
+    # (=TODAY()) que LibreOffice muestra en INGLES (ej. "15-August-2026")
+    # porque no usa la configuracion regional en español -- se escribe
+    # directo el texto ya formateado en español, y se centra (la
+    # plantilla la traia alineada a la izquierda).
+    if nombre_hoja == "AFIRMACION":
+        _meses_es = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
+                     "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+        _hoy = datetime.now()
+        hoja["F8"] = f"{_hoy.day}-{_meses_es[_hoy.month - 1]}-{_hoy.year}"
+        hoja["F8"].alignment = Alignment(horizontal="center", vertical=hoja["F8"].alignment.vertical)
     exportar["D51"] = ""  # traslado_municipio -- vacio explicito, si no la formula '=EXPORTAR!D51' en FORMULARIO muestra "0" (una celda totalmente vacia, sin ni siquiera comillas vacias, se lee como cero en una referencia directa)
     exportar["D24"] = ""  # precio -- la plantilla trae un valor de prueba guardado (9.000.000); se deja vacio para que se llene a mano en el documento impreso
     exportar["D24"].number_format = "General"
