@@ -372,7 +372,7 @@ MEDELLIN_TIPO_IDENTIFICACION = {
 MEDELLIN_GENERO = {"Masculino": "m", "Femenino": "f", "Otro": "o"}
 
 
-def medellin_crear_usuario(datos):
+def medellin_crear_usuario(datos, usar_proxy=True):
     """Crea un usuario nuevo en el portal 'Movilidad en Linea' de la
     Alcaldia de Medellin (formulario de auto-registro). Los selectores
     estan confirmados con el HTML real del formulario (no son una
@@ -381,7 +381,10 @@ def medellin_crear_usuario(datos):
     numero_identificacion, nombre, apellidos, genero, email, direccion,
     telefono (todos como texto, tal como se ven en el formulario).
     Pais/Departamento/Ciudad se dejan en su valor por defecto (Colombia/
-    Antioquia/Medellin), que ya vienen preseleccionados."""
+    Antioquia/Medellin), que ya vienen preseleccionados.
+    'usar_proxy' (True por defecto): el sitio de Medellin ha bloqueado la
+    IP fija del servidor varias veces por exceso de peticiones -- se usa
+    el proxy residencial de IPRoyal por defecto para evitarlo."""
     resultado = {"exito": False, "mensaje": ""}
     etiqueta = f"[MEDELLIN-{uuid.uuid4().hex[:6]}]"  # para poder filtrar SOLO estos logs entre los de otros procesos concurrentes
 
@@ -390,9 +393,21 @@ def medellin_crear_usuario(datos):
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
             "--single-process", "--no-zygote", "--disable-setuid-sandbox"
         ])
+        proxy_config = None
+        if usar_proxy:
+            if IPROYAL_USER and IPROYAL_PASS:
+                proxy_config = {
+                    "server": f"http://{IPROYAL_HOST}:{IPROYAL_PORT}",
+                    "username": IPROYAL_USER,
+                    "password": IPROYAL_PASS,
+                }
+                print(f"{etiqueta} Usando proxy residencial de IPRoyal para este registro.", flush=True)
+            else:
+                print(f"{etiqueta} *** ALERTA: se pidio usar el proxy, pero faltan las credenciales de IPRoyal en las variables de entorno (IPROYAL_USER/IPROYAL_PASS) -- este registro va SIN proxy, usando la IP normal del servidor.", flush=True)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
             viewport={"width": 1366, "height": 900},
+            proxy=proxy_config,
         )
         page = context.new_page()
 
