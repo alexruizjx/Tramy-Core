@@ -1857,6 +1857,35 @@ def envigado_reservar_cita(solicitud):
 
             # --- Elegir la fecha en el datepicker ---
             respuestas_capturadas.pop("getHorasDisponibles", None)
+
+            # PRIMER INTENTO: hacer clic en el campo para abrir el
+            # calendario visual -- muchos widgets de este tipo (sobre
+            # todo los mas viejos, tipo bootstrap-datepicker) solo
+            # disparan la consulta de horas cuando se hace clic en el
+            # DIA dentro del calendario emergente, no con solo escribir
+            # texto en el input.
+            try:
+                page.click('#agendarCitaDatePicker', timeout=5000)
+                page.wait_for_timeout(800)
+                estructura_calendario = page.evaluate("""() => {
+                    var selectores = ['.datepicker', '.ui-datepicker', '.mat-calendar', '[class*="calendar"]', '[class*="datepicker"]'];
+                    var resultado = [];
+                    selectores.forEach(function(sel){
+                        document.querySelectorAll(sel).forEach(function(elCal){
+                            if (elCal.offsetWidth || elCal.offsetHeight || elCal.getClientRects().length) {
+                                resultado.push({selector: sel, id: elCal.id || null, clase: elCal.className || null, html_recortado: elCal.outerHTML.substring(0, 1500)});
+                            }
+                        });
+                    });
+                    return resultado;
+                }""")
+                print(f"{etiqueta} === DIAGNOSTICO: estructura del calendario tras hacer clic en el datepicker ===", flush=True)
+                for c in estructura_calendario:
+                    print(f"{etiqueta} {c}", flush=True)
+                print(f"{etiqueta} === FIN DIAGNOSTICO calendario ===", flush=True)
+            except Exception as e_click_dp:
+                print(f"{etiqueta} No se pudo hacer clic en el datepicker: {e_click_dp}", flush=True)
+
             # Se usa page.fill() (escritura real, caracter por caracter)
             # en vez de solo asignar .value por JS -- muchos widgets de
             # calendario (Angular Material y similares) no reaccionan
