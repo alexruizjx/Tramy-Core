@@ -2231,6 +2231,16 @@ def envigado_reservar_cita(solicitud):
             # agendarCitaGAComponentes (el endpoint real de confirmacion,
             # ya venia previsto en _capturar_respuesta) para saber si
             # salio bien y obtener el numero de atencion. ---
+            resultado["capturas"] = {}
+
+            captura_antes = f"{etiqueta.strip('[]')}_1_antes_confirmar.png"
+            try:
+                page.screenshot(path=os.path.join(CAPTURAS_ENVIGADO_DIR, captura_antes), full_page=True)
+                resultado["capturas"]["antes_confirmar"] = captura_antes
+                print(f"{etiqueta} Captura guardada: {captura_antes}", flush=True)
+            except Exception as e_cap1:
+                print(f"{etiqueta} No se pudo tomar captura antes de confirmar: {e_cap1}", flush=True)
+
             respuestas_capturadas.pop("agendarCitaGAComponentes", None)
             print(f"{etiqueta} Haciendo clic en 'Confirmar cita' -- ESTO RESERVA LA CITA DE VERDAD...", flush=True)
             try:
@@ -2247,10 +2257,40 @@ def envigado_reservar_cita(solicitud):
             respuesta_confirmacion = respuestas_capturadas.get("agendarCitaGAComponentes")
             print(f"{etiqueta} Respuesta de agendarCitaGAComponentes: {respuesta_confirmacion}", flush=True)
 
+            captura_despues = f"{etiqueta.strip('[]')}_2_despues_confirmar.png"
+            try:
+                page.screenshot(path=os.path.join(CAPTURAS_ENVIGADO_DIR, captura_despues), full_page=True)
+                resultado["capturas"]["despues_confirmar"] = captura_despues
+                print(f"{etiqueta} Captura guardada: {captura_despues}", flush=True)
+            except Exception as e_cap2:
+                print(f"{etiqueta} No se pudo tomar captura despues de confirmar: {e_cap2}", flush=True)
+
             try:
                 print(f"{etiqueta} Texto visible de la pagina despues del clic final:", page.inner_text("body")[:2000], flush=True)
             except Exception:
                 pass
+
+            # Si no se capturo la respuesta esperada, se listan TODAS las
+            # peticiones de red vistas justo despues del clic (por si el
+            # endpoint real de confirmacion tiene otro nombre), y
+            # cualquier mensaje de error visible en la pagina.
+            if not respuesta_confirmacion:
+                print(f"{etiqueta} === DIAGNOSTICO: no se capturo la confirmacion -- revisando alternativas ===", flush=True)
+                print(f"{etiqueta} Todas las respuestas capturadas hasta ahora: {list(respuestas_capturadas.keys())}", flush=True)
+                try:
+                    posibles_errores = page.evaluate("""() => {
+                        var resultado = [];
+                        document.querySelectorAll('[class*="error" i], [class*="alert" i], .toast, .swal2-popup, .modal').forEach(function(el){
+                            if (el.offsetWidth || el.offsetHeight || el.getClientRects().length) {
+                                resultado.push({tag: el.tagName, clase: el.className, texto: (el.innerText||'').trim().substring(0, 300)});
+                            }
+                        });
+                        return resultado;
+                    }""")
+                    print(f"{etiqueta} Elementos de error/alerta/modal visibles: {posibles_errores}", flush=True)
+                except Exception as e_err:
+                    print(f"{etiqueta} No se pudieron listar posibles errores: {e_err}", flush=True)
+                print(f"{etiqueta} === FIN DIAGNOSTICO confirmacion ===", flush=True)
 
             if respuesta_confirmacion:
                 # La estructura exacta se confirma con el resultado real
@@ -2267,7 +2307,7 @@ def envigado_reservar_cita(solicitud):
                 resultado["mensaje"] = f"Cita reservada exitosamente para el {fecha_elegida} a las {hora_ini_valor}." + (f" Nro. atencion: {nro_atencion}" if nro_atencion else "")
                 resultado["detalle"] = respuesta_confirmacion
             else:
-                resultado["mensaje"] = "Se hizo clic en 'Confirmar cita' pero no se pudo confirmar el resultado (revisar diagnostico en los logs -- puede que si se haya reservado)."
+                resultado["mensaje"] = "Se hizo clic en 'Confirmar cita' pero no se pudo confirmar el resultado (revisar diagnostico en los logs y las capturas -- puede que si se haya reservado)."
             return resultado
 
         except Exception as e:
@@ -7134,6 +7174,21 @@ def envigado_citas_solicitud_probar_ahora_endpoint():
 
     threading.Thread(target=ejecutar, daemon=True).start()
     return jsonify({"job_id": job_id})
+
+
+@app.route("/envigado-captura", methods=["GET"])
+def envigado_captura_endpoint():
+    """Sirve una captura de pantalla guardada por el flujo de reserva de
+    citas de Envigado (para descargar o ver en el navegador)."""
+    nombre_archivo = request.args.get("nombre", "")
+    # Se valida que sea solo un nombre de archivo simple (sin rutas), para
+    # que no se pueda pedir ningun otro archivo del servidor con esto.
+    if not nombre_archivo or "/" in nombre_archivo or ".." in nombre_archivo:
+        return jsonify({"ok": False, "error": "Nombre de archivo inválido."}), 400
+    ruta_completa = os.path.join(CAPTURAS_ENVIGADO_DIR, nombre_archivo)
+    if not os.path.isfile(ruta_completa):
+        return jsonify({"ok": False, "error": "No se encontró esa captura (puede que el servidor se haya reiniciado desde entonces)."}), 404
+    return send_file(ruta_completa, mimetype="image/png")
 
 
 @app.route("/envigado-citas-disponibles", methods=["GET"])
