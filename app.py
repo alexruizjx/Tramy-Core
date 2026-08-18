@@ -16,7 +16,7 @@ import threading
 import boto3
 from botocore.config import Config
 from datetime import datetime, timedelta, date
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from playwright.sync_api import sync_playwright
 from pypdf import PdfWriter
 from flask_cors import CORS
@@ -1620,6 +1620,11 @@ def envigado_revisar_citas_disponibles(dias_adelante=14):
 
 
 ENVIGADO_RECAPTCHA_SITEKEY = "6LdZ-WUsAAAAAEEs0_PbIzNhEoDTBqV1CwBEE8B-"  # confirmado con un HAR real
+
+# Carpeta temporal donde se guardan las capturas de pantalla del flujo de
+# reserva de citas de Envigado -- se sirven despues via /envigado-captura.
+CAPTURAS_ENVIGADO_DIR = "/tmp/capturas_envigado"
+os.makedirs(CAPTURAS_ENVIGADO_DIR, exist_ok=True)
 
 
 def envigado_reservar_cita(solicitud):
