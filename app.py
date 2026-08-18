@@ -248,6 +248,33 @@ def job_error(job_id, mensaje_error):
 #  CACHE IMPUESTOS ANTIOQUIA
 # ============================================================
 
+def _avaluo_declaracion_mas_reciente(data3):
+    """Devuelve el avaluoComercial de la declaracion MAS RECIENTE
+    (la de mayor vigencia) dentro de listaDetallePagos -- este es el
+    avaluo real que aparece en el certificado (ej. 10.979.000 para la
+    vigencia 2026), a diferencia de estadoCuenta.avaluoComercial, que es
+    un campo GENERAL de la Gobernacion que no siempre coincide con el
+    avaluo de la ultima declaracion presentada (se confirmo con un caso
+    real: el campo general traia $12.639.000 mientras la declaracion
+    2026 real era $10.979.000)."""
+    lista = data3.get("listaDetallePagos", []) or []
+    mejor = None
+    mejor_vigencia = -1
+    for d in lista:
+        try:
+            vig = int(d.get("vigencia", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if vig > mejor_vigencia:
+            mejor_vigencia = vig
+            mejor = d
+    if mejor and mejor.get("avaluoComercial"):
+        return mejor["avaluoComercial"]
+    # Respaldo: si no hay declaraciones (caso raro), se usa el campo
+    # general -- mejor un valor aproximado que nada.
+    return (data3.get("estadoCuenta", {}) or {}).get("avaluoComercial", 0) or 0
+
+
 def cache_antioquia_buscar(placa):
     """Busca PAZ_Y_SALVO en caché para el año actual."""
     try:
@@ -4340,11 +4367,26 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     # texto "El suscrito funcionario..." con el logo justo debajo -- se
     # revierte, la altura original ya tenia un espacio aceptable.
 
-    # "Avaluo para la vigencia" -- se usa directamente el avaluo de la
-    # vigencia actual (viene ya calculado en estadoCuenta), en vez de
-    # depender de la formula original (que buscaba la ultima fila de la
-    # tabla y se rompe si borramos filas despues).
-    edc["AE76"] = _moneda_pys(estado_veh.get("avaluoComercial", 0))
+    # "Avaluo para la vigencia" -- CORREGIDO: se usa el avaluo de la
+    # declaracion MAS RECIENTE (la de mayor vigencia dentro de la tabla
+    # de declaraciones), no estadoCuenta.avaluoComercial -- se confirmo
+    # con un caso real que ese campo general de la Gobernacion puede
+    # traer un valor distinto (de otra referencia) al que realmente
+    # aparece declarado para el año en curso en la propia tabla de este
+    # mismo documento.
+    avaluo_vigencia_actual = None
+    mejor_vigencia_pdf = -1
+    for d in declaraciones:
+        try:
+            vig_d = int(d.get("vigencia", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if vig_d > mejor_vigencia_pdf:
+            mejor_vigencia_pdf = vig_d
+            avaluo_vigencia_actual = d.get("avaluoComercial", 0)
+    if not avaluo_vigencia_actual:
+        avaluo_vigencia_actual = estado_veh.get("avaluoComercial", 0)  # respaldo si no hay declaraciones
+    edc["AE76"] = _moneda_pys(avaluo_vigencia_actual)
 
     # Ocultar las filas vacias sobrantes de ambas tablas (no todas las
     # placas tienen 30 declaraciones ni observaciones). Se OCULTAN en vez
@@ -5549,7 +5591,12 @@ def consultar_antioquia(page, placa, identificacion, tipo_documento_abrev,
 
     estado_veh          = data3.get("estadoCuenta", {})
     vigencias_adeudadas = data3.get("listaVigenciasAdeudas", [])
-    avaluo              = estado_veh.get("avaluoComercial", 0) or 0
+    # Se usa el avaluo de la DECLARACION MAS RECIENTE (ej. la de 2026),
+    # no el campo general estadoCuenta.avaluoComercial -- se confirmo con
+    # un caso real que ese campo general puede traer un valor distinto
+    # (mas viejo o de otra referencia) al avaluo que realmente aparece
+    # declarado para el año en curso.
+    avaluo              = _avaluo_declaracion_mas_reciente(data3)
     print(f"  → Vigencias adeudadas encontradas: {len(vigencias_adeudadas)}")
     if job_id:
         if not vigencias_adeudadas:
@@ -6237,7 +6284,11 @@ def consultar_antioquia_vigencias():
             )
             estado_veh          = data3.get("estadoCuenta", {})
             vigencias_adeudadas = data3.get("listaVigenciasAdeudas", [])
-            avaluo              = estado_veh.get("avaluoComercial", 0) or 0
+            # Se usa el avaluo de la DECLARACION MAS RECIENTE, no el campo
+            # general estadoCuenta.avaluoComercial (ver comentario en
+            # _avaluo_declaracion_mas_reciente para el detalle del caso
+            # real que confirmo esta discrepancia).
+            avaluo              = _avaluo_declaracion_mas_reciente(data3)
             resultado['vigencias']  = vigencias_adeudadas
             resultado['avaluo']     = avaluo
             resultado['estado_veh'] = estado_veh
