@@ -1984,20 +1984,40 @@ def envigado_reservar_cita(solicitud):
                 resultado["mensaje"] = f"No se pudo resolver el reCAPTCHA: {e_captcha}"
                 return resultado
 
-            # Se inyecta el token en el textarea estandar de reCAPTCHA v2,
-            # y se dispara tanto un evento "change" como cualquier
-            # callback configurado en el widget (los sitios que usan
-            # reCAPTCHA normalmente llaman a una funcion via el atributo
-            # "data-callback" del div del widget).
+            # Se inyecta el token en el textarea estandar de reCAPTCHA v2.
+            # Se confirmo con diagnostico real que el sitio tiene un
+            # <div id="widgetReCaptcha"> vacio -- el widget de Google
+            # nunca termino de renderizarse ahi (posiblemente por el
+            # entorno headless/automatizado). No hace falta el widget
+            # visual para que el formulario acepte la respuesta: si el
+            # textarea "g-recaptcha-response" no existe, se CREA
+            # manualmente dentro de ese div (es exactamente lo que el
+            # script de Google crea normalmente al renderizar), y se le
+            # pone el token ahi.
             resultado_inyeccion = page.evaluate(f"""() => {{
-                var resultado = {{ textarea_encontrado: false, callback_llamado: false, callback_nombre: null }};
+                var resultado = {{ textarea_encontrado: false, textarea_creado: false, callback_llamado: false, callback_nombre: null }};
                 var textarea = document.getElementById('g-recaptcha-response');
-                if (textarea) {{
-                    textarea.style.display = 'block';
-                    textarea.value = {json.dumps(token_captcha)};
-                    textarea.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    resultado.textarea_encontrado = true;
+                if (!textarea) {{
+                    var contenedor = document.getElementById('widgetReCaptcha') || document.body;
+                    textarea = document.createElement('textarea');
+                    textarea.id = 'g-recaptcha-response';
+                    textarea.name = 'g-recaptcha-response';
+                    textarea.style.width = '250px';
+                    textarea.style.height = '40px';
+                    textarea.style.border = '1px solid #c1c1c1';
+                    textarea.style.margin = '10px 25px';
+                    textarea.style.padding = '0px';
+                    textarea.style.resize = 'none';
+                    textarea.style.display = 'none';
+                    contenedor.appendChild(textarea);
+                    resultado.textarea_creado = true;
                 }}
+                textarea.style.display = 'block';
+                textarea.value = {json.dumps(token_captcha)};
+                textarea.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                textarea.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                resultado.textarea_encontrado = true;
+
                 var widget = document.querySelector('.g-recaptcha[data-callback], div[data-callback]');
                 if (widget) {{
                     var nombreCallback = widget.getAttribute('data-callback');
