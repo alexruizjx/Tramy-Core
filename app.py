@@ -2126,6 +2126,41 @@ def envigado_reservar_cita(solicitud):
             }""")
             print(f"{etiqueta} Diagnostico directo del boton (atributos y scope): {diagnostico_boton}", flush=True)
 
+            # Confirmado por diagnostico real: el boton usa
+            # ng-disabled="ctrl.isBloquearAgendarCita" -- es una
+            # propiedad del CONTROLADOR (sintaxis "controller as ctrl"),
+            # no del scope raiz directamente. Se pone en false y se
+            # fuerza el digest de nuevo para que Angular actualice el
+            # atributo "disabled" real del boton en el DOM.
+            resultado_forzar_boton = page.evaluate("""() => {
+                var resultado = { ctrl_encontrado: false, valor_anterior: null, valor_nuevo: null, boton_disabled_final: null };
+                var boton = document.getElementById('btnGuardarCita');
+                if (!boton) return resultado;
+                try {
+                    var scope = angular.element(boton).scope();
+                    if (!scope) {
+                        var actual = boton;
+                        while (actual && !scope) {
+                            scope = angular.element(actual).scope();
+                            actual = actual.parentElement;
+                        }
+                    }
+                    if (scope && scope.ctrl) {
+                        resultado.ctrl_encontrado = true;
+                        resultado.valor_anterior = scope.ctrl.isBloquearAgendarCita;
+                        scope.$apply(function() {
+                            scope.ctrl.isBloquearAgendarCita = false;
+                        });
+                        resultado.valor_nuevo = scope.ctrl.isBloquearAgendarCita;
+                    }
+                } catch (e) {
+                    resultado.error = String(e);
+                }
+                resultado.boton_disabled_final = boton.disabled;
+                return resultado;
+            }""")
+            print(f"{etiqueta} Resultado de forzar ctrl.isBloquearAgendarCita a false: {resultado_forzar_boton}", flush=True)
+
             # Si no se encontro el textarea en la pagina principal, puede
             # estar dentro de un iframe (asi renderiza normalmente
             # reCAPTCHA) -- se busca en TODOS los frames de la pagina, y
