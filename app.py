@@ -2010,6 +2010,39 @@ def envigado_reservar_cita(solicitud):
                 return resultado;
             }}""")
             print(f"{etiqueta} Resultado de inyectar el token: {resultado_inyeccion}", flush=True)
+
+            # Si no se encontro el textarea en la pagina principal, puede
+            # estar dentro de un iframe (asi renderiza normalmente
+            # reCAPTCHA) -- se busca en TODOS los frames de la pagina, y
+            # tambien se lista cualquier elemento relacionado a captcha
+            # (iframe con "recaptcha" en el src, cualquier id/clase que
+            # contenga "captcha") para entender la estructura real.
+            if not resultado_inyeccion.get("textarea_encontrado"):
+                print(f"{etiqueta} === DIAGNOSTICO: buscando captcha en iframes ===", flush=True)
+                try:
+                    todos_los_frames = page.frames
+                    print(f"{etiqueta} Cantidad de frames en la pagina: {len(todos_los_frames)}", flush=True)
+                    for f in todos_los_frames:
+                        print(f"{etiqueta} Frame URL: {f.url}", flush=True)
+                except Exception as e_frames:
+                    print(f"{etiqueta} No se pudieron listar los frames: {e_frames}", flush=True)
+                try:
+                    elementos_captcha = page.evaluate("""() => {
+                        var resultado = [];
+                        document.querySelectorAll('[id*="captcha" i], [class*="captcha" i], iframe').forEach(function(el){
+                            resultado.push({
+                                tag: el.tagName, id: el.id || null, clase: el.className || null,
+                                src: el.src || null,
+                                visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+                            });
+                        });
+                        return resultado;
+                    }""")
+                    print(f"{etiqueta} Elementos relacionados a captcha/iframes en la pagina principal: {elementos_captcha}", flush=True)
+                except Exception as e_elcap:
+                    print(f"{etiqueta} No se pudieron listar elementos de captcha: {e_elcap}", flush=True)
+                print(f"{etiqueta} === FIN DIAGNOSTICO captcha ===", flush=True)
+
             page.wait_for_timeout(1500)
 
             # --- DIAGNOSTICO: se detiene ANTES de confirmar la cita de
