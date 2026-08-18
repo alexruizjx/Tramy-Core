@@ -1479,28 +1479,48 @@ def envigado_hay_puntos_disponibles():
 
                 respuestas_capturadas.pop("getFechasDisponibles", None)
                 try:
-                    # Se reintenta hasta 5 veces (con pequenas esperas)
-                    # porque el <select> a veces todavia no tiene sus
-                    # <option> renderizadas por Angular justo cuando
-                    # llega la respuesta de puntos -- si se intenta
-                    # elegir la sede demasiado rapido, el valor se queda
-                    # vacio en silencio (el <option> con ese value aun no
-                    # existe en el DOM).
-                    valor_quedo = None
+                    # Se selecciona por el TEXTO VISIBLE de la opcion
+                    # (nombre de la sede), no por su "value" interno --
+                    # se confirmo con diagnostico real que el <select> de
+                    # Angular no usa el idSubsede puro como value (nunca
+                    # se encontraba una opcion con ese valor exacto,
+                    # aunque el <select> si tenia opciones renderizadas).
+                    # select_option con "label" busca por el texto que ve
+                    # el usuario, evitando ese problema. Se reintenta por
+                    # si las opciones aun no han terminado de renderizarse.
+                    seleccionado_ok = False
                     for intento_sede in range(5):
-                        valor_quedo = page.evaluate(f"""() => {{
-                            var el = document.querySelector('#seleccione_punto_atencion');
-                            if (!el) return null;
-                            var existeOpcion = Array.from(el.options).some(function(o){{ return o.value === '{id_subsede}'; }});
-                            if (!existeOpcion) return '__SIN_OPCION__';
-                            el.value = '{id_subsede}';
-                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                            return el.value;
-                        }}""")
-                        if valor_quedo and valor_quedo not in ('', '__SIN_OPCION__'):
+                        try:
+                            page.select_option('#seleccione_punto_atencion', label=nombre_sede, timeout=2000)
+                            seleccionado_ok = True
                             break
-                        page.wait_for_timeout(500)
-                    print(f"Sede '{nombre_sede}' (idSubsede={id_subsede}) -- valor que quedo en el <select> despues de elegirla: {valor_quedo!r}", flush=True)
+                        except Exception:
+                            page.wait_for_timeout(500)
+                    if not seleccionado_ok:
+                        # Respaldo: el texto exacto no coincidio (puede
+                        # tener espacios/mayusculas distintas) -- se busca
+                        # cualquier <option> cuyo texto CONTENGA el nombre
+                        # de la sede, sin importar mayusculas/espacios.
+                        seleccionado_ok = page.evaluate(f"""() => {{
+                            var el = document.querySelector('#seleccione_punto_atencion');
+                            if (!el) return false;
+                            var buscado = {json.dumps(nombre_sede)}.trim().toLowerCase();
+                            for (var i = 0; i < el.options.length; i++) {{
+                                var texto = (el.options[i].textContent || '').trim().toLowerCase();
+                                if (texto.indexOf(buscado) >= 0 || buscado.indexOf(texto) >= 0) {{
+                                    el.selectedIndex = i;
+                                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                    return true;
+                                }}
+                            }}
+                            return false;
+                        }}""")
+                    print(f"Sede '{nombre_sede}' (idSubsede={id_subsede}) -- se pudo seleccionar por texto: {seleccionado_ok}", flush=True)
+                    if seleccionado_ok:
+                        page.evaluate("""() => {
+                            var el = document.querySelector('#seleccione_punto_atencion');
+                            if (el) el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }""")
                 except Exception as e_sede:
                     print(f"No se pudo seleccionar la sede '{nombre_sede}': {e_sede}", flush=True)
                     continue
@@ -1784,27 +1804,41 @@ def envigado_reservar_cita(solicitud):
             print(f"{etiqueta} Sede elegida: {sede_elegida}", flush=True)
 
             # --- Elegir la sede en el <select> real ---
-            # Se reintenta hasta 5 veces (con pequenas esperas) porque el
-            # <select> a veces todavia no tiene sus <option> renderizadas
-            # por Angular justo cuando llega la respuesta de puntos -- si
-            # se intenta elegir la sede demasiado rapido, el valor se
-            # queda vacio en silencio.
+            # Se selecciona por el TEXTO VISIBLE de la opcion (nombre de
+            # la sede), no por su "value" interno -- se confirmo con
+            # diagnostico real que el <select> de Angular no usa el
+            # idSubsede puro como value.
             id_subsede_elegida = sede_elegida.get("idSubsede")
-            valor_sede_quedo = None
+            nombre_sede_elegida = sede_elegida.get("nombreSubsede") or ""
+            seleccionado_ok = False
             for intento_sede in range(5):
-                valor_sede_quedo = page.evaluate(f"""() => {{
-                    var el = document.querySelector('#seleccione_punto_atencion');
-                    if (!el) return null;
-                    var existeOpcion = Array.from(el.options).some(function(o){{ return o.value === '{id_subsede_elegida}'; }});
-                    if (!existeOpcion) return '__SIN_OPCION__';
-                    el.value = '{id_subsede_elegida}';
-                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    return el.value;
-                }}""")
-                if valor_sede_quedo and valor_sede_quedo not in ('', '__SIN_OPCION__'):
+                try:
+                    page.select_option('#seleccione_punto_atencion', label=nombre_sede_elegida, timeout=2000)
+                    seleccionado_ok = True
                     break
-                page.wait_for_timeout(500)
-            print(f"{etiqueta} Sede -- valor que quedo en el <select>: {valor_sede_quedo!r}", flush=True)
+                except Exception:
+                    page.wait_for_timeout(500)
+            if not seleccionado_ok:
+                seleccionado_ok = page.evaluate(f"""() => {{
+                    var el = document.querySelector('#seleccione_punto_atencion');
+                    if (!el) return false;
+                    var buscado = {json.dumps(nombre_sede_elegida)}.trim().toLowerCase();
+                    for (var i = 0; i < el.options.length; i++) {{
+                        var texto = (el.options[i].textContent || '').trim().toLowerCase();
+                        if (texto.indexOf(buscado) >= 0 || buscado.indexOf(texto) >= 0) {{
+                            el.selectedIndex = i;
+                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            return true;
+                        }}
+                    }}
+                    return false;
+                }}""")
+            if seleccionado_ok:
+                page.evaluate("""() => {
+                    var el = document.querySelector('#seleccione_punto_atencion');
+                    if (el) el.dispatchEvent(new Event('change', { bubbles: true }));
+                }""")
+            print(f"{etiqueta} Sede '{nombre_sede_elegida}' (idSubsede={id_subsede_elegida}) -- se pudo seleccionar por texto: {seleccionado_ok}", flush=True)
             page.wait_for_timeout(1500)
 
             for _ in range(10):
