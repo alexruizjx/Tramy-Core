@@ -316,7 +316,7 @@ def cache_antioquia_eliminar_vigencia(placa, anio):
 
 
 ENVIGADO_CITAS_SEDES = {
-    "Sede Principal": 1,
+    "Sede Principal": 5,  # idSubsede confirmado por log real (antes se tenia 1, incorrecto)
     "City Plaza": 3,
 }
 ENVIGADO_CITAS_ID_SERVICIO = "90"
