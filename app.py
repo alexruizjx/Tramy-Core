@@ -1479,13 +1479,27 @@ def envigado_hay_puntos_disponibles():
 
                 respuestas_capturadas.pop("getFechasDisponibles", None)
                 try:
-                    valor_quedo = page.evaluate(f"""() => {{
-                        var el = document.querySelector('#seleccione_punto_atencion');
-                        if (!el) return null;
-                        el.value = '{id_subsede}';
-                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                        return el.value;
-                    }}""")
+                    # Se reintenta hasta 5 veces (con pequenas esperas)
+                    # porque el <select> a veces todavia no tiene sus
+                    # <option> renderizadas por Angular justo cuando
+                    # llega la respuesta de puntos -- si se intenta
+                    # elegir la sede demasiado rapido, el valor se queda
+                    # vacio en silencio (el <option> con ese value aun no
+                    # existe en el DOM).
+                    valor_quedo = None
+                    for intento_sede in range(5):
+                        valor_quedo = page.evaluate(f"""() => {{
+                            var el = document.querySelector('#seleccione_punto_atencion');
+                            if (!el) return null;
+                            var existeOpcion = Array.from(el.options).some(function(o){{ return o.value === '{id_subsede}'; }});
+                            if (!existeOpcion) return '__SIN_OPCION__';
+                            el.value = '{id_subsede}';
+                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            return el.value;
+                        }}""")
+                        if valor_quedo and valor_quedo not in ('', '__SIN_OPCION__'):
+                            break
+                        page.wait_for_timeout(500)
                     print(f"Sede '{nombre_sede}' (idSubsede={id_subsede}) -- valor que quedo en el <select> despues de elegirla: {valor_quedo!r}", flush=True)
                 except Exception as e_sede:
                     print(f"No se pudo seleccionar la sede '{nombre_sede}': {e_sede}", flush=True)
@@ -1770,13 +1784,27 @@ def envigado_reservar_cita(solicitud):
             print(f"{etiqueta} Sede elegida: {sede_elegida}", flush=True)
 
             # --- Elegir la sede en el <select> real ---
-            page.evaluate(f"""() => {{
-                var el = document.querySelector('#seleccione_punto_atencion');
-                if (!el) return false;
-                el.value = '{sede_elegida.get("idSubsede")}';
-                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                return true;
-            }}""")
+            # Se reintenta hasta 5 veces (con pequenas esperas) porque el
+            # <select> a veces todavia no tiene sus <option> renderizadas
+            # por Angular justo cuando llega la respuesta de puntos -- si
+            # se intenta elegir la sede demasiado rapido, el valor se
+            # queda vacio en silencio.
+            id_subsede_elegida = sede_elegida.get("idSubsede")
+            valor_sede_quedo = None
+            for intento_sede in range(5):
+                valor_sede_quedo = page.evaluate(f"""() => {{
+                    var el = document.querySelector('#seleccione_punto_atencion');
+                    if (!el) return null;
+                    var existeOpcion = Array.from(el.options).some(function(o){{ return o.value === '{id_subsede_elegida}'; }});
+                    if (!existeOpcion) return '__SIN_OPCION__';
+                    el.value = '{id_subsede_elegida}';
+                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    return el.value;
+                }}""")
+                if valor_sede_quedo and valor_sede_quedo not in ('', '__SIN_OPCION__'):
+                    break
+                page.wait_for_timeout(500)
+            print(f"{etiqueta} Sede -- valor que quedo en el <select>: {valor_sede_quedo!r}", flush=True)
             page.wait_for_timeout(1500)
 
             for _ in range(10):
