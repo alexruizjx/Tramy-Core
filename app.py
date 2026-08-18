@@ -1713,6 +1713,39 @@ def envigado_reservar_cita(solicitud):
             puntos = respuestas_capturadas.get("getPuntosAtencionServiciosLowcode") or []
             print(f"{etiqueta} Puntos de atencion encontrados: {puntos}", flush=True)
             if not puntos:
+                # Diagnostico enriquecido -- antes esta funcion solo
+                # reportaba "vacio" sin mas detalle. Se imprime el texto
+                # visible y los campos reales del formulario en este
+                # punto, para distinguir si el sitio de verdad respondio
+                # "sin puntos" o si la respuesta nunca se capturo (ej. el
+                # clic en "Agregar servicio" no disparo la peticion).
+                print(f"{etiqueta} === DIAGNOSTICO: puntos vacio -- revisando estado de la pagina ===", flush=True)
+                print(f"{etiqueta} URL actual: {page.url}", flush=True)
+                print(f"{etiqueta} Se capturo getPuntosAtencionServiciosLowcode en absoluto: {'getPuntosAtencionServiciosLowcode' in respuestas_capturadas}", flush=True)
+                try:
+                    print(f"{etiqueta} Texto visible de la pagina (primeros 2000 caracteres):", flush=True)
+                    print(page.inner_text("body")[:2000], flush=True)
+                except Exception as e_txt:
+                    print(f"{etiqueta} No se pudo leer el texto de la pagina: {e_txt}", flush=True)
+                try:
+                    campos_diag = page.evaluate("""() => {
+                        var els = document.querySelectorAll('input, select, textarea');
+                        var resultado = [];
+                        els.forEach(function(el){
+                            resultado.push({
+                                tag: el.tagName, name: el.name || null, id: el.id || null,
+                                value: (el.value || '').substring(0, 40),
+                                visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+                            });
+                        });
+                        return resultado;
+                    }""")
+                    print(f"{etiqueta} Campos reales (con su valor actual) en este punto:", flush=True)
+                    for c in campos_diag:
+                        print(f"{etiqueta}   {c}", flush=True)
+                except Exception as e_campos:
+                    print(f"{etiqueta} No se pudieron listar los campos: {e_campos}", flush=True)
+                print(f"{etiqueta} === FIN DIAGNOSTICO ===", flush=True)
                 resultado["mensaje"] = "No se encontraron puntos de atención con este trámite."
                 return resultado
 
