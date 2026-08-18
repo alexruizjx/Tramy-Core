@@ -2235,7 +2235,7 @@ def envigado_reservar_cita(solicitud):
 
             captura_antes = f"{etiqueta.strip('[]')}_1_antes_confirmar.png"
             try:
-                page.screenshot(path=os.path.join(CAPTURAS_ENVIGADO_DIR, captura_antes), full_page=True)
+                page.screenshot(path=os.path.join(CAPTURAS_ENVIGADO_DIR, captura_antes), full_page=False, timeout=8000)
                 resultado["capturas"]["antes_confirmar"] = captura_antes
                 print(f"{etiqueta} Captura guardada: {captura_antes}", flush=True)
             except Exception as e_cap1:
@@ -2259,7 +2259,7 @@ def envigado_reservar_cita(solicitud):
 
             captura_despues = f"{etiqueta.strip('[]')}_2_despues_confirmar.png"
             try:
-                page.screenshot(path=os.path.join(CAPTURAS_ENVIGADO_DIR, captura_despues), full_page=True)
+                page.screenshot(path=os.path.join(CAPTURAS_ENVIGADO_DIR, captura_despues), full_page=False, timeout=8000)
                 resultado["capturas"]["despues_confirmar"] = captura_despues
                 print(f"{etiqueta} Captura guardada: {captura_despues}", flush=True)
             except Exception as e_cap2:
