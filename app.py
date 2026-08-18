@@ -1255,8 +1255,11 @@ def envigado_hay_puntos_disponibles():
     fecha_objetivo = _envigado_proximo_dia_habil()
     resultado_final = []
     respuestas_capturadas = {}
+    todas_las_urls_vistas = []  # diagnostico -- para ver TODAS las peticiones de red relacionadas a citas, sin importar el nombre exacto
 
     def _capturar_respuesta(response):
+        if "backavit" in response.url or "citas" in response.url:
+            todas_las_urls_vistas.append(response.url)
         for nombre_endpoint in ["getPuntosAtencionServiciosLowcode", "getFechasDisponibles"]:
             if nombre_endpoint in response.url:
                 try:
@@ -1476,13 +1479,14 @@ def envigado_hay_puntos_disponibles():
 
                 respuestas_capturadas.pop("getFechasDisponibles", None)
                 try:
-                    page.evaluate(f"""() => {{
+                    valor_quedo = page.evaluate(f"""() => {{
                         var el = document.querySelector('#seleccione_punto_atencion');
-                        if (!el) return false;
+                        if (!el) return null;
                         el.value = '{id_subsede}';
                         el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                        return true;
+                        return el.value;
                     }}""")
+                    print(f"Sede '{nombre_sede}' (idSubsede={id_subsede}) -- valor que quedo en el <select> despues de elegirla: {valor_quedo!r}", flush=True)
                 except Exception as e_sede:
                     print(f"No se pudo seleccionar la sede '{nombre_sede}': {e_sede}", flush=True)
                     continue
@@ -1493,9 +1497,13 @@ def envigado_hay_puntos_disponibles():
                         break
                     page.wait_for_timeout(1000)
 
+                if "getFechasDisponibles" not in respuestas_capturadas:
+                    print(f"Sede '{nombre_sede}': NUNCA se capturo la respuesta de getFechasDisponibles (la peticion no se disparo, o tardo mas de 10 segundos).", flush=True)
+                    print(f"Todas las URLs de red relacionadas a citas vistas hasta ahora: {todas_las_urls_vistas}", flush=True)
+
                 fechas_disponibles = respuestas_capturadas.get("getFechasDisponibles") or []
                 dias_atencion = [f.get("diaAtencion") for f in fechas_disponibles if isinstance(f, dict)]
-                print(f"Fechas disponibles en '{nombre_sede}': {dias_atencion}", flush=True)
+                print(f"Fechas disponibles en '{nombre_sede}': {dias_atencion} (respuesta cruda: {fechas_disponibles})", flush=True)
 
                 if fecha_objetivo in dias_atencion:
                     resultado_final.append({"sede": nombre_sede, "fecha": fecha_objetivo})
