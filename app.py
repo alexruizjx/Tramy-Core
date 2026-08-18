@@ -1929,13 +1929,31 @@ def envigado_reservar_cita(solicitud):
                 resultado["mensaje"] = f"No se encontraron horas disponibles para el {fecha_elegida} (puede que el datepicker no haya respondido como se esperaba -- revisar diagnostico)."
                 return resultado
 
+            # 'horas_disponibles' viene AGRUPADA por franja (ej. "7:00 AM
+            # - 12:00 PM", "1:00 PM - 7:00 PM"), cada grupo con su propia
+            # lista interna "horarios" -- se aplanan todos los horarios
+            # individuales de todos los grupos en una sola lista antes de
+            # buscar el mas cercano (si no, min() comparaba los GRUPOS
+            # completos entre si, que no tienen "horaIni" propio, y el
+            # resultado quedaba con idControlCapacidad/idTaquilla/horaIni
+            # vacios).
+            horarios_individuales = []
+            for grupo in horas_disponibles:
+                if isinstance(grupo, dict) and isinstance(grupo.get("horarios"), list):
+                    horarios_individuales.extend(grupo["horarios"])
+                elif isinstance(grupo, dict) and "horaIni" in grupo:
+                    horarios_individuales.append(grupo)  # por si algun dia SI viene plano
+            if not horarios_individuales:
+                resultado["mensaje"] = f"Se encontraron franjas para el {fecha_elegida}, pero ninguna tenia horarios individuales dentro."
+                return resultado
+
             # Se busca la hora mas cercana a la hora aproximada pedida.
             # 'horaIni' viene como numero tipo 1027 = 10:27 -- se compara
             # solo la parte de la hora (// 100) contra la hora pedida, y
             # si no hay coincidencia exacta se toma la mas cercana.
             hora_pedida = int(solicitud["hora_aproximada"])
             mejor_horario = min(
-                horas_disponibles,
+                horarios_individuales,
                 key=lambda h: abs((h.get("horaIni", 0) // 100) - hora_pedida)
             )
             print(f"{etiqueta} Horario elegido (mas cercano a las {hora_pedida}:00): {mejor_horario}", flush=True)
