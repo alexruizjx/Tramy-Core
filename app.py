@@ -1857,14 +1857,28 @@ def envigado_reservar_cita(solicitud):
 
             # --- Elegir la fecha en el datepicker ---
             respuestas_capturadas.pop("getHorasDisponibles", None)
-            page.evaluate(f"""() => {{
-                var el = document.querySelector('#agendarCitaDatePicker');
-                if (!el) return false;
-                el.value = '{fecha_elegida}';
-                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                return true;
-            }}""")
+            # Se usa page.fill() (escritura real, caracter por caracter)
+            # en vez de solo asignar .value por JS -- muchos widgets de
+            # calendario (Angular Material y similares) no reaccionan
+            # bien a una asignacion directa, pero si a una escritura real
+            # simulada. Se intenta primero asi, y si falla se cae al
+            # metodo anterior como respaldo.
+            fecha_input_ok = False
+            try:
+                page.fill('#agendarCitaDatePicker', fecha_elegida, timeout=5000)
+                page.locator('#agendarCitaDatePicker').press('Tab')
+                fecha_input_ok = True
+            except Exception as e_fecha_fill:
+                print(f"{etiqueta} page.fill() en el datepicker fallo ({e_fecha_fill}), probando metodo de respaldo...", flush=True)
+            if not fecha_input_ok:
+                page.evaluate(f"""() => {{
+                    var el = document.querySelector('#agendarCitaDatePicker');
+                    if (!el) return false;
+                    el.value = '{fecha_elegida}';
+                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    return true;
+                }}""")
             page.wait_for_timeout(1500)
 
             for _ in range(10):
@@ -1874,6 +1888,24 @@ def envigado_reservar_cita(solicitud):
             horas_disponibles = respuestas_capturadas.get("getHorasDisponibles") or []
             print(f"{etiqueta} Horas disponibles para {fecha_elegida}: {horas_disponibles}", flush=True)
             if not horas_disponibles:
+                # Diagnostico enriquecido -- igual que se hizo antes con
+                # la sede, para ver que esta pasando realmente en la
+                # pagina cuando esto falla.
+                print(f"{etiqueta} === DIAGNOSTICO: horas vacias -- revisando estado de la pagina ===", flush=True)
+                try:
+                    valor_datepicker_actual = page.evaluate("""() => {
+                        var el = document.querySelector('#agendarCitaDatePicker');
+                        return el ? el.value : null;
+                    }""")
+                    print(f"{etiqueta} Valor actual del datepicker: {valor_datepicker_actual!r}", flush=True)
+                except Exception:
+                    pass
+                try:
+                    print(f"{etiqueta} Texto visible de la pagina (primeros 2000 caracteres):", flush=True)
+                    print(page.inner_text("body")[:2000], flush=True)
+                except Exception as e_txt:
+                    print(f"{etiqueta} No se pudo leer el texto de la pagina: {e_txt}", flush=True)
+                print(f"{etiqueta} === FIN DIAGNOSTICO ===", flush=True)
                 resultado["mensaje"] = f"No se encontraron horas disponibles para el {fecha_elegida} (puede que el datepicker no haya respondido como se esperaba -- revisar diagnostico)."
                 return resultado
 
