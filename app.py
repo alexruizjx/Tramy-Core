@@ -2084,6 +2084,48 @@ def envigado_reservar_cita(solicitud):
             }}""")
             print(f"{etiqueta} Resultado de forzar el digest de Angular: {resultado_angular}", flush=True)
 
+            # El boton sigue deshabilitado a pesar de forzar el digest y
+            # sobrescribir grecaptcha.getResponse -- en vez de seguir
+            # adivinando el mecanismo, se lee DIRECTAMENTE del boton (y
+            # de su scope de Angular) que atributos/variables controlan
+            # su estado, para saber con certeza que falta.
+            diagnostico_boton = page.evaluate("""() => {
+                var boton = document.getElementById('btnGuardarCita');
+                if (!boton) return { error: 'boton no encontrado' };
+                var atributos = {};
+                for (var i = 0; i < boton.attributes.length; i++) {
+                    var a = boton.attributes[i];
+                    atributos[a.name] = a.value;
+                }
+                var resultado = { atributos: atributos };
+                try {
+                    var scope = angular.element(boton).scope();
+                    if (!scope) {
+                        var actual = boton;
+                        while (actual && !scope) {
+                            scope = angular.element(actual).scope();
+                            actual = actual.parentElement;
+                        }
+                    }
+                    if (scope) {
+                        // Se listan las propiedades del scope que parezcan
+                        // relacionadas a captcha, formulario, o validez.
+                        var propsRelevantes = {};
+                        for (var key in scope) {
+                            if (scope.hasOwnProperty(key) && /captcha|valid|form|disable|recaptcha/i.test(key)) {
+                                try { propsRelevantes[key] = JSON.stringify(scope[key]).substring(0, 200); }
+                                catch (e2) { propsRelevantes[key] = '(no se pudo convertir a texto)'; }
+                            }
+                        }
+                        resultado.scope_propiedades_relevantes = propsRelevantes;
+                    }
+                } catch (e) {
+                    resultado.error_scope = String(e);
+                }
+                return resultado;
+            }""")
+            print(f"{etiqueta} Diagnostico directo del boton (atributos y scope): {diagnostico_boton}", flush=True)
+
             # Si no se encontro el textarea en la pagina principal, puede
             # estar dentro de un iframe (asi renderiza normalmente
             # reCAPTCHA) -- se busca en TODOS los frames de la pagina, y
