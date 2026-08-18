@@ -1901,11 +1901,52 @@ def envigado_reservar_cita(solicitud):
             }}""")
             page.wait_for_timeout(1000)
 
-            # --- DIAGNOSTICO: se detiene ANTES de resolver el reCAPTCHA
-            # y confirmar la cita de verdad -- primero hay que confirmar
-            # que la seleccion de sede/fecha/hora de arriba funciono bien
-            # (revisando estos logs), antes de dar el paso final que si
-            # aparta una cita real. ---
+            # --- Confirmado por pruebas reales que sede/fecha/hora se
+            # eligen bien -- se procede a resolver el reCAPTCHA. Se
+            # SIGUE deteniendo justo antes del envio final (el clic que
+            # si reservaria la cita de verdad), para confirmar primero
+            # que el captcha se acepta correctamente. ---
+            print(f"{etiqueta} Resolviendo reCAPTCHA con 2captcha (puede tardar 15-40 segundos)...", flush=True)
+            try:
+                token_captcha = resolver_recaptcha_2captcha(ENVIGADO_RECAPTCHA_SITEKEY, page.url)
+                print(f"{etiqueta} Token de 2captcha obtenido (primeros 30 caracteres): {token_captcha[:30]}...", flush=True)
+            except Exception as e_captcha:
+                resultado["mensaje"] = f"No se pudo resolver el reCAPTCHA: {e_captcha}"
+                return resultado
+
+            # Se inyecta el token en el textarea estandar de reCAPTCHA v2,
+            # y se dispara tanto un evento "change" como cualquier
+            # callback configurado en el widget (los sitios que usan
+            # reCAPTCHA normalmente llaman a una funcion via el atributo
+            # "data-callback" del div del widget).
+            resultado_inyeccion = page.evaluate(f"""() => {{
+                var resultado = {{ textarea_encontrado: false, callback_llamado: false, callback_nombre: null }};
+                var textarea = document.getElementById('g-recaptcha-response');
+                if (textarea) {{
+                    textarea.style.display = 'block';
+                    textarea.value = {json.dumps(token_captcha)};
+                    textarea.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    resultado.textarea_encontrado = true;
+                }}
+                var widget = document.querySelector('.g-recaptcha[data-callback], div[data-callback]');
+                if (widget) {{
+                    var nombreCallback = widget.getAttribute('data-callback');
+                    resultado.callback_nombre = nombreCallback;
+                    if (nombreCallback && typeof window[nombreCallback] === 'function') {{
+                        window[nombreCallback]({json.dumps(token_captcha)});
+                        resultado.callback_llamado = true;
+                    }}
+                }}
+                return resultado;
+            }}""")
+            print(f"{etiqueta} Resultado de inyectar el token: {resultado_inyeccion}", flush=True)
+            page.wait_for_timeout(1500)
+
+            # --- DIAGNOSTICO: se detiene ANTES de confirmar la cita de
+            # verdad -- primero hay que revisar en estos logs que el
+            # captcha se haya aceptado (ej. que no aparezca un mensaje de
+            # error de captcha en la pagina), antes de dar el ultimo paso
+            # que si aparta una cita real. ---
             print(f"{etiqueta} === DIAGNOSTICO: estado antes de confirmar (aun NO se ha reservado nada) ===", flush=True)
             print(f"{etiqueta} idControlCapacidad={id_control_capacidad}, idTaquilla={id_taquilla}, horaIni={hora_ini_valor}, fecha={fecha_elegida}", flush=True)
             try:
@@ -1918,7 +1959,7 @@ def envigado_reservar_cita(solicitud):
                     var resultado = [];
                     botones.forEach(function(b){
                         if (b.offsetWidth || b.offsetHeight || b.getClientRects().length) {
-                            resultado.push({tag: b.tagName, texto: (b.innerText||b.value||'').trim(), id: b.id||null});
+                            resultado.push({tag: b.tagName, texto: (b.innerText||b.value||'').trim(), id: b.id||null, disabled: !!b.disabled});
                         }
                     });
                     return resultado;
@@ -1927,7 +1968,7 @@ def envigado_reservar_cita(solicitud):
             except Exception:
                 pass
 
-            resultado["mensaje"] = "Se detuvo justo antes de confirmar (a proposito) -- revisa el diagnostico en los logs para confirmar que sede/fecha/hora se eligieron bien, y avisa para programar el ultimo paso (captcha + confirmar)."
+            resultado["mensaje"] = "Se resolvio el reCAPTCHA y se detuvo justo antes de confirmar (a proposito) -- revisa el diagnostico en los logs para confirmar que el captcha se acepto bien (ej. que el boton de confirmar ya no aparezca deshabilitado), y avisa para programar el ultimo paso (el clic final que si reserva la cita)."
             return resultado
 
         except Exception as e:
