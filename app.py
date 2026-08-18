@@ -6469,6 +6469,81 @@ def personas_eliminar_endpoint():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/liquidaciones-guardar", methods=["POST"])
+def liquidaciones_guardar_endpoint():
+    """Guarda una liquidacion en el historial -- se llama justo cuando el
+    usuario da clic en 'Enviar por WhatsApp', con fecha/hora automatica."""
+    datos = request.get_json(silent=True) or {}
+    placa = (datos.get("placa") or "").strip().upper()
+    texto_whatsapp = datos.get("texto_whatsapp") or ""
+    if not placa or not texto_whatsapp:
+        return jsonify({"ok": False, "error": "Faltan placa o texto_whatsapp."}), 400
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO liquidaciones_historial
+                (placa, municipio, marca, linea, tipo_cliente, tramites, total, texto_whatsapp)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (
+            placa, (datos.get("municipio") or "").strip(),
+            (datos.get("marca") or "").strip(), (datos.get("linea") or "").strip(),
+            (datos.get("tipo_cliente") or "").strip(), (datos.get("tramites") or "").strip(),
+            datos.get("total") or 0, texto_whatsapp,
+        ))
+        liquidacion_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close(); conn.close()
+        return jsonify({"ok": True, "id": liquidacion_id})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/liquidaciones-buscar", methods=["GET"])
+def liquidaciones_buscar_endpoint():
+    """Busca liquidaciones guardadas, principalmente por placa (tambien
+    acepta buscar por municipio o tramite). Paginado de 20 en 20."""
+    consulta = request.args.get("q", "").strip()
+    pagina = max(int(request.args.get("pagina", 1) or 1), 1)
+    por_pagina = 20
+    offset = (pagina - 1) * por_pagina
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        if consulta:
+            patron = f"%{consulta}%"
+            cur.execute("""
+                SELECT id, placa, municipio, marca, linea, tipo_cliente, tramites, total, texto_whatsapp, creado_en
+                FROM liquidaciones_historial
+                WHERE placa ILIKE %s OR municipio ILIKE %s OR tramites ILIKE %s
+                ORDER BY creado_en DESC LIMIT %s OFFSET %s
+            """, (patron, patron, patron, por_pagina, offset))
+            filas = cur.fetchall()
+            cur.execute("""
+                SELECT COUNT(*) FROM liquidaciones_historial
+                WHERE placa ILIKE %s OR municipio ILIKE %s OR tramites ILIKE %s
+            """, (patron, patron, patron))
+            total_filas = cur.fetchone()[0]
+        else:
+            cur.execute("""
+                SELECT id, placa, municipio, marca, linea, tipo_cliente, tramites, total, texto_whatsapp, creado_en
+                FROM liquidaciones_historial ORDER BY creado_en DESC LIMIT %s OFFSET %s
+            """, (por_pagina, offset))
+            filas = cur.fetchall()
+            cur.execute("SELECT COUNT(*) FROM liquidaciones_historial")
+            total_filas = cur.fetchone()[0]
+        cur.close(); conn.close()
+        liquidaciones = [{
+            "id": f[0], "placa": f[1], "municipio": f[2], "marca": f[3], "linea": f[4],
+            "tipo_cliente": f[5], "tramites": f[6], "total": float(f[7]) if f[7] is not None else 0,
+            "texto_whatsapp": f[8], "creado_en": f[9].isoformat() + "Z",
+        } for f in filas]
+        return jsonify({"ok": True, "liquidaciones": liquidaciones, "total": total_filas, "pagina": pagina, "por_pagina": por_pagina})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/appjx-documentos-listar", methods=["GET"])
 def appjx_documentos_listar_endpoint():
     """Devuelve la lista de documentos disponibles de AppJX.xlsm (clave +
