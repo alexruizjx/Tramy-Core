@@ -1472,6 +1472,16 @@ def envigado_revisar_citas_disponibles(dias_adelante=14):
     conn = get_db_conn()
     cur = conn.cursor()
 
+    # Limpieza general: se borra CUALQUIER registro cuya fecha de cita ya
+    # paso, sin importar el resultado de esta consulta -- antes solo se
+    # limpiaban los resultados vacios del dia de HOY, asi que un positivo
+    # de dias anteriores que nunca se volvio a consultar se quedaba
+    # mostrandose para siempre.
+    cur.execute("""
+        DELETE FROM envigado_citas_disponibles
+        WHERE TO_DATE(fecha_dia, 'DD/MM/YYYY') < CURRENT_DATE
+    """)
+
     if isinstance(puntos, list) and len(puntos) > 0:
         # Aun no conocemos la estructura exacta de una respuesta CON datos
         # (solo hemos visto la vacia) -- se imprime completa en los logs
@@ -1785,6 +1795,16 @@ def envigado_reservar_cita(solicitud):
     resultados = []
     conn = get_db_conn()
     cur = conn.cursor()
+
+    # Limpieza general: se borra CUALQUIER registro cuya fecha de cita ya
+    # paso, sin importar el resultado de esta consulta -- antes solo se
+    # limpiaban los resultados vacios del dia de HOY, asi que un positivo
+    # de dias anteriores que nunca se volvio a consultar se quedaba
+    # mostrandose para siempre.
+    cur.execute("""
+        DELETE FROM envigado_citas_disponibles
+        WHERE TO_DATE(fecha_dia, 'DD/MM/YYYY') < CURRENT_DATE
+    """)
 
     if isinstance(puntos, list) and len(puntos) > 0:
         # Aun no conocemos la estructura exacta de una respuesta CON datos
@@ -7088,10 +7108,25 @@ def envigado_citas_ultimo_resultado_endpoint():
         """)
         filas = cur.fetchall()
         cur.close(); conn.close()
-        disponibles = [
-            {"sede": f[0], "fecha": f[1], "cantidad_horarios": f[2], "verificado_en": f[3].isoformat() + "Z"}
-            for f in filas
-        ]
+        # Se descartan aqui los registros cuya fecha de cita YA PASO --
+        # antes se mostraban indefinidamente porque la limpieza automatica
+        # solo borra los resultados vacios del DIA EN QUE SE CONSULTO, no
+        # los positivos de dias anteriores que quedaron sin revisar de
+        # nuevo (ej. si el monitoreo se detuvo antes de volver a
+        # consultar esa fecha).
+        hoy = datetime.now().date()
+        disponibles = []
+        for sede, fecha_dia, cantidad_horarios, verificado_en in filas:
+            try:
+                fecha_cita = datetime.strptime(fecha_dia, "%d/%m/%Y").date()
+                if fecha_cita < hoy:
+                    continue  # la fecha de la cita ya paso -- se ignora
+            except (ValueError, TypeError):
+                pass  # si no se puede interpretar la fecha, se muestra igual (mejor prevenir que ocultar por error)
+            disponibles.append({
+                "sede": sede, "fecha": fecha_dia, "cantidad_horarios": cantidad_horarios,
+                "verificado_en": verificado_en.isoformat() + "Z"
+            })
         return jsonify({"ok": True, "hay_citas": len(disponibles) > 0, "disponibles": disponibles})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
