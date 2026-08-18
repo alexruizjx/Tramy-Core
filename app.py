@@ -1840,66 +1840,6 @@ def envigado_reservar_cita(solicitud):
 
 
 
-    """Revisa si hay ALGUN punto de atencion con citas disponibles (una
-    sola peticion, no dia por dia), y guarda el resultado en la base de
-    datos. 'dias_adelante' ya no se usa para hacer mas peticiones -- se
-    deja como parametro por compatibilidad con quien ya llama esta
-    funcion. Devuelve una tupla (resultados, hubo_error):
-    - resultados: lista de {sede, fecha, cantidad_horarios}
-    - hubo_error: True si la consulta fallo por dentro (para NO
-      confundirlo con un "confirmado, sin citas ahora mismo")."""
-    puntos = envigado_hay_puntos_disponibles()
-    if puntos is None:
-        print("Error consultando disponibilidad de citas Envigado (ver logs arriba).", flush=True)
-        return [], True
-
-    resultados = []
-    conn = get_db_conn()
-    cur = conn.cursor()
-
-    # Limpieza general: se borra CUALQUIER registro cuya fecha de cita ya
-    # paso, sin importar el resultado de esta consulta -- antes solo se
-    # limpiaban los resultados vacios del dia de HOY, asi que un positivo
-    # de dias anteriores que nunca se volvio a consultar se quedaba
-    # mostrandose para siempre.
-    cur.execute("""
-        DELETE FROM envigado_citas_disponibles
-        WHERE TO_DATE(fecha_dia, 'DD/MM/YYYY') < CURRENT_DATE
-    """)
-
-    if isinstance(puntos, list) and len(puntos) > 0:
-        # Aun no conocemos la estructura exacta de una respuesta CON datos
-        # (solo hemos visto la vacia) -- se imprime completa en los logs
-        # para poder revisarla y afinar el formato la primera vez que se
-        # dispare de verdad.
-        print("=== CITAS ENVIGADO: se encontraron puntos disponibles ===", flush=True)
-        print(puntos, flush=True)
-        print("=== FIN ===", flush=True)
-        fecha_hoy = datetime.now().strftime("%d/%m/%Y")
-        resultados.append({
-            "sede": "Ver detalle en logs del servidor",
-            "fecha": fecha_hoy,
-            "cantidad_horarios": len(puntos)
-        })
-        cur.execute("""
-            INSERT INTO envigado_citas_disponibles (sede, id_subsede, fecha_dia, cantidad_horarios, verificado_en)
-            VALUES (%s, %s, %s, %s, NOW())
-            ON CONFLICT (sede, fecha_dia) DO UPDATE SET
-                cantidad_horarios=EXCLUDED.cantidad_horarios, verificado_en=NOW()
-        """, ("Detectado (ver logs)", 0, fecha_hoy, len(puntos)))
-    else:
-        # Sin citas en este momento -- se limpia cualquier resultado
-        # positivo anterior guardado hoy, para no mostrar un aviso viejo
-        # que ya no es cierto.
-        cur.execute("""
-            DELETE FROM envigado_citas_disponibles
-            WHERE verificado_en::date = CURRENT_DATE
-        """)
-
-    conn.commit()
-    cur.close(); conn.close()
-    return resultados, False
-
 
 ENVIGADO_TURNOS_API = "https://gacomponentes.envigado.gov.co/backga/back-ga/turnos/findAtencionesMonitor"
 
