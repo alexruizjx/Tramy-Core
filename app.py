@@ -1858,56 +1858,47 @@ def envigado_reservar_cita(solicitud):
             # --- Elegir la fecha en el datepicker ---
             respuestas_capturadas.pop("getHorasDisponibles", None)
 
-            # PRIMER INTENTO: hacer clic en el campo para abrir el
-            # calendario visual -- muchos widgets de este tipo (sobre
-            # todo los mas viejos, tipo bootstrap-datepicker) solo
-            # disparan la consulta de horas cuando se hace clic en el
-            # DIA dentro del calendario emergente, no con solo escribir
-            # texto en el input.
-            try:
-                page.click('#agendarCitaDatePicker', timeout=5000)
-                page.wait_for_timeout(800)
-                estructura_calendario = page.evaluate("""() => {
-                    var selectores = ['.datepicker', '.ui-datepicker', '.mat-calendar', '[class*="calendar"]', '[class*="datepicker"]'];
-                    var resultado = [];
-                    selectores.forEach(function(sel){
-                        document.querySelectorAll(sel).forEach(function(elCal){
-                            if (elCal.offsetWidth || elCal.offsetHeight || elCal.getClientRects().length) {
-                                resultado.push({selector: sel, id: elCal.id || null, clase: elCal.className || null, html_recortado: elCal.outerHTML.substring(0, 1500)});
-                            }
-                        });
-                    });
-                    return resultado;
-                }""")
-                print(f"{etiqueta} === DIAGNOSTICO: estructura del calendario tras hacer clic en el datepicker ===", flush=True)
-                for c in estructura_calendario:
-                    print(f"{etiqueta} {c}", flush=True)
-                print(f"{etiqueta} === FIN DIAGNOSTICO calendario ===", flush=True)
-            except Exception as e_click_dp:
-                print(f"{etiqueta} No se pudo hacer clic en el datepicker: {e_click_dp}", flush=True)
+            # Confirmado por diagnostico real: el sitio usa la libreria
+            # "Air Datepicker" -- cada dia es un <div> con
+            # data-date/data-month/data-year (mes de 0 a 11), y hay que
+            # hacer CLIC en la celda del dia exacto para que se dispare
+            # la consulta de horas disponibles (escribir texto en el
+            # input no basta).
+            dia_num, mes_num, anio_num = fecha_elegida.split("/")
+            mes_datepicker = str(int(mes_num) - 1)  # Air Datepicker usa el mes de 0 a 11
+            dia_datepicker = str(int(dia_num))  # sin cero a la izquierda, ej "19" no "019"
 
-            # Se usa page.fill() (escritura real, caracter por caracter)
-            # en vez de solo asignar .value por JS -- muchos widgets de
-            # calendario (Angular Material y similares) no reaccionan
-            # bien a una asignacion directa, pero si a una escritura real
-            # simulada. Se intenta primero asi, y si falla se cae al
-            # metodo anterior como respaldo.
-            fecha_input_ok = False
+            page.click('#agendarCitaDatePicker', timeout=5000)
+            page.wait_for_timeout(800)
+
+            selector_dia = (
+                f'.datepicker--cell-day[data-date="{dia_datepicker}"]'
+                f'[data-month="{mes_datepicker}"][data-year="{anio_num}"]:not(.-other-month-)'
+            )
+            fecha_click_ok = False
             try:
-                page.fill('#agendarCitaDatePicker', fecha_elegida, timeout=5000)
-                page.locator('#agendarCitaDatePicker').press('Tab')
-                fecha_input_ok = True
-            except Exception as e_fecha_fill:
-                print(f"{etiqueta} page.fill() en el datepicker fallo ({e_fecha_fill}), probando metodo de respaldo...", flush=True)
-            if not fecha_input_ok:
-                page.evaluate(f"""() => {{
-                    var el = document.querySelector('#agendarCitaDatePicker');
-                    if (!el) return false;
-                    el.value = '{fecha_elegida}';
-                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    return true;
-                }}""")
+                page.click(selector_dia, timeout=5000)
+                fecha_click_ok = True
+            except Exception as e_click_dia:
+                print(f"{etiqueta} No se pudo hacer clic en la celda del dia ({selector_dia}): {e_click_dia}", flush=True)
+
+            print(f"{etiqueta} Clic en el dia {fecha_elegida} del calendario -- exitoso: {fecha_click_ok}", flush=True)
+
+            # Respaldo (por si la libreria cambia o el selector no
+            # coincide): escribir el texto directamente en el input.
+            if not fecha_click_ok:
+                try:
+                    page.fill('#agendarCitaDatePicker', fecha_elegida, timeout=5000)
+                    page.locator('#agendarCitaDatePicker').press('Tab')
+                except Exception:
+                    page.evaluate(f"""() => {{
+                        var el = document.querySelector('#agendarCitaDatePicker');
+                        if (!el) return false;
+                        el.value = '{fecha_elegida}';
+                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        return true;
+                    }}""")
             page.wait_for_timeout(1500)
 
             for _ in range(10):
