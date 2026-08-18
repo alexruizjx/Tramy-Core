@@ -316,7 +316,7 @@ def cache_antioquia_eliminar_vigencia(placa, anio):
 
 
 ENVIGADO_CITAS_SEDES = {
-    "Vegas (El Colombiano)": 1,
+    "Sede Principal": 1,
     "City Plaza": 3,
 }
 ENVIGADO_CITAS_ID_SERVICIO = "90"
@@ -1221,30 +1221,48 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
             context.close(); browser.close()
 
 
+def _envigado_proximo_dia_habil():
+    """Calcula el proximo dia habil (lunes a viernes) a partir de hoy, en
+    formato 'DD/MM/YYYY' -- igual al formato que usa la API de Envigado
+    para 'diaAtencion'. Si hoy es viernes o fin de semana, salta al
+    proximo lunes."""
+    hoy = datetime.now().date()
+    siguiente = hoy + timedelta(days=1)
+    while siguiente.weekday() >= 5:  # 5=sabado, 6=domingo
+        siguiente += timedelta(days=1)
+    return siguiente.strftime("%d/%m/%Y")
+
+
 def envigado_hay_puntos_disponibles():
-    """Revisa si hay ALGUN punto de atencion con citas disponibles para
-    el servicio vigilado. Usa un NAVEGADOR REAL (Playwright) en vez de
-    peticiones HTTP directas -- se probo con peticiones directas primero
-    (replicando payload y encabezados exactos capturados de un HAR real),
-    pero el servidor seguia devolviendo error 500 solo en este endpoint
-    especifico (el mismo enfoque SI funciona para otros endpoints de
-    Envigado, como el monitor de turnos) -- lo mas probable es que este
-    endpoint en particular tenga alguna proteccion anti-bot que detecta
-    que la conexion no viene de un navegador real. Se llena el formulario
-    igual que lo haria una persona, con datos de prueba que no
-    corresponden a ningun ciudadano real, y se intercepta la respuesta de
-    getPuntosAtencionServiciosLowcode directamente de la red.
-    Devuelve la lista cruda que entrega el sitio (vacia [] si no hay nada
-    disponible en ningun lado en este momento), o None si algo fallo."""
-    resultado_capturado = {"datos": None, "capturado": False}
+    """Revisa, para CADA sede, si el PROXIMO DIA HABIL especificamente
+    tiene fechas de atencion disponibles -- no solo si el servicio esta
+    listado (eso casi siempre es cierto y causaba falsos positivos, ya
+    que 'getPuntosAtencionServiciosLowcode' solo dice que sedes OFRECEN
+    el tramite, sin decir si tienen cupo). Usa un NAVEGADOR REAL
+    (Playwright) en vez de peticiones HTTP directas -- se probo con
+    peticiones directas primero (replicando payload y encabezados
+    exactos capturados de un HAR real), pero el servidor seguia
+    devolviendo error 500 solo en este endpoint especifico (el mismo
+    enfoque SI funciona para otros endpoints de Envigado, como el
+    monitor de turnos) -- lo mas probable es que este endpoint en
+    particular tenga alguna proteccion anti-bot que detecta que la
+    conexion no viene de un navegador real. Se llena el formulario igual
+    que lo haria una persona, con datos de prueba que no corresponden a
+    ningun ciudadano real.
+    Devuelve una lista de {"sede": nombre, "fecha": "DD/MM/YYYY"} -- una
+    entrada por cada sede que SI tiene el proximo dia habil disponible
+    (vacia [] si ninguna sede lo tiene), o None si algo fallo."""
+    fecha_objetivo = _envigado_proximo_dia_habil()
+    resultado_final = []
+    respuestas_capturadas = {}
 
     def _capturar_respuesta(response):
-        if "getPuntosAtencionServiciosLowcode" in response.url:
-            try:
-                resultado_capturado["datos"] = response.json()
-                resultado_capturado["capturado"] = True
-            except Exception:
-                pass
+        for nombre_endpoint in ["getPuntosAtencionServiciosLowcode", "getFechasDisponibles"]:
+            if nombre_endpoint in response.url:
+                try:
+                    respuestas_capturadas[nombre_endpoint] = response.json()
+                except Exception:
+                    pass
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True, args=[
@@ -1416,19 +1434,20 @@ def envigado_hay_puntos_disponibles():
                 print("Aviso 'sin agenda disponible' detectado justo despues de 'Agregar servicio' -- confirmado, no hay citas.", flush=True)
                 return []
 
-            # Esperar a que la peticion se dispare y la respuesta llegue.
-            # Se revisa el aviso de "sin agenda" en cada vuelta tambien,
-            # por si aparece justo en este momento (a veces tarda un poco
-            # en mostrarse despues del clic).
+            # Esperar a que la peticion de puntos se dispare y la
+            # respuesta llegue. Se revisa el aviso de "sin agenda" en
+            # cada vuelta tambien, por si aparece justo en este momento
+            # (a veces tarda un poco en mostrarse despues del clic).
             for _ in range(10):
-                if resultado_capturado["capturado"]:
+                if "getPuntosAtencionServiciosLowcode" in respuestas_capturadas:
                     break
                 if _envigado_hay_aviso_sin_agenda(page):
                     print("Aviso 'sin agenda disponible' detectado mientras se esperaba la respuesta -- confirmado, no hay citas.", flush=True)
                     return []
                 page.wait_for_timeout(1000)
 
-            if not resultado_capturado["capturado"]:
+            puntos = respuestas_capturadas.get("getPuntosAtencionServiciosLowcode")
+            if not puntos:
                 # Diagnostico: se imprime un resumen del HTML visible para
                 # poder ajustar los selectores si algo no coincidio.
                 print("=== DIAGNOSTICO citas Envigado: no se capturo la respuesta esperada ===", flush=True)
@@ -1439,6 +1458,47 @@ def envigado_hay_puntos_disponibles():
                 except Exception as e_txt:
                     print("No se pudo leer el texto de la pagina:", e_txt, flush=True)
                 print("=== FIN DIAGNOSTICO ===", flush=True)
+                context.close(); browser.close()
+                return []
+
+            print(f"Puntos de atencion encontrados (revisando fecha objetivo {fecha_objetivo}): {puntos}", flush=True)
+
+            # Por cada punto/sede que ofrece el tramite, se elige esa sede
+            # y se revisa si el PROXIMO DIA HABIL especificamente esta en
+            # su lista de fechas disponibles -- esto es lo que realmente
+            # confirma que hay cupo, a diferencia de solo listar el
+            # tramite como ofrecido.
+            for punto in puntos:
+                nombre_sede = punto.get("nombreSubsede") or "Sede desconocida"
+                id_subsede = punto.get("idSubsede")
+                if id_subsede is None:
+                    continue
+
+                respuestas_capturadas.pop("getFechasDisponibles", None)
+                try:
+                    page.evaluate(f"""() => {{
+                        var el = document.querySelector('#seleccione_punto_atencion');
+                        if (!el) return false;
+                        el.value = '{id_subsede}';
+                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        return true;
+                    }}""")
+                except Exception as e_sede:
+                    print(f"No se pudo seleccionar la sede '{nombre_sede}': {e_sede}", flush=True)
+                    continue
+                page.wait_for_timeout(1500)
+
+                for _ in range(10):
+                    if "getFechasDisponibles" in respuestas_capturadas:
+                        break
+                    page.wait_for_timeout(1000)
+
+                fechas_disponibles = respuestas_capturadas.get("getFechasDisponibles") or []
+                dias_atencion = [f.get("diaAtencion") for f in fechas_disponibles if isinstance(f, dict)]
+                print(f"Fechas disponibles en '{nombre_sede}': {dias_atencion}", flush=True)
+
+                if fecha_objetivo in dias_atencion:
+                    resultado_final.append({"sede": nombre_sede, "fecha": fecha_objetivo})
 
         except Exception as e:
             print(f"Error en el flujo de Playwright para citas Envigado: {e}", flush=True)
@@ -1448,16 +1508,17 @@ def envigado_hay_puntos_disponibles():
                 print("=== FIN DIAGNOSTICO ===", flush=True)
             except Exception:
                 pass
+            return None
         finally:
             context.close(); browser.close()
 
-    return resultado_capturado["datos"]
+    return resultado_final
 
 
 def envigado_revisar_citas_disponibles(dias_adelante=14):
-    """Revisa si hay ALGUN punto de atencion con citas disponibles (una
-    sola peticion, no dia por dia), y guarda el resultado en la base de
-    datos. 'dias_adelante' ya no se usa para hacer mas peticiones -- se
+    """Revisa si el proximo dia habil tiene cupo en alguna sede, y guarda
+    el resultado en la base de datos. 'dias_adelante' ya no se usa (se
+    revisa unicamente el proximo dia habil, no un rango de dias) -- se
     deja como parametro por compatibilidad con quien ya llama esta
     funcion. Devuelve una tupla (resultados, hubo_error):
     - resultados: lista de {sede, fecha, cantidad_horarios}
@@ -1483,25 +1544,25 @@ def envigado_revisar_citas_disponibles(dias_adelante=14):
     """)
 
     if isinstance(puntos, list) and len(puntos) > 0:
-        # Aun no conocemos la estructura exacta de una respuesta CON datos
-        # (solo hemos visto la vacia) -- se imprime completa en los logs
-        # para poder revisarla y afinar el formato la primera vez que se
-        # dispare de verdad.
-        print("=== CITAS ENVIGADO: se encontraron puntos disponibles ===", flush=True)
+        # 'puntos' ya viene filtrado -- cada elemento es una sede que SI
+        # tiene el proximo dia habil disponible de verdad (no solo que
+        # ofrece el tramite).
+        print("=== CITAS ENVIGADO: hay cupo para el proximo dia habil ===", flush=True)
         print(puntos, flush=True)
         print("=== FIN ===", flush=True)
-        fecha_hoy = datetime.now().strftime("%d/%m/%Y")
-        resultados.append({
-            "sede": "Ver detalle en logs del servidor",
-            "fecha": fecha_hoy,
-            "cantidad_horarios": len(puntos)
-        })
-        cur.execute("""
-            INSERT INTO envigado_citas_disponibles (sede, id_subsede, fecha_dia, cantidad_horarios, verificado_en)
-            VALUES (%s, %s, %s, %s, NOW())
-            ON CONFLICT (sede, fecha_dia) DO UPDATE SET
-                cantidad_horarios=EXCLUDED.cantidad_horarios, verificado_en=NOW()
-        """, ("Detectado (ver logs)", 0, fecha_hoy, len(puntos)))
+        for p in puntos:
+            resultados.append({
+                "sede": p["sede"],
+                "fecha": p["fecha"],
+                "cantidad_horarios": 1  # se confirma que hay cupo; el conteo exacto de horas se ve al reservar
+            })
+            cur.execute("""
+                INSERT INTO envigado_citas_disponibles (sede, id_subsede, fecha_dia, cantidad_horarios, verificado_en)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (sede, fecha_dia) DO UPDATE SET
+                    cantidad_horarios=EXCLUDED.cantidad_horarios, verificado_en=NOW()
+            """, (p["sede"], 0, p["fecha"], 1))
+
     else:
         # Sin citas en este momento -- se limpia cualquier resultado
         # positivo anterior guardado hoy, para no mostrar un aviso viejo
