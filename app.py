@@ -2031,6 +2031,42 @@ def envigado_reservar_cita(solicitud):
             }}""")
             print(f"{etiqueta} Resultado de inyectar el token: {resultado_inyeccion}", flush=True)
 
+            # El sitio usa AngularJS (clasico) -- el boton "Confirmar cita"
+            # probablemente esta deshabilitado por una expresion tipo
+            # ng-disabled que Angular solo revisa de nuevo cuando corre su
+            # "digest cycle" (no se entera de cambios hechos por fuera de
+            # su propio framework, como crear un textarea a mano). Se
+            # busca el scope de Angular mas cercano al boton y se le
+            # fuerza un $apply() para que reevalue todas sus condiciones,
+            # incluida la del boton.
+            resultado_angular = page.evaluate("""() => {
+                var resultado = { angular_encontrado: false, apply_ok: false, boton_disabled_despues: null };
+                if (typeof angular === 'undefined') return resultado;
+                resultado.angular_encontrado = true;
+                var boton = document.getElementById('btnGuardarCita');
+                var el = boton || document.querySelector('[ng-app]') || document.body;
+                try {
+                    var scope = angular.element(el).scope();
+                    if (!scope) {
+                        // A veces el elemento exacto no tiene scope propio -- se busca hacia arriba.
+                        var actual = el;
+                        while (actual && !scope) {
+                            scope = angular.element(actual).scope();
+                            actual = actual.parentElement;
+                        }
+                    }
+                    if (scope) {
+                        scope.$apply();
+                        resultado.apply_ok = true;
+                    }
+                } catch (e) {
+                    resultado.error = String(e);
+                }
+                if (boton) resultado.boton_disabled_despues = boton.disabled;
+                return resultado;
+            }""")
+            print(f"{etiqueta} Resultado de forzar el digest de Angular: {resultado_angular}", flush=True)
+
             # Si no se encontro el textarea en la pagina principal, puede
             # estar dentro de un iframe (asi renderiza normalmente
             # reCAPTCHA) -- se busca en TODOS los frames de la pagina, y
