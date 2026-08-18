@@ -2221,7 +2221,48 @@ def envigado_reservar_cita(solicitud):
             except Exception:
                 pass
 
-            resultado["mensaje"] = "Se resolvio el reCAPTCHA y se detuvo justo antes de confirmar (a proposito) -- revisa el diagnostico en los logs para confirmar que el captcha se acepto bien (ej. que el boton de confirmar ya no aparezca deshabilitado), y avisa para programar el ultimo paso (el clic final que si reserva la cita)."
+            # --- PASO FINAL: clic real en "Confirmar cita" -- esto SI
+            # reserva la cita de verdad. Se captura la respuesta de
+            # agendarCitaGAComponentes (el endpoint real de confirmacion,
+            # ya venia previsto en _capturar_respuesta) para saber si
+            # salio bien y obtener el numero de atencion. ---
+            respuestas_capturadas.pop("agendarCitaGAComponentes", None)
+            print(f"{etiqueta} Haciendo clic en 'Confirmar cita' -- ESTO RESERVA LA CITA DE VERDAD...", flush=True)
+            try:
+                page.click('#btnGuardarCita', timeout=8000)
+            except Exception as e_clic_confirmar:
+                resultado["mensaje"] = f"No se pudo hacer clic en 'Confirmar cita': {e_clic_confirmar}"
+                return resultado
+
+            for _ in range(15):
+                if "agendarCitaGAComponentes" in respuestas_capturadas:
+                    break
+                page.wait_for_timeout(1000)
+
+            respuesta_confirmacion = respuestas_capturadas.get("agendarCitaGAComponentes")
+            print(f"{etiqueta} Respuesta de agendarCitaGAComponentes: {respuesta_confirmacion}", flush=True)
+
+            try:
+                print(f"{etiqueta} Texto visible de la pagina despues del clic final:", page.inner_text("body")[:2000], flush=True)
+            except Exception:
+                pass
+
+            if respuesta_confirmacion:
+                # La estructura exacta se confirma con el resultado real
+                # -- se buscan las claves mas probables para el numero de
+                # atencion, sin asumir un unico nombre de campo.
+                nro_atencion = None
+                if isinstance(respuesta_confirmacion, dict):
+                    for clave_posible in ("nroAtencion", "numeroAtencion", "nro_atencion", "codigo", "id"):
+                        if respuesta_confirmacion.get(clave_posible):
+                            nro_atencion = respuesta_confirmacion[clave_posible]
+                            break
+                resultado["exito"] = True
+                resultado["nro_atencion"] = nro_atencion
+                resultado["mensaje"] = f"Cita reservada exitosamente para el {fecha_elegida} a las {hora_ini_valor}." + (f" Nro. atencion: {nro_atencion}" if nro_atencion else "")
+                resultado["detalle"] = respuesta_confirmacion
+            else:
+                resultado["mensaje"] = "Se hizo clic en 'Confirmar cita' pero no se pudo confirmar el resultado (revisar diagnostico en los logs -- puede que si se haya reservado)."
             return resultado
 
         except Exception as e:
