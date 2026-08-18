@@ -2039,32 +2039,49 @@ def envigado_reservar_cita(solicitud):
             # busca el scope de Angular mas cercano al boton y se le
             # fuerza un $apply() para que reevalue todas sus condiciones,
             # incluida la del boton.
-            resultado_angular = page.evaluate("""() => {
-                var resultado = { angular_encontrado: false, apply_ok: false, boton_disabled_despues: null };
+            #
+            # ADEMAS: si la condicion del boton llama directamente a
+            # grecaptcha.getResponse() (la funcion real de Google, en vez
+            # de leer el textarea), esa funcion no sabe nada de nuestro
+            # token porque nunca se llamo grecaptcha.render() de verdad
+            # -- se SOBRESCRIBE esa funcion para que siempre devuelva
+            # nuestro token ya resuelto, sin importar el widget id.
+            resultado_angular = page.evaluate(f"""() => {{
+                var resultado = {{ angular_encontrado: false, apply_ok: false, boton_disabled_despues: null, grecaptcha_sobreescrito: false }};
+
+                if (typeof grecaptcha !== 'undefined') {{
+                    try {{
+                        grecaptcha.getResponse = function(id) {{ return {json.dumps(token_captcha)}; }};
+                        resultado.grecaptcha_sobreescrito = true;
+                    }} catch (e) {{
+                        resultado.error_grecaptcha = String(e);
+                    }}
+                }}
+
                 if (typeof angular === 'undefined') return resultado;
                 resultado.angular_encontrado = true;
                 var boton = document.getElementById('btnGuardarCita');
                 var el = boton || document.querySelector('[ng-app]') || document.body;
-                try {
+                try {{
                     var scope = angular.element(el).scope();
-                    if (!scope) {
+                    if (!scope) {{
                         // A veces el elemento exacto no tiene scope propio -- se busca hacia arriba.
                         var actual = el;
-                        while (actual && !scope) {
+                        while (actual && !scope) {{
                             scope = angular.element(actual).scope();
                             actual = actual.parentElement;
-                        }
-                    }
-                    if (scope) {
+                        }}
+                    }}
+                    if (scope) {{
                         scope.$apply();
                         resultado.apply_ok = true;
-                    }
-                } catch (e) {
+                    }}
+                }} catch (e) {{
                     resultado.error = String(e);
-                }
+                }}
                 if (boton) resultado.boton_disabled_despues = boton.disabled;
                 return resultado;
-            }""")
+            }}""")
             print(f"{etiqueta} Resultado de forzar el digest de Angular: {resultado_angular}", flush=True)
 
             # Si no se encontro el textarea en la pagina principal, puede
