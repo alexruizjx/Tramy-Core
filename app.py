@@ -6285,7 +6285,7 @@ def personas_buscar_endpoint():
             patron = f"%{consulta}%"
             cur.execute("""
                 SELECT id, nombres, apellido, segundo_apellido, tipo_documento, numero_documento,
-                       direccion, ciudad, telefono, email
+                       telefono, direccion, barrio_info, ciudad, email
                 FROM personas
                 WHERE numero_documento ILIKE %s OR nombres ILIKE %s OR apellido ILIKE %s
                 ORDER BY actualizado_en DESC LIMIT 20
@@ -6293,15 +6293,15 @@ def personas_buscar_endpoint():
         else:
             cur.execute("""
                 SELECT id, nombres, apellido, segundo_apellido, tipo_documento, numero_documento,
-                       direccion, ciudad, telefono, email
+                       telefono, direccion, barrio_info, ciudad, email
                 FROM personas ORDER BY actualizado_en DESC LIMIT 20
             """)
         filas = cur.fetchall()
         cur.close(); conn.close()
         personas = [{
             "id": f[0], "nombres": f[1], "apellido": f[2], "segundo_apellido": f[3],
-            "tipo_documento": f[4], "numero_documento": f[5], "direccion": f[6],
-            "ciudad": f[7], "telefono": f[8], "email": f[9],
+            "tipo_documento": f[4], "numero_documento": f[5], "telefono": f[6],
+            "direccion": f[7], "barrio_info": f[8], "ciudad": f[9], "email": f[10],
         } for f in filas]
         return jsonify({"ok": True, "personas": personas})
     except Exception as e:
@@ -6323,22 +6323,22 @@ def personas_guardar_endpoint():
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO personas (nombres, apellido, segundo_apellido, tipo_documento, numero_documento,
-                                   direccion, ciudad, telefono, email, notas, actualizado_en)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                                   telefono, direccion, barrio_info, ciudad, email, notas, actualizado_en)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             ON CONFLICT (numero_documento) DO UPDATE SET
                 nombres = EXCLUDED.nombres, apellido = EXCLUDED.apellido,
                 segundo_apellido = EXCLUDED.segundo_apellido, tipo_documento = EXCLUDED.tipo_documento,
-                direccion = EXCLUDED.direccion, ciudad = EXCLUDED.ciudad,
-                telefono = EXCLUDED.telefono, email = EXCLUDED.email,
-                notas = EXCLUDED.notas, actualizado_en = NOW()
+                telefono = EXCLUDED.telefono, direccion = EXCLUDED.direccion,
+                barrio_info = EXCLUDED.barrio_info, ciudad = EXCLUDED.ciudad,
+                email = EXCLUDED.email, notas = EXCLUDED.notas, actualizado_en = NOW()
             RETURNING id
         """, (
             nombres.upper(), (datos.get("apellido") or "").strip().upper(),
             (datos.get("segundo_apellido") or "").strip().upper(),
             (datos.get("tipo_documento") or "CC").strip(), numero_documento,
-            (datos.get("direccion") or "").strip(), (datos.get("ciudad") or "").strip().upper(),
-            (datos.get("telefono") or "").strip(), (datos.get("email") or "").strip(),
-            (datos.get("notas") or "").strip(),
+            (datos.get("telefono") or "").strip(), (datos.get("direccion") or "").strip(),
+            (datos.get("barrio_info") or "").strip(), (datos.get("ciudad") or "").strip().upper(),
+            (datos.get("email") or "").strip(), (datos.get("notas") or "").strip(),
         ))
         persona_id = cur.fetchone()[0]
         conn.commit()
