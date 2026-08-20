@@ -3684,19 +3684,24 @@ APPJX_CELDA_CAPACIDAD = {
 }
 
 
-# Celdas cuyo FORMATO en la plantilla original quedo como numero entero
-# ("0") en vez de texto/general -- cuando el telefono viene vacio, ese
-# formato hace que se muestre literalmente "0" en el PDF en vez de
-# blanco. Se corrige a "General" en tiempo de ejecucion, sin modificar
-# el archivo original. Confirmado revisando la plantilla real.
+# Celdas de TELEFONO en cada documento que dependen de una formula
+# (=EXPORTAR!D14 o similar) que, cuando la celda de origen esta vacia,
+# Excel/LibreOffice la evalua como el NUMERO 0 (asi es como Excel trata
+# SIEMPRE una referencia a una celda vacia, sin importar el formato de
+# la celda que muestra el resultado -- cambiar el numero_format NO
+# alcanza a arreglar esto). La solucion real es escribir el valor de
+# telefono DIRECTO en la celda del documento (no depender de la
+# formula), igual que ya se hace con otros datos fragiles como la linea
+# de empresa o la capacidad. Cada entrada dice que ROL de persona
+# corresponde a esa celda.
 APPJX_CELDAS_TELEFONO_A_CORREGIR = {
-    "formulario": ["S29", "S44"],
-    "formulario_dos_vendedores": ["S31", "S46"],
-    "formulario_dos_compradores": ["S45"],
-    "compraventa": ["B7", "B14"],
-    "compraventa_dos_vendedores": ["B7", "G7", "B14"],
-    "compraventa_dos_compradores": ["B7", "G7", "B14"],
-    "compraventa_persona_juridica": ["B7", "B14"],
+    "formulario": [("S29", "propietario"), ("S44", "comprador")],
+    "formulario_dos_vendedores": [("S31", "otro_propietario"), ("S46", "comprador")],
+    "formulario_dos_compradores": [("S45", "comprador")],
+    "compraventa": [("B7", "propietario"), ("B14", "comprador")],
+    "compraventa_dos_vendedores": [("B7", "propietario"), ("G7", "otro_propietario"), ("B14", "comprador")],
+    "compraventa_dos_compradores": [("B7", "propietario"), ("G7", "otro_comprador"), ("B14", "comprador")],
+    "compraventa_persona_juridica": [("B7", "propietario"), ("B14", "comprador")],
 }
 
 
@@ -3722,9 +3727,6 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
                 cell.value = cell.value.replace("[1]EXPORTAR!", "EXPORTAR!")
             elif isinstance(cell.value, str) and "[1]DATOS!" in cell.value:
                 cell.value = cell.value.replace("[1]DATOS!", "DATOS!")
-
-    for celda_tel in APPJX_CELDAS_TELEFONO_A_CORREGIR.get(clave_documento, []):
-        hoja[celda_tel].number_format = "General"
 
     exportar = wb["EXPORTAR"]
     exportar["D27"] = datos_vehiculo.get("placa", "")
@@ -3834,6 +3836,17 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     _escribir_bloque_persona(8, con_direccion=True, persona=datos_vehiculo.get("otro_propietario"), columna=7)
     _escribir_bloque_persona(16, con_direccion=True, persona=datos_vehiculo.get("comprador"), columna=4)
     _escribir_bloque_persona(16, con_direccion=True, persona=datos_vehiculo.get("otro_comprador"), columna=7)
+
+    # Se escribe el telefono TAMBIEN directo en la celda del documento
+    # (ademas de en EXPORTAR) -- una formula que apunta a una celda vacia
+    # se evalua como 0 en Excel/LibreOffice sin importar el formato de la
+    # celda de destino, asi que la unica forma confiable de que un
+    # telefono vacio se vea en blanco es no depender de la formula.
+    for celda_doc, clave_persona in APPJX_CELDAS_TELEFONO_A_CORREGIR.get(clave_documento, []):
+        persona_rol = datos_vehiculo.get(clave_persona) or {}
+        celda = hoja[celda_doc]
+        celda.value = persona_rol.get("telefono") or ""
+        celda.number_format = "General"
 
     # Las celdas DENTRO del documento (no en EXPORTAR) que muestran estos
     # datos de personas dependen de que LibreOffice recalcule su formula
