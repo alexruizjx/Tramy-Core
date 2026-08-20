@@ -3694,6 +3694,33 @@ APPJX_CELDA_CAPACIDAD = {
 # formula), igual que ya se hace con otros datos fragiles como la linea
 # de empresa o la capacidad. Cada entrada dice que ROL de persona
 # corresponde a esa celda.
+# Casillas de TRAMITE en las 3 variantes de Formulario -- confirmado
+# revisando la plantilla real que la cuadrilla de 18 casillas (filas
+# 7, 9 y 12) es IDENTICA en las 3 hojas (Formulario, Formulario (2),
+# Formulario (3)), asi que un solo mapeo aplica a las tres. Cada entrada
+# tiene DOS celdas (numero + etiqueta) que se pintan de verde juntas.
+CELDAS_TRAMITE_FORMULARIO = {
+    "MATRICULA/ REGISTRO": ("A7", "B7"), "TRASLADO MATRICULA / REGISTRO": ("I7", "J7"),
+    "RADICADO MATRICULA / REGISTRO": ("N7", "O7"), "CAMBIO DE COLOR": ("Q7", "R7"),
+    "CAMBIO DE SERVICIO": ("T7", "U7"),
+    "REGRABAR MOTOR": ("A9", "B9"), "REGRABAR CHASIS": ("E9", "F9"),
+    "DUPLICADO LICENCIA TRANSITO": ("N9", "O9"), "INSCRIPC. PRENDA": ("Q9", "R9"), "LEVANTA PRENDA": ("T9", "U9"),
+    "CANCELACION MATRICULA / REGISTRO": ("A12", "B12"), "CAMBIO DE PLACAS": ("E12", "F12"),
+    "DUPLICADO DE PLACAS": ("I12", "J12"), "REMATRICULA": ("N12", "O12"),
+    "CAMBIO DE CARROCERIA": ("Q12", "R12"),
+}
+CELDA_OTROS_TRAMITE_FORMULARIO = ("T12", "U12")
+
+# Celda donde se escribe DIRECTO (no por formula) el texto de traslado de
+# cuenta cuando se elige el tramite "TRASLADO MATRICULA / REGISTRO" --
+# cada variante de Formulario tiene esta celda en una fila distinta
+# (confirmado revisando la plantilla real).
+APPJX_CELDA_TRASLADO_TEXTO = {
+    "formulario": "W41",
+    "formulario_dos_vendedores": "W43",
+    "formulario_dos_compradores": "W41",
+}
+
 APPJX_CELDAS_TELEFONO_A_CORREGIR = {
     "formulario": [("S29", "propietario"), ("S44", "comprador")],
     "formulario_dos_vendedores": [("S31", "otro_propietario"), ("S46", "comprador")],
@@ -4027,6 +4054,41 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     else:
         hoja.sheet_properties.pageSetUpPr.fitToPage = True
     wb.active = wb.sheetnames.index(nombre_hoja)
+
+    # Resaltado de tramites (solo aplica a las 3 variantes de
+    # Formulario -- son las unicas que tienen esta cuadricula de
+    # casillas). Se normaliza el texto (mayusculas, espacios multiples
+    # colapsados) para que coincida sin importar variaciones pequeñas de
+    # como se escribio en el modulo de tramites.
+    if clave_documento in APPJX_CELDA_TRASLADO_TEXTO:
+        tramites_elegidos = datos_vehiculo.get("tramites_seleccionados") or []
+        for tramite_texto in tramites_elegidos:
+            tramite_normalizado = re.sub(r"\s+", " ", (tramite_texto or "").strip().upper())
+            if tramite_normalizado == "OTROS":
+                celdas_marcar = [CELDA_OTROS_TRAMITE_FORMULARIO]
+            else:
+                # Se busca por coincidencia normalizada contra las claves
+                # del mapeo (tambien normalizadas), en vez de exigir un
+                # match exacto de texto.
+                celdas_marcar = []
+                for clave_mapa, celdas in CELDAS_TRAMITE_FORMULARIO.items():
+                    if re.sub(r"\s+", " ", clave_mapa.strip().upper()) == tramite_normalizado:
+                        celdas_marcar = [celdas]
+                        break
+            for celda_num, celda_etq in celdas_marcar:
+                hoja[celda_num].fill = VERDE_MARCA
+                hoja[celda_etq].fill = VERDE_MARCA
+
+            # Caso especial: "TRASLADO MATRICULA / REGISTRO" ademas
+            # escribe el texto DIRECTO (no por formula) en la celda de
+            # abajo del parrafo "ESPECIFIQUE LA PALABRA OTRO...", con el
+            # municipio del vehiculo -- igual que con el telefono, una
+            # formula que depende de una celda vacia puede fallar al
+            # convertir a PDF, asi que se escribe el valor ya armado.
+            if tramite_normalizado == "TRASLADO MATRICULA / REGISTRO":
+                celda_traslado = APPJX_CELDA_TRASLADO_TEXTO[clave_documento]
+                municipio_vehiculo = (datos_vehiculo.get("municipio") or "").strip()
+                hoja[celda_traslado] = f"Traslado de Cuenta hacia la secretaria de transito de {municipio_vehiculo}".strip()
 
     id_temp = str(uuid.uuid4())[:8]
     ruta_xlsm_temp = f"/tmp/_appjxdoc_{id_temp}.xlsm"
