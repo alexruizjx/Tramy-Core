@@ -6469,14 +6469,18 @@ def consultar_runt_vehiculo_endpoint():
 
 def guardar_mi_consulta(user_id, placa, cedula):
     """Registra que este usuario en particular consulto esta placa (y
-    cedula), para el historial personal de 'Mis vehiculos consultados'."""
+    cedula), para el historial personal de 'Mis vehiculos consultados'.
+    La restriccion unica es solo (user_id, placa) -- si la cedula viene
+    distinta a una consulta anterior de esa misma placa (ej. por
+    diferencias de formato), se ACTUALIZA la fila existente en vez de
+    crear una copia nueva."""
     try:
         conn = get_db_conn()
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO mis_consultas (user_id, placa, cedula, actualizado_en)
             VALUES (%s, %s, %s, NOW())
-            ON CONFLICT (user_id, placa, cedula) DO UPDATE SET actualizado_en = NOW()
+            ON CONFLICT (user_id, placa) DO UPDATE SET cedula = EXCLUDED.cedula, actualizado_en = NOW()
         """, (user_id, placa, cedula))
         conn.commit()
         cur.close(); conn.close()
