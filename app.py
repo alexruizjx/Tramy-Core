@@ -3700,7 +3700,8 @@ APPJX_CELDA_CAPACIDAD = {
 # Formulario (3)), asi que un solo mapeo aplica a las tres. Cada entrada
 # tiene DOS celdas (numero + etiqueta) que se pintan de verde juntas.
 CELDAS_TRAMITE_FORMULARIO = {
-    "MATRICULA/ REGISTRO": ("A7", "B7"), "TRASLADO MATRICULA / REGISTRO": ("I7", "J7"),
+    "MATRICULA/ REGISTRO": ("A7", "B7"), "TRASPASO": ("E7", "F7"),
+    "TRASLADO MATRICULA / REGISTRO": ("I7", "J7"),
     "RADICADO MATRICULA / REGISTRO": ("N7", "O7"), "CAMBIO DE COLOR": ("Q7", "R7"),
     "CAMBIO DE SERVICIO": ("T7", "U7"),
     "REGRABAR MOTOR": ("A9", "B9"), "REGRABAR CHASIS": ("E9", "F9"),
@@ -4081,14 +4082,19 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
 
             # Caso especial: "TRASLADO MATRICULA / REGISTRO" ademas
             # escribe el texto DIRECTO (no por formula) en la celda de
-            # abajo del parrafo "ESPECIFIQUE LA PALABRA OTRO...", con el
-            # municipio del vehiculo -- igual que con el telefono, una
-            # formula que depende de una celda vacia puede fallar al
-            # convertir a PDF, asi que se escribe el valor ya armado.
+            # abajo del parrafo "ESPECIFIQUE LA PALABRA OTRO..." -- igual
+            # que con el telefono, una formula que depende de una celda
+            # vacia puede fallar al convertir a PDF, asi que se escribe
+            # el valor ya armado. Usa el MUNICIPIO DE DESTINO elegido a
+            # mano en el frontend (no el municipio del vehiculo -- ese es
+            # de donde SALE el tramite, no hacia donde se traslada).
             if tramite_normalizado == "TRASLADO MATRICULA / REGISTRO":
                 celda_traslado = APPJX_CELDA_TRASLADO_TEXTO[clave_documento]
-                municipio_vehiculo = (datos_vehiculo.get("municipio") or "").strip()
-                hoja[celda_traslado] = f"Traslado de Cuenta hacia la secretaria de transito de {municipio_vehiculo}".strip()
+                municipio_destino = (datos_vehiculo.get("traslado_municipio_destino") or "").strip()
+                celda_obj = hoja[celda_traslado]
+                celda_obj.value = f"Traslado de Cuenta hacia la secretaria de transito de {municipio_destino}".strip()
+                celda_obj.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+                celda_obj.fill = VERDE_MARCA
 
     id_temp = str(uuid.uuid4())[:8]
     ruta_xlsm_temp = f"/tmp/_appjxdoc_{id_temp}.xlsm"
