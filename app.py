@@ -8071,6 +8071,32 @@ def mis_vehiculos_runt():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/mis-vehiculos-eliminar", methods=["POST"])
+def mis_vehiculos_eliminar_endpoint():
+    """Elimina una placa del historial personal del usuario (tabla
+    mis_consultas) -- NO borra el vehiculo de la tabla global 'vehiculos'
+    (otros usuarios que tambien la hayan consultado siguen viendola en su
+    propio historial, y la placa se puede volver a consultar despues sin
+    problema)."""
+    datos = request.get_json(silent=True) or {}
+    user_id = (datos.get("user_id") or "").strip()
+    placa = (datos.get("placa") or "").strip().upper()
+    if not user_id or not placa:
+        return jsonify({"ok": False, "error": "Faltan user_id o placa."}), 400
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM mis_consultas WHERE user_id = %s AND placa = %s", (user_id, placa))
+        eliminada = cur.rowcount > 0
+        conn.commit()
+        cur.close(); conn.close()
+        if not eliminada:
+            return jsonify({"ok": False, "error": "No se encontró esa placa en tu historial."}), 404
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/vehiculos-buscar", methods=["GET"])
 def vehiculos_buscar():
     """Autocompletado: si hay texto ('q'), devuelve placas que empiecen con
