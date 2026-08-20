@@ -46,6 +46,15 @@ IPROYAL_HOST = os.environ.get("IPROYAL_HOST", "geo.iproyal.com")
 IPROYAL_PORT = os.environ.get("IPROYAL_PORT", "12321")
 IPROYAL_USER = os.environ.get("IPROYAL_USER", "")
 IPROYAL_PASS = os.environ.get("IPROYAL_PASS", "")
+# DataImpulse -- proxy residencial usado para el monitoreo/reserva de
+# citas de Envigado, para evitar que el sitio detecte el trafico
+# repetido del servidor como sospechoso y escale la dificultad del
+# captcha. Host/puerto por defecto segun la documentacion de
+# DataImpulse -- ajustar via variables de entorno si difieren.
+DATAIMPULSE_HOST = os.environ.get("DATAIMPULSE_HOST", "gw.dataimpulse.com")
+DATAIMPULSE_PORT = os.environ.get("DATAIMPULSE_PORT", "823")
+DATAIMPULSE_USER = os.environ.get("DATAIMPULSE_USER", "")
+DATAIMPULSE_PASS = os.environ.get("DATAIMPULSE_PASS", "")
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_CLAIMS = {"sub": "mailto:soporte@tramy.app"}
 
@@ -247,6 +256,22 @@ def job_error(job_id, mensaje_error):
 # ============================================================
 #  CACHE IMPUESTOS ANTIOQUIA
 # ============================================================
+
+def _dataimpulse_proxy_config(etiqueta=""):
+    """Construye la configuracion de proxy residencial de DataImpulse
+    para usar con Playwright (browser.new_context(proxy=...)). Devuelve
+    None si faltan credenciales (y avisa por log), para que el llamador
+    pueda decidir seguir sin proxy en vez de fallar."""
+    if DATAIMPULSE_USER and DATAIMPULSE_PASS:
+        print(f"{etiqueta} Usando proxy residencial de DataImpulse.", flush=True)
+        return {
+            "server": f"http://{DATAIMPULSE_HOST}:{DATAIMPULSE_PORT}",
+            "username": DATAIMPULSE_USER,
+            "password": DATAIMPULSE_PASS,
+        }
+    print(f"{etiqueta} *** ALERTA: se pidio usar el proxy de DataImpulse, pero faltan las credenciales (DATAIMPULSE_USER/DATAIMPULSE_PASS) -- esta sesion va SIN proxy, usando la IP normal del servidor.", flush=True)
+    return None
+
 
 def _avaluo_declaracion_mas_reciente(data3):
     """Devuelve el avaluoComercial de la declaracion MAS RECIENTE
@@ -1260,7 +1285,7 @@ def _envigado_proximo_dia_habil():
     return siguiente.strftime("%d/%m/%Y")
 
 
-def envigado_hay_puntos_disponibles():
+def envigado_hay_puntos_disponibles(usar_proxy=True):
     """Revisa, para CADA sede, si el PROXIMO DIA HABIL especificamente
     tiene fechas de atencion disponibles -- no solo si el servicio esta
     listado (eso casi siempre es cierto y causaba falsos positivos, ya
@@ -1276,6 +1301,10 @@ def envigado_hay_puntos_disponibles():
     conexion no viene de un navegador real. Se llena el formulario igual
     que lo haria una persona, con datos de prueba que no corresponden a
     ningun ciudadano real.
+    'usar_proxy' (True por defecto): el trafico repetido del monitoreo
+    desde la misma IP del servidor puede hacer que el sitio escale la
+    dificultad del captcha -- se usa el proxy residencial de DataImpulse
+    por defecto para evitarlo.
     Devuelve una lista de {"sede": nombre, "fecha": "DD/MM/YYYY"} -- una
     entrada por cada sede que SI tiene el proximo dia habil disponible
     (vacia [] si ninguna sede lo tiene), o None si algo fallo."""
@@ -1283,6 +1312,7 @@ def envigado_hay_puntos_disponibles():
     resultado_final = []
     respuestas_capturadas = {}
     todas_las_urls_vistas = []  # diagnostico -- para ver TODAS las peticiones de red relacionadas a citas, sin importar el nombre exacto
+    etiqueta = f"[ENVIGADO-CHEQUEO-{uuid.uuid4().hex[:6]}]"
 
     def _capturar_respuesta(response):
         if "backavit" in response.url or "citas" in response.url:
@@ -1299,9 +1329,11 @@ def envigado_hay_puntos_disponibles():
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
             "--single-process", "--no-zygote", "--disable-setuid-sandbox"
         ])
+        proxy_config = _dataimpulse_proxy_config(etiqueta) if usar_proxy else None
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
             viewport={"width": 390, "height": 844},
+            proxy=proxy_config,
         )
         page = context.new_page()
         page.on("response", _capturar_respuesta)
@@ -1694,9 +1726,11 @@ def envigado_reservar_cita(solicitud):
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
             "--single-process", "--no-zygote", "--disable-setuid-sandbox"
         ])
+        proxy_config = _dataimpulse_proxy_config(etiqueta)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
             viewport={"width": 390, "height": 844},
+            proxy=proxy_config,
         )
         page = context.new_page()
         page.on("response", _capturar_respuesta)
@@ -3650,6 +3684,22 @@ APPJX_CELDA_CAPACIDAD = {
 }
 
 
+# Celdas cuyo FORMATO en la plantilla original quedo como numero entero
+# ("0") en vez de texto/general -- cuando el telefono viene vacio, ese
+# formato hace que se muestre literalmente "0" en el PDF en vez de
+# blanco. Se corrige a "General" en tiempo de ejecucion, sin modificar
+# el archivo original. Confirmado revisando la plantilla real.
+APPJX_CELDAS_TELEFONO_A_CORREGIR = {
+    "formulario": ["S29", "S44"],
+    "formulario_dos_vendedores": ["S31", "S46"],
+    "formulario_dos_compradores": ["S45"],
+    "compraventa": ["B7", "B14"],
+    "compraventa_dos_vendedores": ["B7", "G7", "B14"],
+    "compraventa_dos_compradores": ["B7", "G7", "B14"],
+    "compraventa_persona_juridica": ["B7", "B14"],
+}
+
+
 def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salida_pdf):
     """Genera en PDF cualquiera de los documentos de AppJX.xlsm listados
     en APPJX_DOCUMENTOS, llenando SOLO los datos del vehiculo (placa,
@@ -3672,6 +3722,9 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
                 cell.value = cell.value.replace("[1]EXPORTAR!", "EXPORTAR!")
             elif isinstance(cell.value, str) and "[1]DATOS!" in cell.value:
                 cell.value = cell.value.replace("[1]DATOS!", "DATOS!")
+
+    for celda_tel in APPJX_CELDAS_TELEFONO_A_CORREGIR.get(clave_documento, []):
+        hoja[celda_tel].number_format = "General"
 
     exportar = wb["EXPORTAR"]
     exportar["D27"] = datos_vehiculo.get("placa", "")
@@ -7423,6 +7476,35 @@ def diagnostico_proxy_iproyal_endpoint():
         resultado = subprocess.run(
             ["curl", "-v", "--proxy", proxy_url, "--max-time", "30",
              "https://www.medellin.gov.co/portal-movilidad/index.html"],
+            capture_output=True, text=True, timeout=35
+        )
+        return jsonify({
+            "ok": True,
+            "codigo_salida": resultado.returncode,
+            "salida_estandar": resultado.stdout[-2000:],
+            "salida_error_detallada": resultado.stderr[-4000:],
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "error": "Timeout -- el comando tardo mas de 35 segundos sin responder."}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/diagnostico-proxy-dataimpulse", methods=["GET"])
+def diagnostico_proxy_dataimpulse_endpoint():
+    """Endpoint de diagnostico -- prueba la conexion real del proxy de
+    DataImpulse contra el sitio de citas de Envigado, directo desde el
+    servidor de Railway (sin pasar por Playwright), para confirmar que
+    las credenciales funcionan y que el sitio .gov no esta bloqueado
+    antes de depender del proxy en el flujo completo de citas."""
+    if not (DATAIMPULSE_USER and DATAIMPULSE_PASS):
+        return jsonify({"error": "Faltan las credenciales de DataImpulse en las variables de entorno (DATAIMPULSE_USER/DATAIMPULSE_PASS)."}), 400
+
+    proxy_url = f"http://{DATAIMPULSE_USER}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{DATAIMPULSE_PORT}"
+    try:
+        resultado = subprocess.run(
+            ["curl", "-v", "--proxy", proxy_url, "--max-time", "30",
+             "https://movilidad.envigado.gov.co/portal-servicios/#/agendar-cita-publica"],
             capture_output=True, text=True, timeout=35
         )
         return jsonify({
