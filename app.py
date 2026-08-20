@@ -2711,7 +2711,7 @@ def _programador_automatico_loop():
 threading.Thread(target=_programador_automatico_loop, daemon=True).start()
 
 
-def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_monitor=1, numeros_vigilados=None):
+def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_monitor=3, numeros_vigilados=None):
     """Revisa el "monitor de turnos" de Envigado cada pocos segundos,
     durante 'duracion_segundos'. Cada vez que aparece un idGestionAtencion
     que no habiamos visto, lo guarda con la hora en que Tramy lo detecto
