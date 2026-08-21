@@ -3903,7 +3903,7 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     if _celda_nombre_mandato:
         hoja[_celda_nombre_mandato].alignment = Alignment(
             horizontal=hoja[_celda_nombre_mandato].alignment.horizontal,
-            vertical="center", wrap_text=True,
+            vertical="center", wrap_text=False,
         )
 
     exportar["D51"] = ""  # traslado_municipio -- vacio explicito, si no la formula '=EXPORTAR!D51' en FORMULARIO muestra "0" (una celda totalmente vacia, sin ni siquiera comillas vacias, se lee como cero en una referencia directa)
