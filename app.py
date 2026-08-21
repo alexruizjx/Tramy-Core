@@ -3725,6 +3725,30 @@ CELDAS_TRAMITE_FORMULARIO = {
 }
 CELDA_OTROS_TRAMITE_FORMULARIO = ("T12", "U12")
 
+# Nombres "normalizados" (en lenguaje de contrato) para cada tramite --
+# se usan SOLO en el texto de los contratos de Mandato (Formulario sigue
+# mostrando la etiqueta corta de la casilla, ya que ahi no hay espacio y
+# ademas debe coincidir exactamente con lo impreso en la casilla misma).
+TRAMITE_NOMBRE_NORMALIZADO_MANDATO = {
+    "MATRICULA/ REGISTRO": "Matrícula / Registro",
+    "TRASPASO": "Traspaso de Propiedad",
+    "TRASLADO MATRICULA / REGISTRO": "Traslado de Cuenta / Registro",
+    "RADICADO MATRICULA / REGISTRO": "Radicado de Matrícula / Registro",
+    "CAMBIO DE COLOR": "Cambio de Color",
+    "CAMBIO DE SERVICIO": "Cambio de Servicio",
+    "REGRABAR MOTOR": "Regrabación de Motor",
+    "REGRABAR CHASIS": "Regrabación de Chasis",
+    "DUPLICADO LICENCIA TRANSITO": "Duplicado de Licencia de Tránsito",
+    "INSCRIPC. PRENDA": "Inscripción de Prenda",
+    "LEVANTA PRENDA": "Levantamiento de Prenda",
+    "CANCELACION MATRICULA / REGISTRO": "Cancelación de Matrícula / Registro",
+    "CAMBIO DE PLACAS": "Cambio de Placas",
+    "DUPLICADO DE PLACAS": "Duplicado de Placas",
+    "REMATRICULA": "Rematrícula",
+    "CAMBIO DE CARROCERIA": "Cambio de Carrocería",
+    "OTROS": "Otros",
+}
+
 # Celdas de "Tipo de Servicio" (Particular/Publico/Diplomatico) -- a
 # diferencia de la cuadricula de TRAMITES (identica en las 3 hojas), esta
 # seccion SI cambia de posicion entre variantes (confirmado revisando la
@@ -3874,19 +3898,15 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     # casillas), aqui cada tramite elegido se escribe como texto, uno por
     # linea, en EXPORTAR!D47/D48/D49 (la plantilla original ya tenia esta
     # conexion prevista con esas 3 celdas -- "MANDATO (3)" solo muestra
-    # las primeras 2, las demas variantes muestran las 3). Si entre los
-    # elegidos esta "TRASLADO MATRICULA / REGISTRO", esa linea en
-    # particular se reemplaza por la frase completa con el municipio de
-    # destino, igual que en Formulario.
+    # las primeras 2, las demas variantes muestran las 3). A diferencia
+    # de Formulario, aqui "Traslado" NO lleva la frase larga con el
+    # municipio -- se pidio explicitamente que quedara como un nombre
+    # simple, igual que los demas tramites.
     _tramites_mandato = (datos_vehiculo.get("tramites_seleccionados") or [])[:3]
-    _municipio_destino_mandato = (datos_vehiculo.get("traslado_municipio_destino") or "").strip()
     _lineas_mandato = []
     for _t in _tramites_mandato:
         _t_norm = re.sub(r"\s+", " ", (_t or "").strip().upper())
-        if _t_norm == "TRASLADO MATRICULA / REGISTRO":
-            _lineas_mandato.append(f"Traslado de Cuenta hacia la secretaria de transito de {_municipio_destino_mandato}".strip())
-        else:
-            _lineas_mandato.append(_t)
+        _lineas_mandato.append(TRAMITE_NOMBRE_NORMALIZADO_MANDATO.get(_t_norm, _t))
     exportar["D47"] = _lineas_mandato[0] if len(_lineas_mandato) > 0 else ""
     exportar["D48"] = _lineas_mandato[1] if len(_lineas_mandato) > 1 else ""
     exportar["D49"] = _lineas_mandato[2] if len(_lineas_mandato) > 2 else ""
