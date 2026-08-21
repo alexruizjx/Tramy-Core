@@ -3270,19 +3270,6 @@ def _parsear_resultado_runt_vehiculo(page):
     def campo(nombre):
         return plano_lower.get(nombre.lower(), "")
 
-    def campo_primero_valido(*nombres):
-        """Prueba varios nombres de campo en orden, y devuelve el primero
-        que tenga un valor real (ni vacio ni '0') -- por ejemplo, en el
-        RUNT 'Pasajeros Sentados' trae el dato real (ej. '4'), mientras
-        que 'Capacidad de Pasajeros' casi siempre viene en '0' aunque el
-        vehiculo si tenga capacidad -- sin este orden de prioridad, el
-        '0' se quedaba primero y tapaba el dato bueno."""
-        for nombre in nombres:
-            valor = campo(nombre)
-            if valor and valor.strip() != "0":
-                return valor
-        return ""
-
     datos = {
         "marca": campo("Marca"),
         "linea": campo("Línea"),
@@ -3301,7 +3288,13 @@ def _parsear_resultado_runt_vehiculo(page):
         "puertas": campo("Puertas"),
         "capacidad_carga": campo("Capacidad de Carga"),
         "peso_bruto_vehicular": campo("Peso Bruto Vehicular"),
-        "capacidad_pasajeros": campo_primero_valido("Capacidad Pasajeros Sentados", "Pasajeros Sentados", "Capacidad Pax Sentados", "Capacidad de Pasajeros"),
+        # Son DOS datos reales y distintos en el RUNT (confirmado con un
+        # caso real) -- antes se mezclaban con una logica de "el primero
+        # que no sea 0", pero eso a veces devolvia el dato de UN campo
+        # guardado bajo el nombre del OTRO. Ahora cada uno se lee por su
+        # propia etiqueta exacta, sin adivinar ni mezclar.
+        "capacidad_pasajeros": campo("Capacidad de Pasajeros"),
+        "pasajeros_sentados": campo("Capacidad Pasajeros Sentados") or campo("Pasajeros Sentados"),
         "numero_ejes": campo("Número de Ejes"),
         "estado_vehiculo": campo("Estado del vehículo"),
         "gravamenes_propiedad": campo("Gravámenes a la propiedad").upper() == "SI",
@@ -3482,7 +3475,12 @@ CELDAS_SERVICIO = {
 # bloque aplica a las 3 por igual.
 CELDAS_REFERENCIA_SIMPLE_VEHICULO = {
     "AJ3": "placa", "W7": "marca", "Z7": "linea", "W10": "color",
-    "AG10": "modelo", "AI10": "cilindrada", "W13": "capacidad",
+    "AG10": "modelo", "AI10": "cilindrada",
+    # NOTA: "capacidad" (W13) NO va en este diccionario a proposito -- ya
+    # se escribe aparte (ver APPJX_CELDA_CAPACIDAD mas abajo), con una
+    # regla especial que trata "0" como vacio (0 pasajeros no es un dato
+    # real, es la ausencia del dato). Si se agregara aqui tambien, este
+    # bloque genérico volvia a escribir "0" encima de esa correccion.
     "AE17": "numero_motor", "W19": "carroceria", "AE19": "numero_chasis",
     "AE22": "numero_serie", "AE24": "vin",
 }
