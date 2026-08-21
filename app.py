@@ -3930,6 +3930,14 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     exportar["D48"] = _lineas_mandato[1] if len(_lineas_mandato) > 1 else ""
     exportar["D49"] = _lineas_mandato[2] if len(_lineas_mandato) > 2 else ""
 
+    # "MANDATO (3)" solo tenia 2 lineas conectadas (A14/A15, con formula
+    # a D47/D48) -- A13 estaba vacia y sin usar, pero hay espacio real
+    # ahi para una 3ra linea. Se escribe DIRECTO (no hay formula previa
+    # que reutilizar), copiando la fuente de A14 para que se vea igual.
+    if nombre_hoja == "MANDATO (3)":
+        hoja["A13"].value = _lineas_mandato[2] if len(_lineas_mandato) > 2 else ""
+        hoja["A13"].font = copy.copy(hoja["A14"].font)
+
     # Linea de datos de la empresa (nombre, telefono, correo, etc.) que
     # aparece al pie de cada documento -- se escribe en DATOS!W2 (por si
     # algun otro lado de la plantilla la usa) Y TAMBIEN directo en la
