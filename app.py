@@ -3755,14 +3755,43 @@ APPJX_CELDA_TRASLADO_TEXTO = {
     "formulario_dos_compradores": "W41",
 }
 
-APPJX_CELDAS_TELEFONO_A_CORREGIR = {
-    "formulario": [("S29", "propietario"), ("S44", "comprador")],
-    "formulario_dos_vendedores": [("S31", "otro_propietario"), ("S46", "comprador")],
-    "formulario_dos_compradores": [("S45", "comprador")],
-    "compraventa": [("B7", "propietario"), ("B14", "comprador")],
-    "compraventa_dos_vendedores": [("B7", "propietario"), ("G7", "otro_propietario"), ("B14", "comprador")],
-    "compraventa_dos_compradores": [("B7", "propietario"), ("G7", "otro_comprador"), ("B14", "comprador")],
-    "compraventa_persona_juridica": [("B7", "propietario"), ("B14", "comprador")],
+# Celdas de DIRECCION/CIUDAD/TELEFONO por documento y rol -- se escriben
+# DIRECTO (no por formula) porque una formula que apunta a una celda
+# vacia se evalua como 0 en Excel/LibreOffice, sin importar el formato
+# de la celda de destino (confirmado con casos reales: paso primero con
+# telefono, luego se confirmo que direccion/ciudad tienen el mismo
+# problema en "FORMULARIO (2)"). No se incluye la hoja base "FORMULARIO"
+# aqui porque esa ya tiene su propio manejo (CELDAS_REFERENCIA_SIMPLE_
+# PERSONAS, mas abajo), que ya escribe vacio correctamente.
+APPJX_CELDAS_PERSONA_A_CORREGIR = {
+    "formulario_dos_vendedores": {
+        "propietario": {"direccion": "A30", "ciudad": "M30", "telefono": "S30"},
+        "otro_propietario": {"direccion": "A31", "ciudad": "M31", "telefono": "S31"},
+        "comprador": {"direccion": "A46", "ciudad": "M46", "telefono": "S46"},
+    },
+    "formulario_dos_compradores": {
+        "propietario": {"direccion": "A29", "ciudad": "M29", "telefono": "S29"},
+        "comprador": {"direccion": "A45", "ciudad": "M45", "telefono": "S45"},
+        "otro_comprador": {"direccion": "A44", "ciudad": "M44", "telefono": "S44"},
+    },
+    "compraventa": {
+        "propietario": {"telefono": "B7"},
+        "comprador": {"telefono": "B14"},
+    },
+    "compraventa_dos_vendedores": {
+        "propietario": {"telefono": "B7"},
+        "otro_propietario": {"telefono": "G7"},
+        "comprador": {"telefono": "B14"},
+    },
+    "compraventa_dos_compradores": {
+        "propietario": {"telefono": "B7"},
+        "otro_comprador": {"telefono": "G7"},
+        "comprador": {"telefono": "B14"},
+    },
+    "compraventa_persona_juridica": {
+        "propietario": {"telefono": "B7"},
+        "comprador": {"telefono": "B14"},
+    },
 }
 
 
@@ -3898,16 +3927,17 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     _escribir_bloque_persona(16, con_direccion=True, persona=datos_vehiculo.get("comprador"), columna=4)
     _escribir_bloque_persona(16, con_direccion=True, persona=datos_vehiculo.get("otro_comprador"), columna=7)
 
-    # Se escribe el telefono TAMBIEN directo en la celda del documento
-    # (ademas de en EXPORTAR) -- una formula que apunta a una celda vacia
-    # se evalua como 0 en Excel/LibreOffice sin importar el formato de la
-    # celda de destino, asi que la unica forma confiable de que un
-    # telefono vacio se vea en blanco es no depender de la formula.
-    for celda_doc, clave_persona in APPJX_CELDAS_TELEFONO_A_CORREGIR.get(clave_documento, []):
-        persona_rol = datos_vehiculo.get(clave_persona) or {}
-        celda = hoja[celda_doc]
-        celda.value = persona_rol.get("telefono") or ""
-        celda.number_format = "General"
+    # Se escriben direccion/ciudad/telefono TAMBIEN directo en la celda
+    # del documento (ademas de en EXPORTAR) -- una formula que apunta a
+    # una celda vacia se evalua como 0 en Excel/LibreOffice sin importar
+    # el formato de la celda de destino, asi que la unica forma confiable
+    # de que un dato vacio se vea en blanco es no depender de la formula.
+    for _rol_doc, _campos_doc in APPJX_CELDAS_PERSONA_A_CORREGIR.get(clave_documento, {}).items():
+        _persona_rol_doc = datos_vehiculo.get(_rol_doc) or {}
+        for _campo_doc, _celda_doc in _campos_doc.items():
+            _celda_obj_doc = hoja[_celda_doc]
+            _celda_obj_doc.value = _persona_rol_doc.get(_campo_doc) or ""
+            _celda_obj_doc.number_format = "General"
 
     # Las celdas DENTRO del documento (no en EXPORTAR) que muestran estos
     # datos de personas dependen de que LibreOffice recalcule su formula
