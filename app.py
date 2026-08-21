@@ -3869,6 +3869,28 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     exportar["D24"] = ""  # precio -- la plantilla trae un valor de prueba guardado (9.000.000); se deja vacio para que se llene a mano en el documento impreso
     exportar["D24"].number_format = "General"
 
+    # Tramites seleccionados en Preparacion, conectados con los 4
+    # contratos de MANDATO -- a diferencia de Formulario (que resalta
+    # casillas), aqui cada tramite elegido se escribe como texto, uno por
+    # linea, en EXPORTAR!D47/D48/D49 (la plantilla original ya tenia esta
+    # conexion prevista con esas 3 celdas -- "MANDATO (3)" solo muestra
+    # las primeras 2, las demas variantes muestran las 3). Si entre los
+    # elegidos esta "TRASLADO MATRICULA / REGISTRO", esa linea en
+    # particular se reemplaza por la frase completa con el municipio de
+    # destino, igual que en Formulario.
+    _tramites_mandato = (datos_vehiculo.get("tramites_seleccionados") or [])[:3]
+    _municipio_destino_mandato = (datos_vehiculo.get("traslado_municipio_destino") or "").strip()
+    _lineas_mandato = []
+    for _t in _tramites_mandato:
+        _t_norm = re.sub(r"\s+", " ", (_t or "").strip().upper())
+        if _t_norm == "TRASLADO MATRICULA / REGISTRO":
+            _lineas_mandato.append(f"Traslado de Cuenta hacia la secretaria de transito de {_municipio_destino_mandato}".strip())
+        else:
+            _lineas_mandato.append(_t)
+    exportar["D47"] = _lineas_mandato[0] if len(_lineas_mandato) > 0 else ""
+    exportar["D48"] = _lineas_mandato[1] if len(_lineas_mandato) > 1 else ""
+    exportar["D49"] = _lineas_mandato[2] if len(_lineas_mandato) > 2 else ""
+
     # Linea de datos de la empresa (nombre, telefono, correo, etc.) que
     # aparece al pie de cada documento -- se escribe en DATOS!W2 (por si
     # algun otro lado de la plantilla la usa) Y TAMBIEN directo en la
