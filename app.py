@@ -3712,6 +3712,26 @@ CELDAS_TRAMITE_FORMULARIO = {
 }
 CELDA_OTROS_TRAMITE_FORMULARIO = ("T12", "U12")
 
+# Celdas de "Tipo de Servicio" (Particular/Publico/Diplomatico) -- a
+# diferencia de la cuadricula de TRAMITES (identica en las 3 hojas), esta
+# seccion SI cambia de posicion entre variantes (confirmado revisando la
+# plantilla real: en "FORMULARIO" el texto esta en la fila 28 y el
+# recuadro que se resalta en las filas 29-30; en "FORMULARIO (2)" todo
+# baja una fila (texto en 29, recuadro en 31-32); en "FORMULARIO (3)" el
+# texto vuelve a la fila 28 pero el recuadro queda en las filas 30-31).
+# Cada entrada son TODAS las celdas que hay que pintar de verde juntas.
+CELDAS_SERVICIO_POR_DOCUMENTO = {
+    "formulario": {
+        "PARTICULAR": ["AE29", "AE30"], "PUBLICO": ["AF29", "AF30"], "DIPLOMATICO": ["AG29", "AG30"],
+    },
+    "formulario_dos_vendedores": {
+        "PARTICULAR": ["AE29", "AE30", "AE31"], "PUBLICO": ["AF29", "AF30", "AF31"], "DIPLOMATICO": ["AG29", "AG30", "AG31"],
+    },
+    "formulario_dos_compradores": {
+        "PARTICULAR": ["AE28", "AE30", "AE31"], "PUBLICO": ["AF28", "AF30", "AF31"], "DIPLOMATICO": ["AG28", "AG30", "AG31"],
+    },
+}
+
 # Celda donde se escribe DIRECTO (no por formula) el texto de traslado de
 # cuenta cuando se elige el tramite "TRASLADO MATRICULA / REGISTRO" --
 # cada variante de Formulario tiene esta celda en una fila distinta
@@ -3958,15 +3978,25 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     # se limpia CUALQUIER resaltado que pudiera haber (por si la plantilla
     # trae algo marcado de una prueba anterior), y despues se vuelve a
     # aplicar SOLO segun los datos reales de este vehiculo. El resaltado
-    # de TRAMITE no aplica todavia (esta herramienta aun no deja elegir
-    # un tramite) -- si se agrega mas adelante, ya queda listo: basta con
-    # mandar datos_vehiculo["tramite"].
+    # de TRAMITE (unico, campo "tramite") no aplica todavia (esta
+    # herramienta aun no deja elegir un tramite asi) -- si se agrega mas
+    # adelante, ya queda listo: basta con mandar datos_vehiculo["tramite"].
     if nombre_hoja in ("FORMULARIO", "FORMULARIO (2)", "FORMULARIO (3)"):
         sin_relleno = PatternFill(fill_type=None)
-        for mapa_celdas in (CELDAS_TRAMITE, CELDAS_CLASE, CELDAS_COMBUSTIBLE, CELDAS_SERVICIO):
+        for mapa_celdas in (CELDAS_TRAMITE, CELDAS_CLASE, CELDAS_COMBUSTIBLE):
             for celdas in mapa_celdas.values():
                 for celda in celdas:
                     hoja[celda].fill = sin_relleno
+        # El servicio SI cambia de celdas entre variantes -- se limpian
+        # las 3 posibles ubicaciones conocidas para curar cualquier
+        # resto, sin importar cual le corresponde a esta hoja en concreto.
+        for _mapa_serv in CELDAS_SERVICIO_POR_DOCUMENTO.values():
+            for _celdas_serv in _mapa_serv.values():
+                for _celda_serv in _celdas_serv:
+                    try:
+                        hoja[_celda_serv].fill = sin_relleno
+                    except Exception:
+                        pass
         for celda in CELDA_OTROS_TRAMITE:
             hoja[celda].fill = sin_relleno
         hoja["W38"].fill = sin_relleno  # bloque "ESPECIFIQUE LA PALABRA OTRO..." (combinado W38:AK40)
@@ -3982,42 +4012,60 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
                 pass
             hoja[celda_fija].fill = sin_relleno
 
-        # CELDAS_REFERENCIA_SIMPLE espera claves "planas" (ej.
-        # "propietario_nombres"), mientras que el resto de esta funcion
-        # recibe los datos de personas como diccionarios (ej.
-        # datos_vehiculo["propietario"] = {"nombres": ..., ...}) -- se
-        # traduce de un formato al otro aqui, solo para FORMULARIO.
-        for _rol, _prefijo in (("propietario", "propietario"), ("comprador", "comprador")):
-            _persona_rol = datos_vehiculo.get(_rol)
-            if _persona_rol:
-                datos_vehiculo[f"{_prefijo}_nombres"] = _persona_rol.get("nombres", "")
-                datos_vehiculo[f"{_prefijo}_primer_apellido"] = _persona_rol.get("apellido", "")
-                datos_vehiculo[f"{_prefijo}_segundo_apellido"] = _persona_rol.get("segundo_apellido", "")
-                datos_vehiculo[f"{_prefijo}_documento"] = _persona_rol.get("numero_documento", "")
-                datos_vehiculo[f"{_prefijo}_direccion"] = _persona_rol.get("direccion", "")
-                datos_vehiculo[f"{_prefijo}_ciudad"] = _persona_rol.get("ciudad", "")
-                datos_vehiculo[f"{_prefijo}_telefono"] = _persona_rol.get("telefono", "")
+        # CELDAS_REFERENCIA_SIMPLE usa coordenadas de celda FIJAS que solo
+        # coinciden con el layout de la hoja BASE "FORMULARIO" -- en
+        # "FORMULARIO (2)"/"(3)" esas mismas coordenadas caen en celdas
+        # distintas (por el layout de dos personas), asi que escribir ahi
+        # SOBREESCRIBIA datos de otro campo (esto causaba que el segundo
+        # comprador mostrara los mismos datos que el primero). Se
+        # restringe este bloque a que SOLO corra en la hoja base.
+        if nombre_hoja == "FORMULARIO":
+            # CELDAS_REFERENCIA_SIMPLE espera claves "planas" (ej.
+            # "propietario_nombres"), mientras que el resto de esta funcion
+            # recibe los datos de personas como diccionarios (ej.
+            # datos_vehiculo["propietario"] = {"nombres": ..., ...}) -- se
+            # traduce de un formato al otro aqui, solo para FORMULARIO.
+            for _rol, _prefijo in (("propietario", "propietario"), ("comprador", "comprador")):
+                _persona_rol = datos_vehiculo.get(_rol)
+                if _persona_rol:
+                    datos_vehiculo[f"{_prefijo}_nombres"] = _persona_rol.get("nombres", "")
+                    datos_vehiculo[f"{_prefijo}_primer_apellido"] = _persona_rol.get("apellido", "")
+                    datos_vehiculo[f"{_prefijo}_segundo_apellido"] = _persona_rol.get("segundo_apellido", "")
+                    datos_vehiculo[f"{_prefijo}_documento"] = _persona_rol.get("numero_documento", "")
+                    datos_vehiculo[f"{_prefijo}_direccion"] = _persona_rol.get("direccion", "")
+                    datos_vehiculo[f"{_prefijo}_ciudad"] = _persona_rol.get("ciudad", "")
+                    datos_vehiculo[f"{_prefijo}_telefono"] = _persona_rol.get("telefono", "")
 
-        # Igual que generar_fun: las celdas de "referencia simple" (que
-        # no son formulas de EXPORTAR, sino texto/numero directo, como
-        # documento/telefono del propietario y comprador) tambien deben
-        # quedar en blanco cuando no hay ese dato -- si no, algunas
-        # aparecen como "0" en vez de vacio.
-        for celda, clave in CELDAS_REFERENCIA_SIMPLE.items():
-            if datos_vehiculo.get(clave):
-                try:
-                    hoja[celda] = datos_vehiculo[clave]
-                except Exception:
-                    pass
-            else:
-                try:
-                    hoja[celda] = ""
-                except Exception:
-                    pass
+            # Igual que generar_fun: las celdas de "referencia simple" (que
+            # no son formulas de EXPORTAR, sino texto/numero directo, como
+            # documento/telefono del propietario y comprador) tambien deben
+            # quedar en blanco cuando no hay ese dato -- si no, algunas
+            # aparecen como "0" en vez de vacio.
+            for celda, clave in CELDAS_REFERENCIA_SIMPLE.items():
+                if datos_vehiculo.get(clave):
+                    try:
+                        hoja[celda] = datos_vehiculo[clave]
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        hoja[celda] = ""
+                    except Exception:
+                        pass
 
         _fun_marcar_checkboxes(hoja, CELDAS_CLASE, datos_vehiculo.get("clase", ""))
         _fun_marcar_checkboxes(hoja, CELDAS_COMBUSTIBLE, datos_vehiculo.get("combustible", ""))
-        _fun_marcar_checkboxes(hoja, CELDAS_SERVICIO, datos_vehiculo.get("servicio", ""))
+
+        # Servicio -- usa el mapeo especifico de ESTE documento (las
+        # celdas cambian de posicion entre variantes, a diferencia de
+        # clase/combustible que si son iguales en las 3).
+        _servicio_normalizado = _fun_normalizar(datos_vehiculo.get("servicio", ""))
+        _mapa_servicio_doc = CELDAS_SERVICIO_POR_DOCUMENTO.get(clave_documento, {})
+        for _etiqueta_serv, _celdas_serv in _mapa_servicio_doc.items():
+            if _fun_coincide(datos_vehiculo.get("servicio", ""), _etiqueta_serv):
+                for _celda_serv in _celdas_serv:
+                    hoja[_celda_serv].fill = VERDE_MARCA
+
         if datos_vehiculo.get("tramite"):
             _fun_marcar_checkboxes(hoja, CELDAS_TRAMITE, datos_vehiculo["tramite"])
             if "TRASLADO" in _fun_normalizar(datos_vehiculo["tramite"]):
