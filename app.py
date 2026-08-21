@@ -3759,7 +3759,7 @@ TRAMITE_NOMBRE_NORMALIZADO_MANDATO = {
 # Cada entrada son TODAS las celdas que hay que pintar de verde juntas.
 CELDAS_SERVICIO_POR_DOCUMENTO = {
     "formulario": {
-        "PARTICULAR": ["AE29", "AE30"], "PUBLICO": ["AF29", "AF30"], "DIPLOMATICO": ["AG29", "AG30"],
+        "PARTICULAR": ["AE28", "AE29", "AE30"], "PUBLICO": ["AF28", "AF29", "AF30"], "DIPLOMATICO": ["AG29", "AG30"],
     },
     "formulario_dos_vendedores": {
         "PARTICULAR": ["AE29", "AE30", "AE31"], "PUBLICO": ["AF29", "AF30", "AF31"], "DIPLOMATICO": ["AG29", "AG30", "AG31"],
