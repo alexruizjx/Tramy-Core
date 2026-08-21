@@ -3477,11 +3477,20 @@ CELDAS_SERVICIO = {
     "PARTICULAR": ("AE29", "AE28"), "PUBLICO": ("AF29", "AF28"), "DIPLOMATICO": ("AG29", "AG28"),
     "OFICIAL": ("AH29", "AH28"), "ESPECIAL": ("AI29", "AI28"), "OTROS": ("AJ29", "AJ28"),
 }
-CELDAS_REFERENCIA_SIMPLE = {
+# Datos del VEHICULO -- confirmado revisando la plantilla que estas
+# coordenadas son IDENTICAS en las 3 hojas de Formulario, asi que este
+# bloque aplica a las 3 por igual.
+CELDAS_REFERENCIA_SIMPLE_VEHICULO = {
     "AJ3": "placa", "W7": "marca", "Z7": "linea", "W10": "color",
     "AG10": "modelo", "AI10": "cilindrada", "W13": "capacidad",
     "AE17": "numero_motor", "W19": "carroceria", "AE19": "numero_chasis",
     "AE22": "numero_serie", "AE24": "vin",
+}
+# Datos de PERSONAS (propietario/comprador) -- estas coordenadas SI son
+# especificas del layout de la hoja BASE (en "(2)"/"(3)" caen en celdas
+# distintas por el espacio de la segunda persona), asi que este bloque
+# solo aplica a la hoja base.
+CELDAS_REFERENCIA_SIMPLE_PERSONAS = {
     "A24": "propietario_primer_apellido", "I24": "propietario_segundo_apellido",
     "P24": "propietario_nombres", "S26": "propietario_documento",
     "A29": "propietario_direccion", "M29": "propietario_ciudad", "S29": "propietario_telefono",
@@ -3490,6 +3499,12 @@ CELDAS_REFERENCIA_SIMPLE = {
     "A44": "comprador_direccion", "M44": "comprador_ciudad", "S44": "comprador_telefono",
     "AG41": "traslado_municipio",
 }
+# Se mantiene el nombre viejo (union de ambos) por compatibilidad con
+# generar_fun, que SI aplica solo a un unico documento (el FUN clasico,
+# no las hojas de AppJX) y no tiene este problema de coordenadas
+# distintas entre variantes.
+CELDAS_REFERENCIA_SIMPLE = {**CELDAS_REFERENCIA_SIMPLE_VEHICULO, **CELDAS_REFERENCIA_SIMPLE_PERSONAS}
+
 
 
 def _fun_normalizar(texto):
@@ -3728,7 +3743,7 @@ CELDAS_SERVICIO_POR_DOCUMENTO = {
         "PARTICULAR": ["AE29", "AE30", "AE31"], "PUBLICO": ["AF29", "AF30", "AF31"], "DIPLOMATICO": ["AG29", "AG30", "AG31"],
     },
     "formulario_dos_compradores": {
-        "PARTICULAR": ["AE28", "AE30", "AE31"], "PUBLICO": ["AF28", "AF30", "AF31"], "DIPLOMATICO": ["AG28", "AG30", "AG31"],
+        "PARTICULAR": ["AE28", "AE29", "AE30", "AE31"], "PUBLICO": ["AF28", "AF29", "AF30", "AF31"], "DIPLOMATICO": ["AG28", "AG29", "AG30", "AG31"],
     },
 }
 
@@ -4012,15 +4027,28 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
                 pass
             hoja[celda_fija].fill = sin_relleno
 
-        # CELDAS_REFERENCIA_SIMPLE usa coordenadas de celda FIJAS que solo
-        # coinciden con el layout de la hoja BASE "FORMULARIO" -- en
-        # "FORMULARIO (2)"/"(3)" esas mismas coordenadas caen en celdas
+        # Datos del VEHICULO (placa, marca, VIN, capacidad, etc.) -- estas
+        # coordenadas SI son identicas en las 3 hojas (confirmado
+        # revisando la plantilla), asi que este bloque corre siempre,
+        # para las 3 variantes. Sin esto, un campo vacio (ej. sin VIN)
+        # aparecia como "0" en vez de blanco -- una formula que apunta a
+        # una celda vacia se evalua como 0 en Excel/LibreOffice, sin
+        # importar el formato de la celda que muestra el resultado.
+        for celda, clave in CELDAS_REFERENCIA_SIMPLE_VEHICULO.items():
+            try:
+                hoja[celda] = datos_vehiculo.get(clave) or ""
+            except Exception:
+                pass
+
+        # CELDAS_REFERENCIA_SIMPLE_PERSONAS usa coordenadas de celda FIJAS
+        # que solo coinciden con el layout de la hoja BASE "FORMULARIO" --
+        # en "FORMULARIO (2)"/"(3)" esas mismas coordenadas caen en celdas
         # distintas (por el layout de dos personas), asi que escribir ahi
         # SOBREESCRIBIA datos de otro campo (esto causaba que el segundo
         # comprador mostrara los mismos datos que el primero). Se
         # restringe este bloque a que SOLO corra en la hoja base.
         if nombre_hoja == "FORMULARIO":
-            # CELDAS_REFERENCIA_SIMPLE espera claves "planas" (ej.
+            # CELDAS_REFERENCIA_SIMPLE_PERSONAS espera claves "planas" (ej.
             # "propietario_nombres"), mientras que el resto de esta funcion
             # recibe los datos de personas como diccionarios (ej.
             # datos_vehiculo["propietario"] = {"nombres": ..., ...}) -- se
@@ -4041,7 +4069,7 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
             # documento/telefono del propietario y comprador) tambien deben
             # quedar en blanco cuando no hay ese dato -- si no, algunas
             # aparecen como "0" en vez de vacio.
-            for celda, clave in CELDAS_REFERENCIA_SIMPLE.items():
+            for celda, clave in CELDAS_REFERENCIA_SIMPLE_PERSONAS.items():
                 if datos_vehiculo.get(clave):
                     try:
                         hoja[celda] = datos_vehiculo[clave]
@@ -4052,6 +4080,7 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
                         hoja[celda] = ""
                     except Exception:
                         pass
+
 
         _fun_marcar_checkboxes(hoja, CELDAS_CLASE, datos_vehiculo.get("clase", ""))
         _fun_marcar_checkboxes(hoja, CELDAS_COMBUSTIBLE, datos_vehiculo.get("combustible", ""))
