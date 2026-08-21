@@ -3889,6 +3889,23 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         _hoy = datetime.now()
         hoja["F8"] = f"{_hoy.day}-{_meses_es[_hoy.month - 1]}-{_hoy.year}"
         hoja["F8"].alignment = Alignment(horizontal="center", vertical=hoja["F8"].alignment.vertical)
+
+    # Las 4 hojas de MANDATO tienen la celda del nombre del
+    # propietario/mandante sin alineacion vertical definida -- hereda la
+    # del tema de la plantilla, que en algunos casos la deja "pegada
+    # al piso" de una fila mas alta de lo normal, dando la impresion de
+    # que el nombre esta en la fila de abajo. Se centra verticalmente
+    # para que siempre se vea en su fila correcta sin importar la altura.
+    _celda_nombre_mandato = {
+        "MANDATO": "C1", "MANDATO NIT": "D3",
+        "MANDATO (2)": "C1", "MANDATO (3)": "C1",
+    }.get(nombre_hoja)
+    if _celda_nombre_mandato:
+        hoja[_celda_nombre_mandato].alignment = Alignment(
+            horizontal=hoja[_celda_nombre_mandato].alignment.horizontal,
+            vertical="center", wrap_text=True,
+        )
+
     exportar["D51"] = ""  # traslado_municipio -- vacio explicito, si no la formula '=EXPORTAR!D51' en FORMULARIO muestra "0" (una celda totalmente vacia, sin ni siquiera comillas vacias, se lee como cero en una referencia directa)
     exportar["D24"] = ""  # precio -- la plantilla trae un valor de prueba guardado (9.000.000); se deja vacio para que se llene a mano en el documento impreso
     exportar["D24"].number_format = "General"
