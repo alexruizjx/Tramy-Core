@@ -3890,19 +3890,21 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         hoja["F8"] = f"{_hoy.day}-{_meses_es[_hoy.month - 1]}-{_hoy.year}"
         hoja["F8"].alignment = Alignment(horizontal="center", vertical=hoja["F8"].alignment.vertical)
 
-    # Las 4 hojas de MANDATO tienen la celda del nombre del
-    # propietario/mandante sin alineacion vertical definida -- hereda la
-    # del tema de la plantilla, que en algunos casos la deja "pegada
-    # al piso" de una fila mas alta de lo normal, dando la impresion de
-    # que el nombre esta en la fila de abajo. Se centra verticalmente
-    # para que siempre se vea en su fila correcta sin importar la altura.
-    _celda_nombre_mandato = {
-        "MANDATO": "C1", "MANDATO NIT": "D3",
-        "MANDATO (2)": "C1", "MANDATO (3)": "C1",
-    }.get(nombre_hoja)
-    if _celda_nombre_mandato:
-        hoja[_celda_nombre_mandato].alignment = Alignment(
-            horizontal=hoja[_celda_nombre_mandato].alignment.horizontal,
+    # Las 4 hojas de MANDATO tienen varias celdas sin alineacion vertical
+    # definida -- heredan la del tema de la plantilla, que en algunos
+    # casos las deja "pegadas al piso" de una fila mas alta de lo normal,
+    # dando la impresion de que el dato esta en la fila de abajo. Se
+    # centran verticalmente para que siempre se vean en su fila correcta
+    # sin importar la altura.
+    _celdas_alinear_mandato = {
+        "MANDATO": ["C1"],
+        "MANDATO NIT": ["D3"],
+        "MANDATO (2)": ["C1"],
+        "MANDATO (3)": ["C1", "F5"],
+    }.get(nombre_hoja, [])
+    for _celda_alinear in _celdas_alinear_mandato:
+        hoja[_celda_alinear].alignment = Alignment(
+            horizontal=hoja[_celda_alinear].alignment.horizontal,
             vertical="center", wrap_text=False,
         )
 
