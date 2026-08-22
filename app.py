@@ -2789,6 +2789,17 @@ def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_mo
                     """, (idg, item.get("nroAtencion"), item.get("nombreUsuario"),
                           item.get("nombreTaquilla"), item.get("nombreServicio"),
                           item.get("idEstadoGestionAtencion"), es_vigilado, placa_asociada))
+
+                    if es_vigilado:
+                        cur.execute("""
+                            UPDATE envigado_citas_vigiladas_historial
+                            SET encontrado = TRUE, taquilla = %s, nombre_usuario = %s, detectado_en = NOW()
+                            WHERE id = (
+                                SELECT id FROM envigado_citas_vigiladas_historial
+                                WHERE numero = %s AND encontrado = FALSE AND fecha_cita = CURRENT_DATE
+                                ORDER BY creado_en DESC LIMIT 1
+                            )
+                        """, (item.get("nombreTaquilla"), item.get("nombreUsuario"), nro_norm))
                 conn.commit()
                 cur.close(); conn.close()
         except Exception as e:
@@ -8145,6 +8156,31 @@ def envigado_turnos_iniciar_monitoreo_endpoint():
         for c in citas if c.get("numero") and c.get("placa")
     }
 
+    # Se guarda cada cita ingresada en el historial -- independiente de
+    # si se llega a detectar o no, para poder revisar despues que se
+    # dejo vigilando cada dia (no todos los turnos que paso el monitor,
+    # solo lo que el usuario pidio vigilar).
+    if citas:
+        try:
+            conn_hist = get_db_conn()
+            cur_hist = conn_hist.cursor()
+            for c in citas:
+                if not c.get("numero"):
+                    continue
+                cur_hist.execute("""
+                    INSERT INTO envigado_citas_vigiladas_historial (numero, placa, hora_cita, fecha_cita)
+                    VALUES (%s, %s, %s, %s)
+                """, (
+                    c["numero"].strip().upper(),
+                    (c.get("placa") or "").strip().upper() or None,
+                    (c.get("hora") or "").strip() or None,
+                    c.get("fecha") or datetime.now().date().isoformat(),
+                ))
+            conn_hist.commit()
+            cur_hist.close(); conn_hist.close()
+        except Exception as e:
+            print(f"Error guardando historial de citas vigiladas: {e}", flush=True)
+
     # Si alguna cita trae hora+fecha, se programa el inicio/fin segun eso
     # -- si no, se usa el comportamiento de siempre (duracion fija,
     # arranca de inmediato).
@@ -8267,16 +8303,16 @@ def envigado_turnos_capturados_endpoint():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-@app.route("/envigado-turnos-fechas-disponibles", methods=["GET"])
-def envigado_turnos_fechas_disponibles_endpoint():
-    """Devuelve la lista de dias (mas reciente primero) que tienen algun
-    turno capturado guardado -- para poblar el selector del historial."""
+@app.route("/envigado-citas-vigiladas-fechas", methods=["GET"])
+def envigado_citas_vigiladas_fechas_endpoint():
+    """Devuelve la lista de dias (mas reciente primero) en los que se
+    dejaron citas vigilando -- para poblar el selector del historial."""
     try:
         conn = get_db_conn()
         cur = conn.cursor()
         cur.execute("""
-            SELECT detectado_en::date AS dia, COUNT(*) AS total
-            FROM envigado_turnos_llamados
+            SELECT fecha_cita AS dia, COUNT(*) AS total
+            FROM envigado_citas_vigiladas_historial
             GROUP BY dia
             ORDER BY dia DESC
             LIMIT 90
@@ -8285,6 +8321,36 @@ def envigado_turnos_fechas_disponibles_endpoint():
         cur.close(); conn.close()
         fechas = [{"fecha": f[0].isoformat(), "total": f[1]} for f in filas]
         return jsonify({"ok": True, "fechas": fechas})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/envigado-citas-vigiladas-historial", methods=["GET"])
+def envigado_citas_vigiladas_historial_endpoint():
+    """Devuelve las citas que se dejaron vigilando en un dia en
+    particular (numero, placa, hora programada), junto con si se llego a
+    detectar el llamado y con que datos (taquilla, nombre, hora real)."""
+    fecha = request.args.get("fecha", "").strip()
+    if not fecha:
+        fecha = datetime.now().date().isoformat()
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT numero, placa, hora_cita, encontrado, taquilla, nombre_usuario, detectado_en, creado_en
+            FROM envigado_citas_vigiladas_historial
+            WHERE fecha_cita = %s
+            ORDER BY creado_en ASC
+        """, (fecha,))
+        filas = cur.fetchall()
+        cur.close(); conn.close()
+        citas = [{
+            "numero": f[0], "placa": f[1] or "", "hora_cita": f[2] or "",
+            "encontrado": f[3], "taquilla": f[4] or "", "nombre_usuario": f[5] or "",
+            "detectado_en": (f[6].isoformat() + "Z") if f[6] else None,
+            "creado_en": f[7].isoformat() + "Z",
+        } for f in filas]
+        return jsonify({"ok": True, "citas": citas})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
