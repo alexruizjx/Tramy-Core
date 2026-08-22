@@ -8229,20 +8229,32 @@ def envigado_turnos_estado_monitoreo_endpoint():
 
 @app.route("/envigado-turnos-capturados", methods=["GET"])
 def envigado_turnos_capturados_endpoint():
-    """Devuelve los turnos capturados, mas recientes primero. Por defecto
-    solo los de hoy."""
+    """Devuelve los turnos capturados de un dia en particular, mas
+    recientes primero. Por defecto (sin 'fecha') muestra los de hoy --
+    'fecha' se recibe en formato YYYY-MM-DD, para poder revisar el
+    historial de dias anteriores."""
     limite = request.args.get("limite", "100")
     limite = int(limite) if limite.isdigit() else 100
+    fecha = request.args.get("fecha", "").strip()
     try:
         conn = get_db_conn()
         cur = conn.cursor()
-        cur.execute("""
-            SELECT nro_atencion, nombre_usuario, nombre_taquilla, nombre_servicio, detectado_en, placa
-            FROM envigado_turnos_llamados
-            WHERE detectado_en::date = CURRENT_DATE
-            ORDER BY detectado_en DESC
-            LIMIT %s
-        """, (limite,))
+        if fecha:
+            cur.execute("""
+                SELECT nro_atencion, nombre_usuario, nombre_taquilla, nombre_servicio, detectado_en, placa
+                FROM envigado_turnos_llamados
+                WHERE detectado_en::date = %s
+                ORDER BY detectado_en DESC
+                LIMIT %s
+            """, (fecha, limite))
+        else:
+            cur.execute("""
+                SELECT nro_atencion, nombre_usuario, nombre_taquilla, nombre_servicio, detectado_en, placa
+                FROM envigado_turnos_llamados
+                WHERE detectado_en::date = CURRENT_DATE
+                ORDER BY detectado_en DESC
+                LIMIT %s
+            """, (limite,))
         filas = cur.fetchall()
         cur.close(); conn.close()
         turnos = [
@@ -8251,6 +8263,28 @@ def envigado_turnos_capturados_endpoint():
             for f in filas
         ]
         return jsonify({"ok": True, "turnos": turnos})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/envigado-turnos-fechas-disponibles", methods=["GET"])
+def envigado_turnos_fechas_disponibles_endpoint():
+    """Devuelve la lista de dias (mas reciente primero) que tienen algun
+    turno capturado guardado -- para poblar el selector del historial."""
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT detectado_en::date AS dia, COUNT(*) AS total
+            FROM envigado_turnos_llamados
+            GROUP BY dia
+            ORDER BY dia DESC
+            LIMIT 90
+        """)
+        filas = cur.fetchall()
+        cur.close(); conn.close()
+        fechas = [{"fecha": f[0].isoformat(), "total": f[1]} for f in filas]
+        return jsonify({"ok": True, "fechas": fechas})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
