@@ -15,14 +15,16 @@ from pywebpush import webpush, WebPushException
 import threading
 import boto3
 from botocore.config import Config
-from datetime import datetime, timedelta, date
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, date, timezone
 
 # Colombia esta siempre en UTC-5 (no tiene horario de verano) -- se usa
-# explicitamente en vez de depender de la hora del servidor (Railway
-# corre en UTC por defecto), para que "ahora" y las horas que escribe el
-# usuario (ej. "14:30" para una cita) se comparen correctamente.
-TZ_COLOMBIA = ZoneInfo("America/Bogota")
+# un desfase FIJO en vez de ZoneInfo("America/Bogota"), porque esa
+# depende de que el sistema tenga instalada la base de datos de zonas
+# horarias (tzdata) -- la imagen de Railway NO la tiene por defecto, y
+# eso tumbaba toda la aplicacion al arrancar (ZoneInfoNotFoundError).
+# Un desfase fijo no depende de nada externo y para Colombia siempre es
+# correcto (nunca cambia por horario de verano).
+TZ_COLOMBIA = timezone(timedelta(hours=-5))
 from flask import Flask, request, jsonify, send_file
 from playwright.sync_api import sync_playwright
 from pypdf import PdfWriter
@@ -8233,8 +8235,8 @@ def envigado_turnos_iniciar_monitoreo_endpoint():
         mensaje = f"Monitoreo iniciado por {duracion_minutos} minutos (o hasta que lo detengas)."
 
     _envigado_monitoreo_estado["activo"] = True
-    _envigado_monitoreo_estado["inicio"] = (ahora + timedelta(seconds=espera_segundos)).astimezone(ZoneInfo("UTC")).isoformat()
-    _envigado_monitoreo_estado["fin_esperado"] = fin_esperado_dt.astimezone(ZoneInfo("UTC")).isoformat()
+    _envigado_monitoreo_estado["inicio"] = (ahora + timedelta(seconds=espera_segundos)).astimezone(timezone.utc).isoformat()
+    _envigado_monitoreo_estado["fin_esperado"] = fin_esperado_dt.astimezone(timezone.utc).isoformat()
     _envigado_monitoreo_estado["numeros_vigilados"] = numeros_vigilados
     _envigado_monitoreo_estado["detener"] = False
 
