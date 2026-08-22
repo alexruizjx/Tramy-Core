@@ -3800,6 +3800,27 @@ CELDAS_SERVICIO_POR_DOCUMENTO = {
     },
 }
 
+# Celdas de "Tipo de documento" (C.C / NIT / N.N / Pasaporte / C.Extranj. /
+# T.Identi.) del propietario y del comprador -- SOLO se resaltan C.C y
+# NIT (los demas tipos no se marcan, segun se pidio explicitamente).
+# Confirmado revisando la plantilla real: cada casilla tiene una celda de
+# ETIQUETA (fila de arriba) y, quiza, una celda de CODIGO (fila de abajo,
+# ej. "C"/"N") -- se pintan ambas cuando existen las dos.
+CELDAS_TIPO_DOC_FORMULARIO = {
+    "formulario": {
+        "propietario": {"CC": ["A25", "A26"], "NIT": ["C25", "C26"]},
+        "comprador": {"CC": ["A40", "A41"], "NIT": ["C40", "C41"]},
+    },
+    "formulario_dos_vendedores": {
+        "propietario": {"CC": ["A26", "A27"], "NIT": ["C26", "C27"]},
+        "comprador": {"CC": ["A42", "A43"], "NIT": ["C42", "C43"]},
+    },
+    "formulario_dos_compradores": {
+        "propietario": {"CC": ["A26"], "NIT": ["C26"]},
+        "comprador": {"CC": ["A40", "A41"], "NIT": ["C40", "C41"]},
+    },
+}
+
 # Celda donde se escribe DIRECTO (no por formula) el texto de traslado de
 # cuenta cuando se elige el tramite "TRASLADO MATRICULA / REGISTRO" --
 # cada variante de Formulario tiene esta celda en una fila distinta
@@ -4222,6 +4243,18 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
             if _fun_coincide(datos_vehiculo.get("servicio", ""), _etiqueta_serv):
                 for _celda_serv in _celdas_serv:
                     hoja[_celda_serv].fill = VERDE_MARCA
+
+        # Tipo de documento (C.C / NIT) del propietario y del comprador --
+        # solo se resalta si es exactamente uno de esos dos tipos (los
+        # demas, como Pasaporte o T.I., no se marcan).
+        _mapa_tipodoc_doc = CELDAS_TIPO_DOC_FORMULARIO.get(clave_documento, {})
+        for _rol_td, _opciones_td in _mapa_tipodoc_doc.items():
+            _persona_td = datos_vehiculo.get(_rol_td) or {}
+            _tipo_doc_persona = (_persona_td.get("tipo_documento") or "").strip().upper()
+            _celdas_td = _opciones_td.get(_tipo_doc_persona)
+            if _celdas_td:
+                for _celda_td in _celdas_td:
+                    hoja[_celda_td].fill = VERDE_MARCA
 
         if datos_vehiculo.get("tramite"):
             _fun_marcar_checkboxes(hoja, CELDAS_TRAMITE, datos_vehiculo["tramite"])
