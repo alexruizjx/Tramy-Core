@@ -445,17 +445,7 @@ def medellin_crear_usuario(datos, usar_proxy=True):
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
             "--single-process", "--no-zygote", "--disable-setuid-sandbox"
         ])
-        proxy_config = None
-        if usar_proxy:
-            if IPROYAL_USER and IPROYAL_PASS:
-                proxy_config = {
-                    "server": f"http://{IPROYAL_HOST}:{IPROYAL_PORT}",
-                    "username": IPROYAL_USER,
-                    "password": IPROYAL_PASS,
-                }
-                print(f"{etiqueta} Usando proxy residencial de IPRoyal para este registro.", flush=True)
-            else:
-                print(f"{etiqueta} *** ALERTA: se pidio usar el proxy, pero faltan las credenciales de IPRoyal en las variables de entorno (IPROYAL_USER/IPROYAL_PASS) -- este registro va SIN proxy, usando la IP normal del servidor.", flush=True)
+        proxy_config = _dataimpulse_proxy_config(etiqueta) if usar_proxy else None
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
             viewport={"width": 1366, "height": 900},
@@ -2745,7 +2735,7 @@ def _programador_automatico_loop():
 threading.Thread(target=_programador_automatico_loop, daemon=True).start()
 
 
-def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_monitor=3, numeros_vigilados=None):
+def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_monitor=3, numeros_vigilados=None, placas_por_numero=None):
     """Revisa el "monitor de turnos" de Envigado cada pocos segundos,
     durante 'duracion_segundos'. Cada vez que aparece un idGestionAtencion
     que no habiamos visto, lo guarda con la hora en que Tramy lo detecto
@@ -2754,11 +2744,15 @@ def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_mo
     Si se indica 'numeros_vigilados' (lista, ej. ["C-89", "G-78"]), en
     cuanto aparezca CUALQUIERA de esos numeros se agrega a
     _envigado_monitoreo_estado['encontrados'] para que el frontend pueda
-    mostrar una alerta destacada (con sonido y vibracion)."""
+    mostrar una alerta destacada (con sonido y vibracion).
+    'placas_por_numero' (dict opcional, ej. {"C-89": "ABC123"}) -- si el
+    usuario indico la placa de esa cita al agregarla a vigilar, se guarda
+    junto con el turno capturado para mostrarla en la alerta."""
     fin = time.time() + duracion_segundos
     ids_vistos = set()
     hoy_str = datetime.now().strftime("%d/%m/%Y")
     numeros_vigilados_norm = set((n or "").strip().upper() for n in (numeros_vigilados or []))
+    placas_por_numero = placas_por_numero or {}
 
     while time.time() < fin:
         if _envigado_monitoreo_estado["detener"]:
@@ -2766,7 +2760,7 @@ def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_mo
         try:
             params = {
                 "idMonitor": id_monitor,
-                "cantidadTurnos": 10,
+                "cantidadTurnos": 20,
                 "fechaInicio": f"{hoy_str} 00:00:00",
                 "fechaFin": f"{hoy_str} 23:59:59",
                 "_": str(int(time.time() * 1000)),
@@ -2784,16 +2778,17 @@ def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_mo
                     ids_vistos.add(idg)
                     nro_norm = (item.get("nroAtencion") or "").strip().upper()
                     es_vigilado = bool(numeros_vigilados_norm and nro_norm in numeros_vigilados_norm)
+                    placa_asociada = placas_por_numero.get(nro_norm, "")
 
                     cur.execute("""
                         INSERT INTO envigado_turnos_llamados
                             (id_gestion_atencion, nro_atencion, nombre_usuario, nombre_taquilla,
-                             nombre_servicio, id_estado, fue_vigilado, detectado_en)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                             nombre_servicio, id_estado, fue_vigilado, placa, detectado_en)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
                         ON CONFLICT (id_gestion_atencion) DO NOTHING
                     """, (idg, item.get("nroAtencion"), item.get("nombreUsuario"),
                           item.get("nombreTaquilla"), item.get("nombreServicio"),
-                          item.get("idEstadoGestionAtencion"), es_vigilado))
+                          item.get("idEstadoGestionAtencion"), es_vigilado, placa_asociada))
                 conn.commit()
                 cur.close(); conn.close()
         except Exception as e:
@@ -2802,6 +2797,22 @@ def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_mo
 
     _envigado_monitoreo_estado["activo"] = False
     _envigado_monitoreo_estado["detener"] = False
+
+
+def _envigado_polling_turnos_con_espera(espera_segundos, duracion_segundos, **kwargs_polling):
+    """Espera 'espera_segundos' antes de arrancar el monitoreo real -- para
+    poder programar un inicio en el futuro (ej. 5 minutos antes de la
+    hora de una cita), sin necesitar un servicio de tareas programadas
+    aparte. El estado 'activo' ya queda en True desde que se programa
+    (no solo cuando arranca de verdad), para que el boton de iniciar se
+    bloquee de una vez y no se pueda programar dos veces por error."""
+    if espera_segundos > 0:
+        time.sleep(espera_segundos)
+    if _envigado_monitoreo_estado["detener"]:
+        _envigado_monitoreo_estado["activo"] = False
+        _envigado_monitoreo_estado["detener"] = False
+        return
+    _envigado_polling_turnos(duracion_segundos=duracion_segundos, **kwargs_polling)
 
 
 def cache_antioquia_guardar_paz_salvo(placa, avaluo, estado_veh):
@@ -8100,14 +8111,21 @@ def envigado_citas_ultimo_resultado_endpoint():
 
 @app.route("/envigado-turnos-iniciar-monitoreo", methods=["GET"])
 def envigado_turnos_iniciar_monitoreo_endpoint():
-    """Arranca una sesion de monitoreo de maximo 2 horas (configurable),
-    que revisa el monitor de turnos de Envigado cada pocos segundos y va
-    guardando cada llamado nuevo que aparezca -- se puede detener antes
-    manualmente. Los DATOS que va capturando (toda la lista, y los que
-    coincidan con los numeros vigilados) quedan guardados en la base de
-    datos todo el dia, sin importar si la sesion de vigilancia ya termino
-    o si se inicia una sesion nueva despues -- solo se renuevan al dia
-    siguiente. Se puede vigilar hasta 10 numeros de cita a la vez."""
+    """Arranca (o programa) una sesion de monitoreo de maximo 2 horas
+    (configurable), que revisa el monitor de turnos de Envigado cada
+    pocos segundos y va guardando cada llamado nuevo que aparezca -- se
+    puede detener antes manualmente. Los DATOS que va capturando (toda
+    la lista, y los que coincidan con los numeros vigilados) quedan
+    guardados en la base de datos todo el dia, sin importar si la sesion
+    de vigilancia ya termino o si se inicia una sesion nueva despues --
+    solo se renuevan al dia siguiente. Se puede vigilar hasta 20 numeros
+    de cita a la vez.
+    Recibe 'citas' como JSON: [{"numero": "C-89", "placa": "ABC123",
+    "hora": "14:30", "fecha": "2026-08-25"}, ...] -- placa/hora/fecha son
+    opcionales. Si ALGUNA cita trae hora+fecha, el monitoreo se PROGRAMA
+    para arrancar 5 minutos antes de la hora mas temprana, y terminar 1
+    hora despues de la hora mas tardia (en vez de arrancar de inmediato
+    con la duracion fija de 'minutos')."""
     if _envigado_monitoreo_estado["activo"]:
         return jsonify({
             "ok": False,
@@ -8115,29 +8133,73 @@ def envigado_turnos_iniciar_monitoreo_endpoint():
             "fin_esperado": _envigado_monitoreo_estado["fin_esperado"]
         }), 409
 
-    duracion_minutos = request.args.get("minutos", "120")
-    duracion_minutos = int(duracion_minutos) if duracion_minutos.isdigit() else 120
-    duracion_minutos = min(duracion_minutos, 120)  # tope maximo de 2 horas
-    duracion_segundos = duracion_minutos * 60
+    try:
+        citas = json.loads(request.args.get("citas", "[]"))
+    except Exception:
+        citas = []
+    citas = citas[:20]
 
-    numeros_raw = request.args.get("numeros", "").strip()
-    numeros_vigilados = [n.strip() for n in numeros_raw.split(",") if n.strip()][:10]
+    numeros_vigilados = [c["numero"].strip().upper() for c in citas if c.get("numero")]
+    placas_por_numero = {
+        c["numero"].strip().upper(): c["placa"].strip().upper()
+        for c in citas if c.get("numero") and c.get("placa")
+    }
+
+    # Si alguna cita trae hora+fecha, se programa el inicio/fin segun eso
+    # -- si no, se usa el comportamiento de siempre (duracion fija,
+    # arranca de inmediato).
+    horas_programadas = []
+    for c in citas:
+        if c.get("hora") and c.get("fecha"):
+            try:
+                horas_programadas.append(datetime.strptime(f"{c['fecha']} {c['hora']}", "%Y-%m-%d %H:%M"))
+            except Exception:
+                pass
+
+    ahora = datetime.now()
+    if horas_programadas:
+        inicio_deseado = min(horas_programadas) - timedelta(minutes=5)
+        fin_deseado = max(horas_programadas) + timedelta(hours=1)
+        espera_segundos = max(0, (inicio_deseado - ahora).total_seconds())
+        duracion_segundos = max(60, (fin_deseado - max(ahora, inicio_deseado)).total_seconds())
+        duracion_segundos = min(duracion_segundos, 6 * 3600)  # tope de seguridad: 6 horas totales de monitoreo
+        inicio_real = max(ahora, inicio_deseado)
+        fin_esperado_dt = inicio_real + timedelta(seconds=duracion_segundos)
+        mensaje = (
+            f"Monitoreo programado para iniciar a las {inicio_deseado.strftime('%H:%M')} "
+            f"y terminar a las {fin_esperado_dt.strftime('%H:%M')}."
+            if espera_segundos > 0 else
+            f"Monitoreo iniciado -- corriendo hasta las {fin_esperado_dt.strftime('%H:%M')}."
+        )
+    else:
+        duracion_minutos = request.args.get("minutos", "120")
+        duracion_minutos = int(duracion_minutos) if duracion_minutos.isdigit() else 120
+        duracion_minutos = min(duracion_minutos, 120)  # tope maximo de 2 horas
+        duracion_segundos = duracion_minutos * 60
+        espera_segundos = 0
+        fin_esperado_dt = ahora + timedelta(seconds=duracion_segundos)
+        mensaje = f"Monitoreo iniciado por {duracion_minutos} minutos (o hasta que lo detengas)."
 
     _envigado_monitoreo_estado["activo"] = True
-    _envigado_monitoreo_estado["inicio"] = datetime.now().isoformat() + "Z"  # UTC
-    _envigado_monitoreo_estado["fin_esperado"] = (datetime.now() + timedelta(seconds=duracion_segundos)).isoformat() + "Z"  # UTC
+    _envigado_monitoreo_estado["inicio"] = (ahora + timedelta(seconds=espera_segundos)).isoformat() + "Z"
+    _envigado_monitoreo_estado["fin_esperado"] = fin_esperado_dt.isoformat() + "Z"
     _envigado_monitoreo_estado["numeros_vigilados"] = numeros_vigilados
     _envigado_monitoreo_estado["detener"] = False
 
     threading.Thread(
-        target=_envigado_polling_turnos,
-        kwargs={"duracion_segundos": duracion_segundos, "numeros_vigilados": numeros_vigilados},
+        target=_envigado_polling_turnos_con_espera,
+        kwargs={
+            "espera_segundos": espera_segundos, "duracion_segundos": duracion_segundos,
+            "numeros_vigilados": numeros_vigilados, "placas_por_numero": placas_por_numero,
+        },
         daemon=True
     ).start()
 
     return jsonify({
         "ok": True,
-        "mensaje": f"Monitoreo iniciado por {duracion_minutos} minutos (o hasta que lo detengas).",
+        "mensaje": mensaje,
+        "programado": espera_segundos > 0,
+        "inicio_esperado": _envigado_monitoreo_estado["inicio"],
         "fin_esperado": _envigado_monitoreo_estado["fin_esperado"]
     })
 
@@ -8175,7 +8237,7 @@ def envigado_turnos_capturados_endpoint():
         conn = get_db_conn()
         cur = conn.cursor()
         cur.execute("""
-            SELECT nro_atencion, nombre_usuario, nombre_taquilla, nombre_servicio, detectado_en
+            SELECT nro_atencion, nombre_usuario, nombre_taquilla, nombre_servicio, detectado_en, placa
             FROM envigado_turnos_llamados
             WHERE detectado_en::date = CURRENT_DATE
             ORDER BY detectado_en DESC
@@ -8185,7 +8247,7 @@ def envigado_turnos_capturados_endpoint():
         cur.close(); conn.close()
         turnos = [
             {"nro_atencion": f[0], "nombre_usuario": f[1], "taquilla": f[2],
-             "servicio": f[3], "detectado_en": f[4].isoformat() + "Z"}
+             "servicio": f[3], "detectado_en": f[4].isoformat() + "Z", "placa": f[5] or ""}
             for f in filas
         ]
         return jsonify({"ok": True, "turnos": turnos})
@@ -8204,7 +8266,7 @@ def envigado_turnos_vigilados_hoy_endpoint():
         conn = get_db_conn()
         cur = conn.cursor()
         cur.execute("""
-            SELECT nro_atencion, nombre_usuario, nombre_taquilla, nombre_servicio, detectado_en
+            SELECT nro_atencion, nombre_usuario, nombre_taquilla, nombre_servicio, detectado_en, placa
             FROM envigado_turnos_llamados
             WHERE fue_vigilado = TRUE AND detectado_en::date = CURRENT_DATE
             ORDER BY detectado_en DESC
@@ -8213,7 +8275,7 @@ def envigado_turnos_vigilados_hoy_endpoint():
         cur.close(); conn.close()
         encontrados = [
             {"nro_atencion": f[0], "nombre_usuario": f[1], "taquilla": f[2],
-             "servicio": f[3], "detectado_en": f[4].isoformat() + "Z"}
+             "servicio": f[3], "detectado_en": f[4].isoformat() + "Z", "placa": f[5] or ""}
             for f in filas
         ]
         return jsonify({"ok": True, "encontrados": encontrados})
