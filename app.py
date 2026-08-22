@@ -7226,9 +7226,13 @@ def personas_guardar_endpoint():
             ON CONFLICT (numero_documento) DO UPDATE SET
                 nombres = EXCLUDED.nombres, apellido = EXCLUDED.apellido,
                 segundo_apellido = EXCLUDED.segundo_apellido, tipo_documento = EXCLUDED.tipo_documento,
-                telefono = EXCLUDED.telefono, direccion = EXCLUDED.direccion,
-                barrio_info = EXCLUDED.barrio_info, ciudad = EXCLUDED.ciudad,
-                email = EXCLUDED.email, notas = EXCLUDED.notas, actualizado_en = NOW()
+                telefono = CASE WHEN EXCLUDED.telefono <> '' THEN EXCLUDED.telefono ELSE personas.telefono END,
+                direccion = CASE WHEN EXCLUDED.direccion <> '' THEN EXCLUDED.direccion ELSE personas.direccion END,
+                barrio_info = CASE WHEN EXCLUDED.barrio_info <> '' THEN EXCLUDED.barrio_info ELSE personas.barrio_info END,
+                ciudad = CASE WHEN EXCLUDED.ciudad <> '' THEN EXCLUDED.ciudad ELSE personas.ciudad END,
+                email = CASE WHEN EXCLUDED.email <> '' THEN EXCLUDED.email ELSE personas.email END,
+                notas = CASE WHEN EXCLUDED.notas <> '' THEN EXCLUDED.notas ELSE personas.notas END,
+                actualizado_en = NOW()
             RETURNING id
         """, (
             nombres.upper(), (datos.get("apellido") or "").strip().upper(),
