@@ -16,6 +16,13 @@ import threading
 import boto3
 from botocore.config import Config
 from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
+
+# Colombia esta siempre en UTC-5 (no tiene horario de verano) -- se usa
+# explicitamente en vez de depender de la hora del servidor (Railway
+# corre en UTC por defecto), para que "ahora" y las horas que escribe el
+# usuario (ej. "14:30" para una cita) se comparen correctamente.
+TZ_COLOMBIA = ZoneInfo("America/Bogota")
 from flask import Flask, request, jsonify, send_file
 from playwright.sync_api import sync_playwright
 from pypdf import PdfWriter
@@ -2750,7 +2757,7 @@ def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_mo
     junto con el turno capturado para mostrarla en la alerta."""
     fin = time.time() + duracion_segundos
     ids_vistos = set()
-    hoy_str = datetime.now().strftime("%d/%m/%Y")
+    hoy_str = datetime.now(TZ_COLOMBIA).strftime("%d/%m/%Y")
     numeros_vigilados_norm = set((n or "").strip().upper() for n in (numeros_vigilados or []))
     placas_por_numero = placas_por_numero or {}
 
@@ -8174,7 +8181,7 @@ def envigado_turnos_iniciar_monitoreo_endpoint():
                     c["numero"].strip().upper(),
                     (c.get("placa") or "").strip().upper() or None,
                     (c.get("hora") or "").strip() or None,
-                    c.get("fecha") or datetime.now().date().isoformat(),
+                    c.get("fecha") or datetime.now(TZ_COLOMBIA).date().isoformat(),
                 ))
             conn_hist.commit()
             cur_hist.close(); conn_hist.close()
@@ -8183,16 +8190,25 @@ def envigado_turnos_iniciar_monitoreo_endpoint():
 
     # Si alguna cita trae hora+fecha, se programa el inicio/fin segun eso
     # -- si no, se usa el comportamiento de siempre (duracion fija,
-    # arranca de inmediato).
+    # arranca de inmediato). Las horas que escribe el usuario son SIEMPRE
+    # hora de Colombia (asi se les asigna explicitamente esa zona), sin
+    # importar en que zona horaria corra el servidor.
     horas_programadas = []
     for c in citas:
         if c.get("hora") and c.get("fecha"):
             try:
-                horas_programadas.append(datetime.strptime(f"{c['fecha']} {c['hora']}", "%Y-%m-%d %H:%M"))
+                dt_naive = datetime.strptime(f"{c['fecha']} {c['hora']}", "%Y-%m-%d %H:%M")
+                # La oficina solo atiende de 7am a 5pm -- se ignora
+                # cualquier hora fuera de ese rango (el frontend ya lo
+                # restringe con min/max, pero se valida aqui tambien por
+                # si la peticion viene de otro lado).
+                hora_valida = 7 <= dt_naive.hour <= 17 and not (dt_naive.hour == 17 and dt_naive.minute > 0)
+                if hora_valida:
+                    horas_programadas.append(dt_naive.replace(tzinfo=TZ_COLOMBIA))
             except Exception:
                 pass
 
-    ahora = datetime.now()
+    ahora = datetime.now(TZ_COLOMBIA)
     if horas_programadas:
         inicio_deseado = min(horas_programadas) - timedelta(minutes=5)
         fin_deseado = max(horas_programadas) + timedelta(hours=1)
@@ -8203,9 +8219,9 @@ def envigado_turnos_iniciar_monitoreo_endpoint():
         fin_esperado_dt = inicio_real + timedelta(seconds=duracion_segundos)
         mensaje = (
             f"Monitoreo programado para iniciar a las {inicio_deseado.strftime('%H:%M')} "
-            f"y terminar a las {fin_esperado_dt.strftime('%H:%M')}."
+            f"y terminar a las {fin_esperado_dt.strftime('%H:%M')} (hora Colombia)."
             if espera_segundos > 0 else
-            f"Monitoreo iniciado -- corriendo hasta las {fin_esperado_dt.strftime('%H:%M')}."
+            f"Monitoreo iniciado -- corriendo hasta las {fin_esperado_dt.strftime('%H:%M')} (hora Colombia)."
         )
     else:
         duracion_minutos = request.args.get("minutos", "120")
@@ -8217,8 +8233,8 @@ def envigado_turnos_iniciar_monitoreo_endpoint():
         mensaje = f"Monitoreo iniciado por {duracion_minutos} minutos (o hasta que lo detengas)."
 
     _envigado_monitoreo_estado["activo"] = True
-    _envigado_monitoreo_estado["inicio"] = (ahora + timedelta(seconds=espera_segundos)).isoformat() + "Z"
-    _envigado_monitoreo_estado["fin_esperado"] = fin_esperado_dt.isoformat() + "Z"
+    _envigado_monitoreo_estado["inicio"] = (ahora + timedelta(seconds=espera_segundos)).astimezone(ZoneInfo("UTC")).isoformat()
+    _envigado_monitoreo_estado["fin_esperado"] = fin_esperado_dt.astimezone(ZoneInfo("UTC")).isoformat()
     _envigado_monitoreo_estado["numeros_vigilados"] = numeros_vigilados
     _envigado_monitoreo_estado["detener"] = False
 
@@ -8332,7 +8348,7 @@ def envigado_citas_vigiladas_historial_endpoint():
     detectar el llamado y con que datos (taquilla, nombre, hora real)."""
     fecha = request.args.get("fecha", "").strip()
     if not fecha:
-        fecha = datetime.now().date().isoformat()
+        fecha = datetime.now(TZ_COLOMBIA).date().isoformat()
     try:
         conn = get_db_conn()
         cur = conn.cursor()
