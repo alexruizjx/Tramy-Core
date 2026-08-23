@@ -3513,7 +3513,7 @@ CELDAS_REFERENCIA_SIMPLE_VEHICULO = {
     # real, es la ausencia del dato). Si se agregara aqui tambien, este
     # bloque genérico volvia a escribir "0" encima de esa correccion.
     "AE17": "numero_motor", "W19": "carroceria", "AE19": "numero_chasis",
-    "AE22": "numero_serie", "AE24": "vin",
+    "AE22": "numero_serie", "AE24": "vin", "AC2": "autoridad_transito",
 }
 # Datos de PERSONAS (propietario/comprador) -- estas coordenadas SI son
 # especificas del layout de la hoja BASE (en "(2)"/"(3)" caen en celdas
