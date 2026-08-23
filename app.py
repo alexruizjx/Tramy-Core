@@ -3743,42 +3743,29 @@ APPJX_CELDA_CAPACIDAD = {
 # 7, 9 y 12) es IDENTICA en las 3 hojas (Formulario, Formulario (2),
 # Formulario (3)), asi que un solo mapeo aplica a las tres. Cada entrada
 # tiene DOS celdas (numero + etiqueta) que se pintan de verde juntas.
+# Los 14 tramites "canonicos" -- estos MISMOS nombres se usan en los 3
+# lugares donde se elige un tramite (el catalogo real de Liquidacion se
+# normaliza a estos, y Preparacion + el modulo de documentos de
+# Liquidacion los muestran identicos). Cada uno mapea a su casilla en
+# Formulario cuando existe (algunos, como "CAMBIO DE MOTOR" o
+# "REGRABACION DE SERIE", no tienen casilla propia en la plantilla, asi
+# que simplemente no resaltan nada ahi -- solo aparecen en el texto de
+# Mandato).
 CELDAS_TRAMITE_FORMULARIO = {
-    "MATRICULA/ REGISTRO": ("A7", "B7"), "TRASPASO": ("E7", "F7"),
-    "TRASLADO MATRICULA / REGISTRO": ("I7", "J7"),
-    "RADICADO MATRICULA / REGISTRO": ("N7", "O7"), "CAMBIO DE COLOR": ("Q7", "R7"),
-    "CAMBIO DE SERVICIO": ("T7", "U7"),
-    "REGRABAR MOTOR": ("A9", "B9"), "REGRABAR CHASIS": ("E9", "F9"),
-    "DUPLICADO LICENCIA TRANSITO": ("N9", "O9"), "INSCRIPC. PRENDA": ("Q9", "R9"), "LEVANTA PRENDA": ("T9", "U9"),
-    "CANCELACION MATRICULA / REGISTRO": ("A12", "B12"), "CAMBIO DE PLACAS": ("E12", "F12"),
-    "DUPLICADO DE PLACAS": ("I12", "J12"), "REMATRICULA": ("N12", "O12"),
-    "CAMBIO DE CARROCERIA": ("Q12", "R12"),
+    "MATRICULA INICIAL": ("A7", "B7"),
+    "TRASPASO DE PROPIEDAD": ("E7", "F7"),
+    "TRASLADO DE CUENTA": ("I7", "J7"),
+    "RADICADO DE CUENTA": ("N7", "O7"),
+    "CAMBIO DE COLOR": ("Q7", "R7"),
+    "REGRABACION DE MOTOR": ("A9", "B9"),
+    "REGRABACION DE CHASIS": ("E9", "F9"),
+    "DUPLICADO DE LICENCIA DE TRANSITO": ("N9", "O9"),
+    "INSCRIPCION DE PRENDA": ("Q9", "R9"),
+    "LEVANTAMIENTO DE PRENDA": ("T9", "U9"),
+    "CANCELACION DE CUENTA": ("A12", "B12"),
+    "DUPLICADO DE PLACAS": ("I12", "J12"),
 }
 CELDA_OTROS_TRAMITE_FORMULARIO = ("T12", "U12")
-
-# Nombres "normalizados" (en lenguaje de contrato) para cada tramite --
-# se usan SOLO en el texto de los contratos de Mandato (Formulario sigue
-# mostrando la etiqueta corta de la casilla, ya que ahi no hay espacio y
-# ademas debe coincidir exactamente con lo impreso en la casilla misma).
-TRAMITE_NOMBRE_NORMALIZADO_MANDATO = {
-    "MATRICULA/ REGISTRO": "MATRÍCULA / REGISTRO",
-    "TRASPASO": "TRASPASO DE PROPIEDAD",
-    "TRASLADO MATRICULA / REGISTRO": "TRASLADO DE CUENTA / REGISTRO",
-    "RADICADO MATRICULA / REGISTRO": "RADICADO DE MATRÍCULA / REGISTRO",
-    "CAMBIO DE COLOR": "CAMBIO DE COLOR",
-    "CAMBIO DE SERVICIO": "CAMBIO DE SERVICIO",
-    "REGRABAR MOTOR": "REGRABACIÓN DE MOTOR",
-    "REGRABAR CHASIS": "REGRABACIÓN DE CHASIS",
-    "DUPLICADO LICENCIA TRANSITO": "DUPLICADO DE LICENCIA DE TRÁNSITO",
-    "INSCRIPC. PRENDA": "INSCRIPCIÓN DE PRENDA",
-    "LEVANTA PRENDA": "LEVANTAMIENTO DE PRENDA",
-    "CANCELACION MATRICULA / REGISTRO": "CANCELACIÓN DE MATRÍCULA / REGISTRO",
-    "CAMBIO DE PLACAS": "CAMBIO DE PLACAS",
-    "DUPLICADO DE PLACAS": "DUPLICADO DE PLACAS",
-    "REMATRICULA": "REMATRÍCULA",
-    "CAMBIO DE CARROCERIA": "CAMBIO DE CARROCERÍA",
-    "OTROS": "OTROS",
-}
 
 # Celdas de "Tipo de Servicio" (Particular/Publico/Diplomatico) -- a
 # diferencia de la cuadricula de TRAMITES (identica en las 3 hojas), esta
@@ -3871,6 +3858,53 @@ APPJX_CELDAS_PERSONA_A_CORREGIR = {
 }
 
 
+import random
+
+# Mismas listas que ya existen en Preparacion (boton "Datos Falsos") --
+# se guardan tambien aqui para poder rellenar automaticamente los datos
+# del propietario cuando falten, al generar un documento desde
+# Liquidacion (que no tiene ese boton en su interfaz).
+TRAMY_PREFIJOS_TELEFONO_FALSO = ["310508", "313205", "301528", "320854", "300633", "323787", "315325", "314458", "333477", "316968"]
+TRAMY_DIRECCIONES_FALSAS = [
+    "Cra 80  # 50 - 52 apto (201)", "Cra 69 # 32 - 25 (401) Palomares",
+    "Calle 34  # 22 - 38 201 Urb calle larga", "Calle 21 # 18 - 26 apto 301",
+    "Diag  77  # 32 - 40 Ed el bosque (501)", "Calle 58 # 70 - 25 granero la palma",
+    "Diag 30  82 - 48 edificio puente verde (908)", "Cl 98a  #65-122",
+    "Calle 50 # 42-54", "Cr 36  #10 B-38", "Calle 81a #52a-60 (piso 4)",
+    "Cra 45 # 42-42 (apto 501)", "Calle 12 # 31-185 edificio la cigala",
+    "Diagonal 49 # 34-92 (urb casa verde casa 18)", "Calle 155b # 8C-22 apto 502",
+    "Carrera 69A #93-20 torre 2 apto 1010", "Carrera 87 N° 46 - 33",
+    "Cra 59 No 36- 56 casa 3", "Calle 54 #85-40 apto 201", "Cr 55 #69-07 esquina apto 501",
+    "Cra 52 # 1-81 la pola", "Calle 51 #49-11 Of. 603", "Transversal 34 A Sur No 32 D -18",
+    "Calle 38 Sur 43-85 Cons. 201", "Carrera 50 A # 33-74", "Calle 18 #58-06",
+    "Calle 39B Sur # 38-9", "Carrera 42 #14-74", "Calle 30A # 79-117",
+    "Calle 78 SUR # 57-83 Local 110", "CRA 65 Nº 43-10", "Carrera 22 # 80 Sur - 32",
+    "Calle 60 sur # 20-16 Diagonal a Andar", "Carrera 43 B #12-157", "Calle 65 # 87 - 59",
+    "Calle 46 N. 54-48 Almacén AYACUCHO", "Cr 42 16 A sur 41 - Mall Aerocentro, local 1",
+]
+
+
+def _rellenar_datos_falsos_si_faltan(persona, municipio_vehiculo):
+    """Si la persona no tiene telefono/direccion/ciudad, se rellenan con
+    datos de prueba (igual que el boton 'Datos Falsos' de Preparacion) --
+    si YA tiene algun dato puesto, ese se respeta y no se toca. Se usa
+    para que los documentos generados desde Liquidacion (que no tiene
+    ese boton) igual salgan completos, ya que las secretarias de
+    transito no reciben documentos con campos en blanco."""
+    if not persona:
+        return persona
+    persona = dict(persona)  # no modificar el original
+    if not persona.get("telefono"):
+        prefijo = random.choice(TRAMY_PREFIJOS_TELEFONO_FALSO)
+        resto = str(random.randint(1000, 9999))
+        persona["telefono"] = prefijo + resto
+    if not persona.get("direccion"):
+        persona["direccion"] = random.choice(TRAMY_DIRECCIONES_FALSAS) + " *"
+    if not persona.get("ciudad") and municipio_vehiculo:
+        persona["ciudad"] = municipio_vehiculo.strip().upper()
+    return persona
+
+
 def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salida_pdf):
     """Genera en PDF cualquiera de los documentos de AppJX.xlsm listados
     en APPJX_DOCUMENTOS, llenando SOLO los datos del vehiculo (placa,
@@ -3880,6 +3914,20 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     if clave_documento not in APPJX_DOCUMENTOS:
         raise ValueError(f"Documento desconocido: {clave_documento}")
     _, nombre_hoja = APPJX_DOCUMENTOS[clave_documento]
+
+    # Si el propietario (vendedor) no tiene telefono/direccion/ciudad, se
+    # rellenan con datos de prueba (igual que el boton "Datos Falsos" de
+    # Preparacion) -- respeta cualquier dato que YA tenga puesto, solo
+    # llena lo que falte. Esto hace que los documentos generados desde
+    # Liquidacion (que no tiene ese boton) tambien salgan completos.
+    # NO se aplica al comprador -- esos datos se ponen a mano cuando se
+    # necesiten, a proposito.
+    _municipio_para_datos_falsos = datos_vehiculo.get("municipio", "")
+    for _rol_relleno in ("propietario", "otro_propietario"):
+        if datos_vehiculo.get(_rol_relleno):
+            datos_vehiculo[_rol_relleno] = _rellenar_datos_falsos_si_faltan(
+                datos_vehiculo[_rol_relleno], _municipio_para_datos_falsos
+            )
 
     wb = _openpyxl.load_workbook(FUN_PLANTILLA, data_only=False, keep_vba=True)
     hoja = wb[nombre_hoja]
@@ -3969,15 +4017,12 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     # casillas), aqui cada tramite elegido se escribe como texto, uno por
     # linea, en EXPORTAR!D47/D48/D49 (la plantilla original ya tenia esta
     # conexion prevista con esas 3 celdas -- "MANDATO (3)" solo muestra
-    # las primeras 2, las demas variantes muestran las 3). A diferencia
-    # de Formulario, aqui "Traslado" NO lleva la frase larga con el
-    # municipio -- se pidio explicitamente que quedara como un nombre
-    # simple, igual que los demas tramites.
+    # las primeras 2, las demas variantes muestran las 3). Los nombres
+    # que llegan aqui ya son los 14 nombres "canonicos" (los mismos que
+    # se eligen en Preparacion/Liquidacion), asi que se usan tal cual,
+    # sin necesidad de normalizarlos de nuevo.
     _tramites_mandato = (datos_vehiculo.get("tramites_seleccionados") or [])[:3]
-    _lineas_mandato = []
-    for _t in _tramites_mandato:
-        _t_norm = re.sub(r"\s+", " ", (_t or "").strip().upper())
-        _lineas_mandato.append(TRAMITE_NOMBRE_NORMALIZADO_MANDATO.get(_t_norm, _t))
+    _lineas_mandato = list(_tramites_mandato)
     exportar["D47"] = _lineas_mandato[0] if len(_lineas_mandato) > 0 else ""
     exportar["D48"] = _lineas_mandato[1] if len(_lineas_mandato) > 1 else ""
     exportar["D49"] = _lineas_mandato[2] if len(_lineas_mandato) > 2 else ""
@@ -4326,7 +4371,7 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
             # el valor ya armado. Usa el MUNICIPIO DE DESTINO elegido a
             # mano en el frontend (no el municipio del vehiculo -- ese es
             # de donde SALE el tramite, no hacia donde se traslada).
-            if tramite_normalizado == "TRASLADO MATRICULA / REGISTRO":
+            if tramite_normalizado == "TRASLADO DE CUENTA":
                 celda_traslado = APPJX_CELDA_TRASLADO_TEXTO[clave_documento]
                 municipio_destino = (datos_vehiculo.get("traslado_municipio_destino") or "").strip()
                 celda_obj = hoja[celda_traslado]
