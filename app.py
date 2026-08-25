@@ -4010,7 +4010,7 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         )
 
     exportar["D51"] = ""  # traslado_municipio -- vacio explicito, si no la formula '=EXPORTAR!D51' en FORMULARIO muestra "0" (una celda totalmente vacia, sin ni siquiera comillas vacias, se lee como cero en una referencia directa)
-    exportar["D24"] = ""  # precio -- la plantilla trae un valor de prueba guardado (9.000.000); se deja vacio para que se llene a mano en el documento impreso
+    exportar["D24"] = datos_vehiculo.get("precio_venta") or ""  # precio -- viene del campo "Precio de venta" en Tramites (Preparacion/Liquidacion); si no se indica, queda vacio para llenarlo a mano en el documento impreso
     exportar["D24"].number_format = "General"
 
     # Tramites seleccionados en Preparacion, conectados con los 4
@@ -4182,6 +4182,25 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         hoja["B7"].number_format = "General"
         hoja["F8"] = _otro_mandatario_persona.get("numero_documento") or ""
         hoja["F8"].number_format = "General"
+
+    # Precio de venta -- se escribe directo en la celda del documento
+    # (ademas de en EXPORTAR) por el mismo motivo de siempre: una formula
+    # que apunta a una celda vacia se evalua como 0, sin importar el
+    # formato de la celda de destino.
+    _CELDA_PRECIO_VENTA = {
+        "compraventa": "G3",
+        "compraventa_dos_vendedores": "G10",
+        "compraventa_dos_compradores": "G10",
+    }
+    if clave_documento in _CELDA_PRECIO_VENTA:
+        _celda_precio = _CELDA_PRECIO_VENTA[clave_documento]
+        _precio_venta_raw = datos_vehiculo.get("precio_venta")
+        try:
+            _precio_venta_valor = float(str(_precio_venta_raw).replace(",", "").replace(".", "").strip()) if _precio_venta_raw else ""
+        except (ValueError, TypeError):
+            _precio_venta_valor = _precio_venta_raw or ""
+        hoja[_celda_precio] = _precio_venta_valor
+        hoja[_celda_precio].number_format = '"$"#,##0'
 
     # Las celdas DENTRO del documento (no en EXPORTAR) que muestran estos
     # datos de personas dependen de que LibreOffice recalcule su formula
