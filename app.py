@@ -5692,6 +5692,41 @@ def _antioquia_descargar_pdf_liquidacion(session, formulario_liquidacion):
     return base64.b64decode(archivo_b64)
 
 
+def _extraer_nombre_apellidos_declaracion(pdf_bytes):
+    """Extrae el NOMBRE (C.1) y los APELLIDOS (C.3) directamente del texto
+    del PDF de la Declaracion Sugerida -- estos son los datos OFICIALES
+    que la Gobernacion tiene registrados para el propietario (confirmado
+    con la ficha de seguridad que responde el propio sistema de la
+    Gobernacion), asi que son mas confiables que cualquier nombre que el
+    usuario haya escrito a mano. Se usan para que la Declaracion Manual
+    quede con el mismo nombre exacto que la Declaracion Sugerida.
+
+    El orden de extraccion de pypdf para este PDF en particular pone el
+    valor de "C.1 NOMBRE..." ANTES de su propia etiqueta, y el valor de
+    "C.3 APELLIDOS" DESPUES de su etiqueta (confirmado con un PDF real) --
+    por eso se buscan con patrones distintos para cada uno.
+    Si no los encuentra (formato distinto), se devuelven vacios -- el
+    llamador debe usar como respaldo lo que el usuario haya escrito."""
+    try:
+        import io, re
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        texto = ""
+        for pagina in reader.pages:
+            texto += (pagina.extract_text() or "") + "\n"
+
+        match_nombres = re.search(r'^([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s]*)$\nC\.1\s+NOMBRE', texto, re.MULTILINE)
+        nombres = match_nombres.group(1).strip() if match_nombres else ""
+
+        match_apellidos = re.search(r'C\.3\s+APELLIDOS\s*\n?\s*([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s]*?)\s+\d', texto)
+        apellidos = match_apellidos.group(1).strip() if match_apellidos else ""
+
+        return {"nombres": nombres, "apellidos": apellidos}
+    except Exception as e:
+        print(f"No se pudo extraer nombre/apellidos del PDF de declaracion: {e}", flush=True)
+    return {"nombres": "", "apellidos": ""}
+
+
 def _extraer_caja_traccion_declaracion(pdf_bytes):
     """Extrae 'Caja' (transmision) y 'Traccion' directamente del texto del
     PDF de la Declaracion Sugerida -- la Gobernacion los incluye ahi
@@ -7119,6 +7154,7 @@ def generar_declaracion_manual_endpoint():
                                         datos_parciales=resultados)
                         data_vig = cache["datos"]
                         caja_traccion = {"caja": data_vig.get("caja", ""), "traccion": data_vig.get("traccion", "")}
+                        nombre_real = {"nombres": data_vig.get("nombres_reales", ""), "apellidos": data_vig.get("apellidos_reales", "")}
                     else:
                         job_actualizar(job_id, f"Vigencia {vigencia}: consultando en la Gobernación (puede tardar por el captcha)...",
                                         datos_parciales=resultados)
@@ -7130,6 +7166,13 @@ def generar_declaracion_manual_endpoint():
                             departamento_cod=departamento_cod
                         )
                         caja_traccion = _extraer_caja_traccion_declaracion(pdf_sugerida_bytes)
+                        # Nombre y apellidos OFICIALES, tal como los tiene
+                        # registrados la Gobernacion (leidos del mismo PDF
+                        # de la Declaracion Sugerida) -- para que la
+                        # Declaracion Manual quede con el mismo nombre
+                        # exacto, sin depender de lo que se haya escrito
+                        # a mano en Tramy.
+                        nombre_real = _extraer_nombre_apellidos_declaracion(pdf_sugerida_bytes)
 
                         # Se guarda en cache SOLO si ya existia una entrada
                         # con PDF real generado antes (para no crear una
@@ -7140,12 +7183,21 @@ def generar_declaracion_manual_endpoint():
                             datos_extra = dict(data_vig or {})
                             datos_extra["caja"] = caja_traccion.get("caja", "")
                             datos_extra["traccion"] = caja_traccion.get("traccion", "")
+                            datos_extra["nombres_reales"] = nombre_real.get("nombres", "")
+                            datos_extra["apellidos_reales"] = nombre_real.get("apellidos", "")
                             _cache_declaracion_guardar(placa, vigencia, cache["url"], datos_extra=datos_extra)
+
+                    # Si la extraccion del PDF no encontro nada (formato
+                    # distinto, PDF fallo, etc.), se usa como respaldo lo
+                    # que el usuario haya escrito a mano -- para no dejar
+                    # el documento sin nombre en ese caso.
+                    nombres_para_pdf = nombre_real.get("nombres") or nombres_propietario
+                    apellidos_para_pdf = nombre_real.get("apellidos") or apellidos_propietario
 
                     datos = {
                         "vigencia": vigencia,
-                        "nombre_completo": nombres_propietario,
-                        "apellidos": apellidos_propietario,
+                        "nombre_completo": nombres_para_pdf,
+                        "apellidos": apellidos_para_pdf,
                         "celular": celular,
                         "telefono": telefono_fijo,
                         "email": email,
