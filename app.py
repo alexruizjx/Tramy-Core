@@ -3680,6 +3680,7 @@ APPJX_DOCUMENTOS = {
     "mandato_persona_juridica":      ("Mandato (persona jurídica)",              "MANDATO NIT"),
     "mandato_dos_vendedores":        ("Mandato (dos vendedores)",                "MANDATO (2)"),
     "mandato_comprador_vendedor":    ("Mandato (comprador y vendedor)",          "MANDATO (3)"),
+    "mandato_4":                     ("Mandato (variante 4)",                    "MANDATO (4)"),
     "traspaso_indeterminado":        ("Traspaso indeterminado",                  "INDETERMINADO"),
     "revocatoria_indeterminado":     ("Revocatoria traspaso indeterminado",      "REVOCATORIA"),
     "afirmacion_traspaso":           ("Afirmación de traspaso",                  "AFIRMACION"),
@@ -4146,6 +4147,41 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         hoja[_celdas_otro_doc["nombre"]].number_format = "General"
         hoja[_celdas_otro_doc["documento"]] = _otro_persona.get("numero_documento") or ""
         hoja[_celdas_otro_doc["documento"]].number_format = "General"
+
+    # Rol "MANDATARIO" -- se conecta con las 5 hojas de Mandato. Estas
+    # celdas ya tenian una formula que apuntaba a EXPORTAR!D3-D6 (el rol
+    # "asesor", que nunca se conecto desde la interfaz, asi que siempre
+    # quedaban vacias) -- se sobrescriben directo con los datos de
+    # "mandatario" en su lugar. "MANDATO (4)" es la unica variante con
+    # espacio para un SEGUNDO mandatario (otro_mandatario).
+    _CELDAS_ROL_MANDATARIO = {
+        "mandato": {"nombre": "A4", "documento": "A6"},
+        "mandato_dos_vendedores": {"nombre": "B7", "documento": "F8"},
+        "mandato_comprador_vendedor": {"nombre": "A7", "documento": "G8"},
+        "mandato_persona_juridica": {"nombre": "D5", "documento": "F6"},
+        "mandato_4": {"nombre": "C4", "documento": "A6"},
+    }
+    if clave_documento in _CELDAS_ROL_MANDATARIO:
+        _mandatario_persona = datos_vehiculo.get("mandatario") or {}
+        _nombre_completo_mandatario = " ".join(filter(None, [
+            _mandatario_persona.get("nombres"), _mandatario_persona.get("apellido"), _mandatario_persona.get("segundo_apellido"),
+        ]))
+        _celdas_mandatario_doc = _CELDAS_ROL_MANDATARIO[clave_documento]
+        hoja[_celdas_mandatario_doc["nombre"]] = _nombre_completo_mandatario
+        hoja[_celdas_mandatario_doc["nombre"]].number_format = "General"
+        hoja[_celdas_mandatario_doc["documento"]] = _mandatario_persona.get("numero_documento") or ""
+        hoja[_celdas_mandatario_doc["documento"]].number_format = "General"
+
+    # Segundo mandatario -- SOLO existe en "MANDATO (4)" por ahora.
+    if clave_documento == "mandato_4":
+        _otro_mandatario_persona = datos_vehiculo.get("otro_mandatario") or {}
+        _nombre_completo_otro_mandatario = " ".join(filter(None, [
+            _otro_mandatario_persona.get("nombres"), _otro_mandatario_persona.get("apellido"), _otro_mandatario_persona.get("segundo_apellido"),
+        ]))
+        hoja["B7"] = _nombre_completo_otro_mandatario
+        hoja["B7"].number_format = "General"
+        hoja["F8"] = _otro_mandatario_persona.get("numero_documento") or ""
+        hoja["F8"].number_format = "General"
 
     # Las celdas DENTRO del documento (no en EXPORTAR) que muestran estos
     # datos de personas dependen de que LibreOffice recalcule su formula
