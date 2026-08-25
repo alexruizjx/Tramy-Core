@@ -5978,7 +5978,7 @@ def antioquia_generar_todas_declaraciones(placa, identificacion, tipo_documento_
                 f.write(pdf_bytes)
 
             url = subir_a_r2(ruta, f"declaraciones/{placa}_{vigencia}_{id_unico}.pdf",
-                              nombre_descarga=f"Declaracion_{placa}_{vigencia}.pdf")
+                              nombre_descarga=f"Declaracion_Sugerida_{placa}_{vigencia}.pdf")
             os.remove(ruta)
 
             # Se extrae caja/traccion (y se guarda la liquidacion completa)
@@ -6168,7 +6168,7 @@ def consultar_antioquia(page, placa, identificacion, tipo_documento_abrev,
                                     f_pdf.write(pdf_bytes_vig)
                                 url_pdf_vig = subir_a_r2(
                                     ruta_pdf_vig, f"declaraciones/{placa}_{anio}_{id_unico_vig}.pdf",
-                                    nombre_descarga=f"Declaracion_{placa}_{anio}.pdf"
+                                    nombre_descarga=f"Declaracion_Sugerida_{placa}_{anio}.pdf"
                                 )
                                 os.remove(ruta_pdf_vig)
 
@@ -6968,6 +6968,13 @@ def combinar_pdfs_endpoint():
     datos = request.get_json(silent=True) or {}
     urls = datos.get("urls", [])
     placa = (datos.get("placa") or "declaraciones").upper().strip()
+    # El nombre de archivo es configurable -- este endpoint se reutiliza
+    # tanto para combinar Declaraciones Sugeridas (su uso original) como
+    # para los combos de documentos de Preparacion/Liquidacion (Combo
+    # Traspaso, Combo FUN-Mandato, etc.), que necesitan su propio nombre
+    # en vez de que todo diga "Declaracion".
+    nombre_archivo = (datos.get("nombre_archivo") or "Declaracion_Sugerida").strip()
+    nombre_archivo = re.sub(r"[^\w\s-]", "", nombre_archivo).replace(" ", "_")
 
     if not urls or len(urls) < 2:
         return jsonify({"error": "Se necesitan al menos 2 URLs para combinar"}), 400
@@ -6992,7 +6999,7 @@ def combinar_pdfs_endpoint():
         writer.close()
 
         url_final = subir_a_r2(ruta_combinado, f"declaraciones/combinado_{placa}_{id_unico}.pdf",
-                                nombre_descarga=f"Declaracion_{placa}_combinado.pdf")
+                                nombre_descarga=f"{nombre_archivo}_{placa}_combinado.pdf")
         os.remove(ruta_combinado)
         for ruta in rutas_temp:
             os.remove(ruta)
