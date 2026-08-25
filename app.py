@@ -4105,6 +4105,22 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
             _celda_obj_doc.value = _persona_rol_doc.get(_campo_doc) or ""
             _celda_obj_doc.number_format = "General"
 
+    # "COMPRA VENTA NIT" -- I9 traia una formula rota (hacia referencia a
+    # una celda de OTRA hoja, "FORMULARIO!P37", que no corresponde a nada
+    # en este documento -- error de copia en la plantilla original). Se
+    # escribe directo el nombre completo del comprador, e I10 (numero de
+    # documento) tambien se escribe directo por seguridad, aunque su
+    # formula original (=B11) si apuntaba al lugar correcto.
+    if clave_documento == "compraventa_persona_juridica":
+        _comprador_nit = datos_vehiculo.get("comprador") or {}
+        _nombre_completo_comprador = " ".join(filter(None, [
+            _comprador_nit.get("nombres"), _comprador_nit.get("apellido"), _comprador_nit.get("segundo_apellido"),
+        ]))
+        hoja["I9"] = _nombre_completo_comprador
+        hoja["I9"].number_format = "General"
+        hoja["I10"] = _comprador_nit.get("numero_documento") or ""
+        hoja["I10"].number_format = "General"
+
     # Las celdas DENTRO del documento (no en EXPORTAR) que muestran estos
     # datos de personas dependen de que LibreOffice recalcule su formula
     # al convertir a PDF -- eso no siempre pasa de forma confiable (igual
