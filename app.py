@@ -4121,6 +4121,32 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         hoja["I10"] = _comprador_nit.get("numero_documento") or ""
         hoja["I10"].number_format = "General"
 
+    # Rol "OTRO" -- se conecta con estas 6 hojas especificas. En
+    # "COMPRA VENTA NIT" y "MANDATO NIT" las celdas estaban vacias (sin
+    # formula previa); en las otras 4 SI habia una formula que mostraba
+    # al propietario por defecto (=EXPORTAR!D8/D9/D10 para el nombre,
+    # =EXPORTAR!D11 para el documento) -- se sobrescribe con los datos
+    # de "otro" en todos los casos, escribiendo directo (no por formula)
+    # para que tambien funcione bien si "otro" queda vacio.
+    _CELDAS_ROL_OTRO = {
+        "compraventa_persona_juridica": {"nombre": "H7", "documento": "J8"},
+        "mandato_persona_juridica": {"nombre": "C1", "documento": "G2"},
+        "revocatoria_indeterminado": {"nombre": "B7", "documento": "C8"},
+        "levantamiento_prenda": {"nombre": "A8", "documento": "C9"},
+        "inscripcion_prenda": {"nombre": "D3", "documento": "C4"},
+        "acta_responsabilidad": {"nombre": "D3", "documento": "C4"},
+    }
+    if clave_documento in _CELDAS_ROL_OTRO:
+        _otro_persona = datos_vehiculo.get("otro") or {}
+        _nombre_completo_otro = " ".join(filter(None, [
+            _otro_persona.get("nombres"), _otro_persona.get("apellido"), _otro_persona.get("segundo_apellido"),
+        ]))
+        _celdas_otro_doc = _CELDAS_ROL_OTRO[clave_documento]
+        hoja[_celdas_otro_doc["nombre"]] = _nombre_completo_otro
+        hoja[_celdas_otro_doc["nombre"]].number_format = "General"
+        hoja[_celdas_otro_doc["documento"]] = _otro_persona.get("numero_documento") or ""
+        hoja[_celdas_otro_doc["documento"]].number_format = "General"
+
     # Las celdas DENTRO del documento (no en EXPORTAR) que muestran estos
     # datos de personas dependen de que LibreOffice recalcule su formula
     # al convertir a PDF -- eso no siempre pasa de forma confiable (igual
