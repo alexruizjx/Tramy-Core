@@ -445,7 +445,7 @@ def medellin_crear_usuario(datos, usar_proxy=True):
     Antioquia/Medellin), que ya vienen preseleccionados.
     'usar_proxy' (True por defecto): el sitio de Medellin ha bloqueado la
     IP fija del servidor varias veces por exceso de peticiones -- se usa
-    el proxy residencial de IPRoyal por defecto para evitarlo."""
+    el proxy residencial de DataImpulse por defecto para evitarlo."""
     resultado = {"exito": False, "mensaje": ""}
     etiqueta = f"[MEDELLIN-{uuid.uuid4().hex[:6]}]"  # para poder filtrar SOLO estos logs entre los de otros procesos concurrentes
 
