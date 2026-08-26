@@ -8029,10 +8029,10 @@ def diagnostico_proxy_dataimpulse_endpoint():
         return jsonify({"error": "Faltan las credenciales de DataImpulse en las variables de entorno (DATAIMPULSE_USER/DATAIMPULSE_PASS)."}), 400
 
     proxy_url = f"http://{DATAIMPULSE_USER}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{DATAIMPULSE_PORT}"
+    url_prueba = request.args.get("url", "https://movilidad.envigado.gov.co/portal-servicios/#/agendar-cita-publica")
     try:
         resultado = subprocess.run(
-            ["curl", "-v", "--proxy", proxy_url, "--max-time", "30",
-             "https://movilidad.envigado.gov.co/portal-servicios/#/agendar-cita-publica"],
+            ["curl", "-v", "--proxy", proxy_url, "--max-time", "30", url_prueba],
             capture_output=True, text=True, timeout=35
         )
         return jsonify({
