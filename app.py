@@ -765,6 +765,40 @@ def medellin_crear_usuario(datos, usar_proxy=True):
                     except Exception as e_btns:
                         print(f"{etiqueta} No se pudo revisar los botones visibles: {e_btns}", flush=True)
                     print(f"{etiqueta} === FIN DIAGNOSTICO sin preguntas ===", flush=True)
+
+                    # Si no aparecio ninguna pregunta, el "Siguiente"
+                    # sigue siendo el unico boton disponible -- hay que
+                    # darle clic OTRA VEZ para que el registro continue
+                    # (antes el codigo se quedaba aqui sin hacer nada
+                    # mas, dejando el registro a medias).
+                    if page.locator("#inpBtnNext").count() > 0:
+                        print(f"{etiqueta} Se le da clic a 'Siguiente' de nuevo, ya que no hubo preguntas que responder.", flush=True)
+                        contenido_antes_siguiente2 = page.inner_text("body")
+                        esperas_reintento_sig2 = [3000, 5000, 8000]
+                        for intento_sig2, espera_ms_sig2 in enumerate(esperas_reintento_sig2):
+                            if page.locator("#inpBtnNext").count() == 0:
+                                print(f"{etiqueta} El boton 'Siguiente' ya no existe -- la pagina avanzo.", flush=True)
+                                break
+                            try:
+                                page.click("#inpBtnNext", force=True, timeout=5000)
+                            except Exception as e_click_sig2:
+                                print(f"{etiqueta} No se pudo hacer clic en Siguiente (probablemente deshabilitado temporalmente): {e_click_sig2}", flush=True)
+                            page.wait_for_timeout(espera_ms_sig2)
+                            contenido_despues_siguiente2 = page.inner_text("body")
+                            if contenido_despues_siguiente2 != contenido_antes_siguiente2:
+                                print(f"{etiqueta} Segundo clic en Siguiente avanzo la pagina (intento {intento_sig2+1}, espero {espera_ms_sig2}ms).", flush=True)
+                                break
+                            print(f"{etiqueta} Segundo clic en Siguiente NO parece haber avanzado (intento {intento_sig2+1}/{len(esperas_reintento_sig2)}, espero {espera_ms_sig2}ms), reintentando...", flush=True)
+                        else:
+                            print(f"{etiqueta} *** Segundo clic en Siguiente no avanzo despues de {len(esperas_reintento_sig2)} intentos -- se continua de todas formas.", flush=True)
+
+                        print(f"{etiqueta} === DIAGNOSTICO: despues del segundo clic en Siguiente ===", flush=True)
+                        print(f"{etiqueta} URL actual:", page.url, flush=True)
+                        try:
+                            print(etiqueta, page.inner_text("body")[:2000], flush=True)
+                        except Exception as e_txt4:
+                            print(f"{etiqueta} No se pudo leer el texto de la pagina:", e_txt4, flush=True)
+                        print(f"{etiqueta} === FIN DIAGNOSTICO despues del segundo clic en Siguiente ===", flush=True)
                 else:
                     preguntas = page.evaluate("""() => {
                         var divs = document.querySelectorAll('.divPregunta');
