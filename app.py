@@ -491,7 +491,7 @@ def medellin_crear_usuario(datos, usar_proxy=True):
                 pass
         page.on("response", _capturar_peticion)
 
-        MAX_INTENTOS_COMPLETOS = 3  # si el formulario se queda pegado, se recarga la pagina y se vuelve a llenar todo desde cero, hasta esta cantidad de veces
+        MAX_INTENTOS_COMPLETOS = 1  # se bajo de 3 a 1 -- recargar y reenviar el formulario completo varias veces parece ser lo que dispara el bloqueo del firewall del sitio (visto en pruebas reales, "Attack ID" del WAF)
         for intento_completo in range(MAX_INTENTOS_COMPLETOS):
           try:
             if intento_completo > 0:
