@@ -799,6 +799,24 @@ def medellin_crear_usuario(datos, usar_proxy=True):
                         except Exception as e_txt4:
                             print(f"{etiqueta} No se pudo leer el texto de la pagina:", e_txt4, flush=True)
                         print(f"{etiqueta} === FIN DIAGNOSTICO despues del segundo clic en Siguiente ===", flush=True)
+
+                        # Captura de pantalla REAL en este punto -- el
+                        # texto (inner_text) no muestra lo que hay
+                        # escrito DENTRO de los campos (solo las
+                        # etiquetas), asi que no basta para saber si el
+                        # formulario sigue lleno o se vacio, o si hay
+                        # algun mensaje de error/validacion visible.
+                        try:
+                            _ruta_captura_med = f"/tmp/medellin_captura_{etiqueta.strip('[]').replace('MEDELLIN-', '')}.png"
+                            page.screenshot(path=_ruta_captura_med, full_page=True, timeout=8000)
+                            _url_captura_med = subir_a_r2(
+                                _ruta_captura_med,
+                                f"diagnosticos/medellin_{etiqueta.strip('[]').replace('MEDELLIN-', '')}.png",
+                                content_type="image/png"
+                            )
+                            print(f"{etiqueta} === Captura de pantalla: {_url_captura_med} ===", flush=True)
+                        except Exception as e_captura_med:
+                            print(f"{etiqueta} No se pudo tomar/subir la captura de pantalla: {e_captura_med}", flush=True)
                 else:
                     preguntas = page.evaluate("""() => {
                         var divs = document.querySelectorAll('.divPregunta');
