@@ -1194,31 +1194,30 @@ def medellin_activar_cuenta(usuario_temporal, password_temporal, nueva_password,
     pide el sitio la primera vez. Reutiliza el mismo patron de login
     real por Playwright que ya usamos para revisar citas.
     'usar_proxy': si es True, la conexion pasa por el proxy residencial
-    de IPRoyal en vez de la IP fija del servidor -- util porque el sitio
-    de Medellin ha bloqueado esa IP fija varias veces por exceso de
-    peticiones."""
+    de DataImpulse en vez de la IP fija del servidor -- util porque el
+    sitio de Medellin ha bloqueado esa IP fija varias veces por exceso
+    de peticiones."""
     etiqueta = f"[MEDELLIN-ACTIVAR-{uuid.uuid4().hex[:6]}]"
     resultado = {"exito": False, "mensaje": ""}
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
-        proxy_config = None
-        if usar_proxy:
-            if IPROYAL_USER and IPROYAL_PASS:
-                proxy_config = {
-                    "server": f"http://{IPROYAL_HOST}:{IPROYAL_PORT}",
-                    "username": IPROYAL_USER,
-                    "password": IPROYAL_PASS,
-                }
-                print(f"{etiqueta} Usando proxy residencial de IPRoyal para esta consulta.", flush=True)
-            else:
-                print(f"{etiqueta} *** ALERTA: se pidio usar el proxy, pero faltan las credenciales de IPRoyal en las variables de entorno (IPROYAL_USER/IPROYAL_PASS) -- esta consulta va SIN proxy, usando la IP normal del servidor.", flush=True)
-        context = browser.new_context(proxy=proxy_config)
+        proxy_config = _dataimpulse_proxy_config(etiqueta) if usar_proxy else None
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            viewport={"width": 1366, "height": 900},
+            proxy=proxy_config,
+        )
         page = context.new_page()
 
         try:
             print(f"{etiqueta} Iniciando sesion con credenciales temporales (usuario: {usuario_temporal})...", flush=True)
             page.goto(MEDELLIN_LOGIN_URL, timeout=30000)
+
+            if _medellin_ip_bloqueada(page, etiqueta):
+                resultado["mensaje"] = "IP bloqueada por el firewall del sitio (no es un error de Tramy) -- espera un rato antes de volver a intentar."
+                return resultado
+
             page.fill('input[name="user"]', usuario_temporal)
             page.fill('input[name="passw"]', password_temporal)
             with page.expect_navigation(timeout=30000):
