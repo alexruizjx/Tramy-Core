@@ -8168,6 +8168,31 @@ def diagnostico_proxy_dataimpulse_endpoint():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/diagnostico-sin-proxy", methods=["GET"])
+def diagnostico_sin_proxy_endpoint():
+    """Igual que /diagnostico-proxy-dataimpulse, pero SIN usar ningun
+    proxy -- directo desde la IP del servidor de Railway. Se usa para
+    comparar: si el bloqueo (Attack ID del WAF) aparece IGUAL sin
+    proxy, es un bloqueo generico a trafico automatizado/datacenter; si
+    solo aparece CON proxy, es especifico a IPs residenciales/proxy."""
+    url_prueba = request.args.get("url", "https://www.medellin.gov.co")
+    try:
+        resultado = subprocess.run(
+            ["curl", "-v", "--max-time", "30", url_prueba],
+            capture_output=True, text=True, timeout=35
+        )
+        return jsonify({
+            "ok": True,
+            "codigo_salida": resultado.returncode,
+            "salida_estandar": resultado.stdout[-2000:],
+            "salida_error_detallada": resultado.stderr[-4000:],
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "error": "Timeout -- el comando tardo mas de 35 segundos sin responder."}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/medellin-activar-cuenta-directo", methods=["GET"])
 def medellin_activar_cuenta_directo_endpoint():
     """Version simplificada de /medellin-activar-cuenta -- en vez de leer
