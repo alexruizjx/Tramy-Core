@@ -433,6 +433,29 @@ MEDELLIN_TIPO_IDENTIFICACION = {
 MEDELLIN_GENERO = {"Masculino": "m", "Femenino": "f", "Otro": "o"}
 
 
+def _medellin_ip_bloqueada(page, etiqueta):
+    """Revisa si la pagina actual muestra el bloqueo del firewall (WAF)
+    de medellin.gov.co -- ese mensaje especifico ('Web Page Blocked!',
+    con un 'Attack ID') es DISTINTO a un error normal de la pagina, y
+    antes quedaba escondido entre el resto de texto de los diagnosticos,
+    dificil de notar sin leer el log completo con cuidado. Ahora se
+    revisa explicitamente y se imprime una linea bien visible si
+    aparece, para saber de inmediato (sin tener que interpretar nada)
+    que el problema es un bloqueo de IP y no un error de nuestro codigo."""
+    try:
+        texto_pagina = page.inner_text("body")
+    except Exception:
+        return False
+    if "Web Page Blocked" in texto_pagina or "Attack ID" in texto_pagina:
+        print(f"{etiqueta} ################################################", flush=True)
+        print(f"{etiqueta} ### IP BLOQUEADA POR EL FIREWALL DEL SITIO  ###", flush=True)
+        print(f"{etiqueta} ### (no es un error de Tramy -- espera un   ###", flush=True)
+        print(f"{etiqueta} ### buen rato antes de volver a intentar)   ###", flush=True)
+        print(f"{etiqueta} ################################################", flush=True)
+        return True
+    return False
+
+
 def medellin_crear_usuario(datos, usar_proxy=True):
     """Crea un usuario nuevo en el portal 'Movilidad en Linea' de la
     Alcaldia de Medellin (formulario de auto-registro). Los selectores
@@ -500,6 +523,11 @@ def medellin_crear_usuario(datos, usar_proxy=True):
 
             page.goto(MEDELLIN_REGISTRO_URL, wait_until="load", timeout=60000)
             page.wait_for_timeout(2000)
+
+            if _medellin_ip_bloqueada(page, etiqueta):
+                resultado["error"] = "IP bloqueada por el firewall del sitio (no es un error de Tramy) -- espera un rato antes de volver a intentar."
+                resultado["mensaje"] = resultado["error"]
+                return resultado
 
             # 1. Tipo de Sociedad -- esto dispara (via jQuery) que se
             # muestren/oculten otros campos (Tipo de Entidad para
@@ -1264,6 +1292,9 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
 
         try:
             page.wait_for_timeout(2000)
+
+            if _medellin_ip_bloqueada(page, etiqueta):
+                return False, {"error": "IP bloqueada por el firewall del sitio (no es un error de Tramy) -- espera un rato antes de volver a intentar."}
 
             # 2. Login -- OJO: el login real del sitio es un ENVIO DE
             # FORMULARIO NORMAL (navegacion completa, Sec-Fetch-Mode:
