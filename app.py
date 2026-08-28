@@ -1218,11 +1218,49 @@ def medellin_activar_cuenta(usuario_temporal, password_temporal, nueva_password,
                 resultado["mensaje"] = "IP bloqueada por el firewall del sitio (no es un error de Tramy) -- espera un rato antes de volver a intentar."
                 return resultado
 
-            page.fill('input[name="user"]', usuario_temporal)
-            page.fill('input[name="passw"]', password_temporal)
-            with page.expect_navigation(timeout=30000):
+            # Diagnostico ANTES de llenar nada -- para confirmar que los
+            # selectores (input[name="user"], input[name="passw"]) son
+            # los correctos para ESTA pagina real.
+            print(f"{etiqueta} === DIAGNOSTICO: HTML de la pagina de login (antes de llenar) ===", flush=True)
+            try:
+                print(etiqueta, page.content()[:4000], flush=True)
+            except Exception as e_html0:
+                print(f"{etiqueta} No se pudo volcar el HTML: {e_html0}", flush=True)
+
+            page.click('input[name="user"]')
+            page.keyboard.type(usuario_temporal, delay=60)
+            page.click('input[name="passw"]')
+            page.keyboard.type(password_temporal, delay=60)
+
+            # En vez de asumir que Enter dispara la navegacion, se busca
+            # un boton real de inicio de sesion primero -- si no se
+            # encuentra ninguno, se cae al Enter como respaldo.
+            contenido_antes_login = page.inner_text("body")
+            boton_login = None
+            for selector_boton in ['button[type="submit"]', 'input[type="submit"]', 'button:has-text("Iniciar")', 'button:has-text("Ingresar")', 'a:has-text("Iniciar")']:
+                if page.locator(selector_boton).count() > 0:
+                    boton_login = selector_boton
+                    break
+
+            if boton_login:
+                print(f"{etiqueta} Se encontro boton de login con el selector: {boton_login}", flush=True)
+                page.click(boton_login, force=True)
+            else:
+                print(f"{etiqueta} No se encontro un boton de login explicito -- se usa Enter como respaldo.", flush=True)
                 page.press('input[name="passw"]', "Enter")
-            page.wait_for_timeout(3000)
+
+            # Se espera a que la pagina cambie (sin asumir que sera una
+            # "navegacion" clasica -- puede ser una actualizacion via
+            # AJAX sin cambiar de URL).
+            for _intento_login in range(6):
+                page.wait_for_timeout(2000)
+                if page.inner_text("body") != contenido_antes_login:
+                    print(f"{etiqueta} La pagina cambio tras el login (intento {_intento_login+1}/6).", flush=True)
+                    break
+            else:
+                print(f"{etiqueta} *** La pagina NO parecio cambiar tras el login, despues de 6 intentos -- se continua de todas formas.", flush=True)
+
+            page.wait_for_timeout(1000)
 
             print(f"{etiqueta} === DIAGNOSTICO: pagina despues del login con credenciales temporales ===", flush=True)
             print(f"{etiqueta} URL actual:", page.url, flush=True)
@@ -1252,6 +1290,17 @@ def medellin_activar_cuenta(usuario_temporal, password_temporal, nueva_password,
                 print(etiqueta, page.inner_text("body")[:2000], flush=True)
             except Exception:
                 pass
+            try:
+                _ruta_captura_act = f"/tmp/medellin_activar_{etiqueta.strip('[]').replace('MEDELLIN-ACTIVAR-', '')}.png"
+                page.screenshot(path=_ruta_captura_act, full_page=True, timeout=8000)
+                _url_captura_act = subir_a_r2(
+                    _ruta_captura_act,
+                    f"diagnosticos/medellin_activar_{etiqueta.strip('[]').replace('MEDELLIN-ACTIVAR-', '')}.png",
+                    content_type="image/png"
+                )
+                print(f"{etiqueta} === Captura de pantalla del error: {_url_captura_act} ===", flush=True)
+            except Exception as e_captura_act:
+                print(f"{etiqueta} No se pudo tomar/subir la captura de pantalla: {e_captura_act}", flush=True)
         finally:
             context.close(); browser.close()
 
