@@ -610,6 +610,7 @@ def medellin_crear_usuario(datos, usar_proxy=True):
             # Se prueba dejando que ese reinicio (si existe) ocurra ANTES,
             # dejando Ciudad como lo ULTIMO que se toca del formulario.
             page.select_option("#cPais", value="CO")
+            page.wait_for_timeout(1500)  # deja que el desplegable en cascada de Departamento termine de cargar sus opciones tras elegir Pais
             page.select_option("#cDepartamento", value="05-ANTIOQUIA")
             page.wait_for_timeout(2500)  # dejar que cualquier reinicio automatico de Ciudad ya ocurra aqui
 
