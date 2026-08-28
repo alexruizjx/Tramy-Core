@@ -611,7 +611,23 @@ def medellin_crear_usuario(datos, usar_proxy=True):
             # dejando Ciudad como lo ULTIMO que se toca del formulario.
             page.select_option("#cPais", value="CO")
             page.wait_for_timeout(1500)  # deja que el desplegable en cascada de Departamento termine de cargar sus opciones tras elegir Pais
-            page.select_option("#cDepartamento", value="05-ANTIOQUIA")
+
+            # En vez de adivinar el "value" exacto del option de Antioquia
+            # (que fallo -- probablemente el formato real es distinto al
+            # que se supuso), se buscan las opciones REALES del
+            # desplegable y se selecciona la que tenga "ANTIOQUIA" en su
+            # texto visible, sin importar el formato interno del value.
+            opciones_depto = page.evaluate("""
+                () => Array.from(document.querySelectorAll('#cDepartamento option')).map(o => ({value: o.value, texto: o.textContent.trim()}))
+            """)
+            print(f"{etiqueta} === Opciones reales de Departamento ({len(opciones_depto)}): {opciones_depto[:5]}...", flush=True)
+            opcion_antioquia = next((o for o in opciones_depto if "ANTIOQUIA" in o["texto"].upper()), None)
+            if opcion_antioquia:
+                print(f"{etiqueta} Se encontro Antioquia con value real: '{opcion_antioquia['value']}'", flush=True)
+                page.select_option("#cDepartamento", value=opcion_antioquia["value"])
+            else:
+                print(f"{etiqueta} *** No se encontro ninguna opcion de Departamento con 'ANTIOQUIA' en el texto -- se intenta con el value supuesto como ultimo recurso.", flush=True)
+                page.select_option("#cDepartamento", value="05-ANTIOQUIA")
             page.wait_for_timeout(2500)  # dejar que cualquier reinicio automatico de Ciudad ya ocurra aqui
 
             try:
@@ -620,7 +636,16 @@ def medellin_crear_usuario(datos, usar_proxy=True):
             except Exception as e0:
                 print(f"{etiqueta} No se pudo leer ciudad (momento 0): {e0}", flush=True)
 
-            page.select_option("#cCiudad", value="05001-MEDELLÍN")
+            opciones_ciudad = page.evaluate("""
+                () => Array.from(document.querySelectorAll('#cCiudad option')).map(o => ({value: o.value, texto: o.textContent.trim()}))
+            """)
+            opcion_medellin = next((o for o in opciones_ciudad if "MEDELL" in o["texto"].upper()), None)
+            if opcion_medellin:
+                print(f"{etiqueta} Se encontro Medellin con value real: '{opcion_medellin['value']}'", flush=True)
+                page.select_option("#cCiudad", value=opcion_medellin["value"])
+            else:
+                print(f"{etiqueta} *** No se encontro ninguna opcion de Ciudad con 'MEDELL' en el texto -- se intenta con el value supuesto como ultimo recurso.", flush=True)
+                page.select_option("#cCiudad", value="05001-MEDELLÍN")
 
             # DIAGNOSTICO TEMPORAL -- revisar el valor de Ciudad en varios
             # momentos seguidos, para ver exactamente cuando se resetea.
@@ -738,7 +763,22 @@ def medellin_crear_usuario(datos, usar_proxy=True):
             # de cada pregunta que SI aparezca y responde segun ese
             # texto.
             try:
-                hay_preguntas = page.evaluate("() => document.querySelectorAll('.divPregunta').length > 0")
+                # Se revisa varias veces seguidas (no solo una vez con
+                # una espera fija) antes de concluir que no hay
+                # preguntas -- se detecto (con una prueba manual real)
+                # que SI pueden aparecer preguntas para un registro en
+                # particular, pero el codigo las revisaba demasiado
+                # rapido, antes de que alcanzaran a renderizarse (la
+                # segunda pregunta en particular depende de una consulta
+                # sobre si la persona tiene vehiculos a su nombre, que
+                # puede tardar mas que la primera).
+                hay_preguntas = False
+                for _intento_preg in range(4):
+                    page.wait_for_timeout(1200)
+                    hay_preguntas = page.evaluate("() => document.querySelectorAll('.divPregunta').length > 0")
+                    if hay_preguntas:
+                        print(f"{etiqueta} Aparecieron preguntas en el intento de revision {_intento_preg+1}/4.", flush=True)
+                        break
                 if not hay_preguntas:
                     print(f"{etiqueta} No aparecio ninguna pregunta de Verdadero/Falso en este registro.", flush=True)
                     print(f"{etiqueta} === DIAGNOSTICO: estado de la pagina sin preguntas ===", flush=True)
