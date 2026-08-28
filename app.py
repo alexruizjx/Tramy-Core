@@ -531,10 +531,23 @@ def medellin_crear_usuario(datos, usar_proxy=True):
 
             # 1. Tipo de Sociedad -- esto dispara (via jQuery) que se
             # muestren/oculten otros campos (Tipo de Entidad para
-            # Juridica, Apellidos/Genero para Natural).
+            # Juridica, Apellidos/Genero para Natural). Se detecto en una
+            # prueba real que, aunque el VALOR quedaba bien puesto,
+            # "Tipo de Entidad" (que solo deberia verse para Juridica)
+            # seguia apareciendo en pantalla incluso eligiendo Natural --
+            # asi que se dispara el evento 'change' explicitamente por
+            # JavaScript, ademas de select_option(), para forzar a que
+            # esa logica de mostrar/ocultar si se ejecute.
             valor_sociedad = MEDELLIN_TIPO_SOCIEDAD.get(datos["tipo_sociedad"], "N-Persona Natural")
             page.select_option("#cTipoSociedad", value=valor_sociedad)
-            page.wait_for_timeout(500)
+            page.evaluate("""() => {
+                var el = document.getElementById('cTipoSociedad');
+                if (el) {
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                    el.dispatchEvent(new Event('click', {bubbles: true}));
+                }
+            }""")
+            page.wait_for_timeout(800)
 
             # 2. Tipo de Entidad -- solo aplica si es Persona Juridica
             if datos["tipo_sociedad"] == "Persona Juridica" and datos.get("tipo_entidad"):
@@ -558,17 +571,26 @@ def medellin_crear_usuario(datos, usar_proxy=True):
             page.wait_for_timeout(3000)
 
             # 4. Nombre / Razon Social
-            page.fill("#cNombre", datos["nombre"])
+            # Igual que Numero de Identificacion: se escribe caracter por
+            # caracter (no fill() de un solo golpe), ya que se detecto
+            # que TODOS los campos de texto se quedaban sin marcar como
+            # "validos" (columna tdOk) usando fill(), lo que bloqueaba
+            # el boton Siguiente aunque el VALOR quedara bien puesto.
+            page.click("#cNombre")
+            page.keyboard.type(datos["nombre"], delay=60)
 
             # 5. Apellidos y Genero -- solo aplican para Persona Natural
             if datos["tipo_sociedad"] == "Persona Natural":
-                page.fill("#cApellidos", datos["apellidos"])
+                page.click("#cApellidos")
+                page.keyboard.type(datos["apellidos"], delay=60)
                 valor_genero = MEDELLIN_GENERO.get(datos["genero"], "m")
                 page.select_option("#cGenero", value=valor_genero)
 
             # 6. Correo y Direccion
-            page.fill("#cCorreoElectronico", datos["email"])
-            page.fill("#cDireccionResidencia", datos["direccion"])
+            page.click("#cCorreoElectronico")
+            page.keyboard.type(datos["email"], delay=60)
+            page.click("#cDireccionResidencia")
+            page.keyboard.type(datos["direccion"], delay=60)
 
             # 7. Aceptar politicas de uso (obligatorio) y autorizar
             # notificaciones (opcional, pero conviene para que lleguen
@@ -624,7 +646,8 @@ def medellin_crear_usuario(datos, usar_proxy=True):
             page.click("#cTelefono")
             page.keyboard.type(datos["telefono"], delay=80)
             if datos.get("celular"):
-                page.fill("#cCelular", datos["celular"])
+                page.click("#cCelular")
+                page.keyboard.type(datos["celular"], delay=60)
             page.wait_for_timeout(3000)
 
             # 9. Pais, Departamento y Ciudad -- se seleccionan explicito
@@ -798,6 +821,23 @@ def medellin_crear_usuario(datos, usar_proxy=True):
             except Exception as e_txt:
                 print(f"{etiqueta} No se pudo leer el texto de la pagina:", e_txt, flush=True)
             print(f"{etiqueta} === FIN DIAGNOSTICO despues de Siguiente ===", flush=True)
+
+            # Captura de pantalla REAL -- el texto solo no ha sido
+            # suficiente para diagnosticar bien varios de estos casos
+            # (los inputs de texto no aparecen en inner_text, solo las
+            # etiquetas), asi que se toma una foto real de la pagina en
+            # este punto especifico donde "Siguiente" no parecio avanzar.
+            try:
+                _ruta_captura_sig = f"/tmp/medellin_sig_{etiqueta.strip('[]').replace('MEDELLIN-', '')}.png"
+                page.screenshot(path=_ruta_captura_sig, full_page=True, timeout=8000)
+                _url_captura_sig = subir_a_r2(
+                    _ruta_captura_sig,
+                    f"diagnosticos/medellin_sig_{etiqueta.strip('[]').replace('MEDELLIN-', '')}.png",
+                    content_type="image/png"
+                )
+                print(f"{etiqueta} === Captura de pantalla (despues de Siguiente): {_url_captura_sig} ===", flush=True)
+            except Exception as e_captura_sig:
+                print(f"{etiqueta} No se pudo tomar/subir la captura de pantalla: {e_captura_sig}", flush=True)
 
             # 10. SEGUNDO PASO -- preguntas de Verdadero/Falso. IMPORTANTE:
             # estas preguntas son FIJAS (no se despliegan preguntas nuevas
