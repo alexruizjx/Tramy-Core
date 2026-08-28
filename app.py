@@ -609,7 +609,24 @@ def medellin_crear_usuario(datos, usar_proxy=True):
             # automatico de Ciudad (patron comun de "selects en cascada").
             # Se prueba dejando que ese reinicio (si existe) ocurra ANTES,
             # dejando Ciudad como lo ULTIMO que se toca del formulario.
-            page.select_option("#cPais", value="CO")
+            # Se busca la opcion de Colombia por su texto real, igual
+            # que se hace mas abajo con Departamento y Ciudad -- si el
+            # value supuesto ("CO") no es el correcto, el desplegable de
+            # Departamento nunca llega a poblarse con nada (justo lo que
+            # se vio en una prueba real: Departamento se quedaba con una
+            # sola opcion, "Seleccione..").
+            opciones_pais = page.evaluate("""
+                () => Array.from(document.querySelectorAll('#cPais option')).map(o => ({value: o.value, texto: o.textContent.trim()}))
+            """)
+            opcion_colombia = next((o for o in opciones_pais if "COLOMBIA" in o["texto"].upper()), None)
+            if opcion_colombia:
+                print(f"{etiqueta} Se encontro Colombia con value real: '{opcion_colombia['value']}'", flush=True)
+                page.select_option("#cPais", value=opcion_colombia["value"])
+            else:
+                print(f"{etiqueta} *** No se encontro ninguna opcion de Pais con 'COLOMBIA' en el texto -- se intenta con el value supuesto 'CO' como ultimo recurso.", flush=True)
+                page.select_option("#cPais", value="CO")
+            valor_pais_confirmado = page.evaluate("() => document.querySelector('#cPais').value")
+            print(f"{etiqueta} Valor real de Pais despues de seleccionarlo: '{valor_pais_confirmado}'", flush=True)
             page.wait_for_timeout(1500)  # deja que el desplegable en cascada de Departamento termine de cargar sus opciones tras elegir Pais
 
             # En vez de adivinar el "value" exacto del option de Antioquia
