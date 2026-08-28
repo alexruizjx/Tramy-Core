@@ -4276,6 +4276,17 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         hoja["F8"] = _otro_mandatario_persona.get("numero_documento") or ""
         hoja["F8"].number_format = "General"
 
+        # A3 y A5 se ven con las lineas montadas (superpuestas con el
+        # texto justo encima) al convertir a PDF -- se bajan 2 lineas
+        # agregando dos saltos de linea al inicio, y se activa el
+        # ajuste de texto para que se vea bien.
+        for _celda_texto_mandato4, _texto_original_mandato4 in [
+            ("A3", "quien para efectos del presente contrato se denominará el MANDANTE VENDEDOR.\n"),
+            ("A5", "también mayor de edad, vecino(a) de ésta  ciudad Identificado(a) con Documento de identidad Numero:\n"),
+        ]:
+            hoja[_celda_texto_mandato4] = "\n\n" + _texto_original_mandato4
+            hoja[_celda_texto_mandato4].alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
     # Precio de venta -- se escribe directo en la celda del documento
     # (ademas de en EXPORTAR) por el mismo motivo de siempre: una formula
     # que apunta a una celda vacia se evalua como 0, sin importar el
