@@ -1217,10 +1217,10 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
     'Punto de atención Sao Paulo'). Si se deja vacio, se revisan todas
     las sedes como antes.
     'usar_proxy' (opcional): si es True, la conexion pasa por el proxy
-    residencial de IPRoyal (IP distinta en cada peticion) en vez de la
-    IP fija del servidor -- pensado para las ventanas de monitoreo muy
-    frecuente (ej. cada 30 segundos), donde el sitio de Medellin puede
-    bloquear la IP fija por exceso de peticiones seguidas.
+    residencial de DataImpulse (IP distinta en cada peticion) en vez de
+    la IP fija del servidor -- pensado para las ventanas de monitoreo
+    muy frecuente (ej. cada 30 segundos), donde el sitio de Medellin
+    puede bloquear la IP fija por exceso de peticiones seguidas.
     Devuelve una tupla (hay_citas: bool, detalle: dict|None)."""
     etiqueta = f"[MEDELLIN-CITAS-{uuid.uuid4().hex[:6]}]"
 
@@ -1229,17 +1229,7 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
             "--single-process", "--no-zygote", "--disable-setuid-sandbox"
         ])
-        proxy_config = None
-        if usar_proxy:
-            if IPROYAL_USER and IPROYAL_PASS:
-                proxy_config = {
-                    "server": f"http://{IPROYAL_HOST}:{IPROYAL_PORT}",
-                    "username": IPROYAL_USER,
-                    "password": IPROYAL_PASS,
-                }
-                print(f"{etiqueta} Usando proxy residencial de IPRoyal para esta consulta.", flush=True)
-            else:
-                print(f"{etiqueta} *** ALERTA: se pidio usar el proxy, pero faltan las credenciales de IPRoyal en las variables de entorno (IPROYAL_USER/IPROYAL_PASS) -- esta consulta va SIN proxy, usando la IP normal del servidor.", flush=True)
+        proxy_config = _dataimpulse_proxy_config(etiqueta) if usar_proxy else None
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
             viewport={"width": 1366, "height": 900},
