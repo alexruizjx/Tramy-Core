@@ -4403,15 +4403,22 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         hoja["F8"].number_format = "General"
 
         # A3 y A5 se ven con las lineas montadas (superpuestas con el
-        # texto justo encima) al convertir a PDF -- se bajan 2 lineas
-        # agregando dos saltos de linea al inicio, y se activa el
-        # ajuste de texto para que se vea bien.
-        for _celda_texto_mandato4, _texto_original_mandato4 in [
-            ("A3", "quien para efectos del presente contrato se denominará el MANDANTE VENDEDOR.\n"),
-            ("A5", "también mayor de edad, vecino(a) de ésta  ciudad Identificado(a) con Documento de identidad Numero:\n"),
-        ]:
-            hoja[_celda_texto_mandato4] = "\n\n" + _texto_original_mandato4
-            hoja[_celda_texto_mandato4].alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        # texto justo encima) al convertir a PDF. El intento anterior de
+        # arreglar esto (agregando saltos de linea AL INICIO del texto)
+        # termino "recortando" el texto -- la fila no tenia suficiente
+        # altura para mostrar los saltos de linea Y el texto real, asi
+        # que el texto quedaba fuera del area visible (invisible, pero
+        # seguia estando ahi). Se corrige de otra forma: el texto se
+        # deja intacto, y en vez de eso se agranda la altura de esas 2
+        # filas especificas, para separar visualmente sin arriesgar
+        # que el texto real se pierda de vista.
+        hoja["A3"] = "quien para efectos del presente contrato se denominará el MANDANTE VENDEDOR."
+        hoja["A3"].alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        hoja.row_dimensions[3].height = 60
+
+        hoja["A5"] = "también mayor de edad, vecino(a) de ésta  ciudad Identificado(a) con Documento de identidad Numero:"
+        hoja["A5"].alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        hoja.row_dimensions[5].height = 60
 
     # Precio de venta -- se escribe directo en la celda del documento
     # (ademas de en EXPORTAR) por el mismo motivo de siempre: una formula
