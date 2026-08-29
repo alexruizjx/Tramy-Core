@@ -1374,7 +1374,16 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
                 # tiempo a la app de Angular de terminar de armar la
                 # pagina.
                 page.goto(MEDELLIN_INICIO_SESION_URL, wait_until="domcontentloaded", timeout=45000)
-                page.wait_for_timeout(3000)
+                # En vez de solo una pausa fija, se espera activamente a
+                # que el campo de usuario aparezca (Angular puede tardar
+                # una cantidad de tiempo variable en terminar de armar
+                # la pagina) -- se vio en una prueba real que a veces el
+                # campo aun no existia con solo 3 segundos de espera.
+                try:
+                    page.wait_for_selector('input[name="user"]', timeout=15000)
+                except Exception:
+                    print(f"{etiqueta} El campo de usuario no aparecio en 15 segundos -- se continua de todas formas.", flush=True)
+                page.wait_for_timeout(1000)
                 break  # la pagina cargo bien, no hace falta reintentar
             except Exception as e_goto_inicial:
                 if proxy_config and any(err in str(e_goto_inicial) for err in ERRORES_TUNEL_PROXY) and intento_proxy < 2:
