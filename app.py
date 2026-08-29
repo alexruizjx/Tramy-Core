@@ -1363,7 +1363,18 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
         ERRORES_TUNEL_PROXY = ("ERR_TUNNEL_CONNECTION_FAILED", "ERR_PROXY_CONNECTION_FAILED", "ERR_PROXY_AUTH_UNSUPPORTED")
         for intento_proxy in range(3):
             try:
-                page.goto(MEDELLIN_INICIO_SESION_URL, wait_until="load", timeout=45000)
+                # "wait_until='load'" nunca se disparaba en pruebas
+                # reales (el log de Playwright confirmo que solo llegaba
+                # a dispararse "domcontentloaded") -- es un patron comun
+                # en sitios tipo Angular/SPA, que pueden quedar con
+                # alguna conexion o actividad de fondo que evita que el
+                # evento "load" clasico se dispare nunca. Se espera
+                # "domcontentloaded" en su lugar (que SI se confirmo que
+                # ocurre), y se agrega una pausa fija despues para darle
+                # tiempo a la app de Angular de terminar de armar la
+                # pagina.
+                page.goto(MEDELLIN_INICIO_SESION_URL, wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_timeout(3000)
                 break  # la pagina cargo bien, no hace falta reintentar
             except Exception as e_goto_inicial:
                 if proxy_config and any(err in str(e_goto_inicial) for err in ERRORES_TUNEL_PROXY) and intento_proxy < 2:
@@ -1392,8 +1403,10 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
             # se envia con Enter, para que el navegador dispare la MISMA
             # navegacion completa que dispara una persona real.
             try:
-                page.fill('input[name="user"]', usuario)
-                page.fill('input[name="passw"]', password)
+                page.click('input[name="user"]')
+                page.keyboard.type(usuario, delay=60)
+                page.click('input[name="passw"]')
+                page.keyboard.type(password, delay=60)
             except Exception as e_login_campos:
                 print(f"{etiqueta} No se encontraron los campos de login con los selectores esperados: {e_login_campos}", flush=True)
                 try:
@@ -1409,8 +1422,27 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
                 except Exception:
                     pass
                 raise
-            with page.expect_navigation(wait_until="load", timeout=20000):
-                page.press('input[name="passw"]', "Enter")
+            # Antes se asumia que el Enter siempre dispara una
+            # "navegacion" clasica (page.expect_navigation) -- se
+            # confirmo en otro modulo de Medellin que esto puede fallar
+            # (el Enter no siempre dispara ese evento de forma
+            # confiable). Se hace mas robusto: se intenta la navegacion
+            # clasica primero (con un timeout mas corto), y si no
+            # ocurre, se cae a solo esperar que el CONTENIDO de la
+            # pagina cambie, sin importar si fue via navegacion o AJAX.
+            contenido_antes_login_citas = page.inner_text("body")
+            try:
+                with page.expect_navigation(wait_until="domcontentloaded", timeout=8000):
+                    page.press('input[name="passw"]', "Enter")
+            except Exception:
+                print(f"{etiqueta} El Enter no disparo una navegacion clasica -- se revisa si el contenido cambio de otra forma.", flush=True)
+                for _intento_login_citas in range(6):
+                    page.wait_for_timeout(2000)
+                    if page.inner_text("body") != contenido_antes_login_citas:
+                        print(f"{etiqueta} La pagina cambio tras el login (intento {_intento_login_citas+1}/6).", flush=True)
+                        break
+                else:
+                    print(f"{etiqueta} *** La pagina NO parecio cambiar tras el login -- se continua de todas formas.", flush=True)
             page.wait_for_timeout(2000)
 
             # 3. Confirmar que la sesion quedo autenticada (revisa el
@@ -1486,6 +1518,17 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
 
         except Exception as e:
             print(f"{etiqueta} Error: {e}", flush=True)
+            try:
+                _ruta_captura_citas = f"/tmp/medellin_citas_{etiqueta.strip('[]').replace('MEDELLIN-CITAS-', '')}.png"
+                page.screenshot(path=_ruta_captura_citas, full_page=True, timeout=8000)
+                _url_captura_citas = subir_a_r2(
+                    _ruta_captura_citas,
+                    f"diagnosticos/medellin_citas_{etiqueta.strip('[]').replace('MEDELLIN-CITAS-', '')}.png",
+                    content_type="image/png"
+                )
+                print(f"{etiqueta} === Captura de pantalla del error: {_url_captura_citas} ===", flush=True)
+            except Exception as e_captura_citas:
+                print(f"{etiqueta} No se pudo tomar/subir la captura de pantalla: {e_captura_citas}", flush=True)
             return False, {"error": str(e)}
         finally:
             context.close(); browser.close()
