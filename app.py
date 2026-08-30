@@ -4480,6 +4480,10 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         hoja["A5"].alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
         hoja.row_dimensions[5].height = 30
 
+        # A49 trae una formula que no se necesita -- se elimina dejando
+        # la celda vacia.
+        hoja["A49"] = None
+
     # Precio de venta -- se escribe directo en la celda del documento
     # (ademas de en EXPORTAR) por el mismo motivo de siempre: una formula
     # que apunta a una celda vacia se evalua como 0, sin importar el
