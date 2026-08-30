@@ -3828,6 +3828,25 @@ def _fun_coincide(valor_tramy, etiqueta_formulario):
     return re.search(r"\b" + re.escape(b) + r"\b", a) is not None
 
 
+def _escribir_celda_segura(ws, coordenada, valor, color_fuente=None):
+    """Escribe un valor en una celda, manejando el caso de que sea parte
+    de una celda COMBINADA -- escribir directo en una celda combinada
+    que no es la esquina superior izquierda lanza AttributeError en
+    openpyxl (o, peor, falla en silencio si el llamador lo atrapa sin
+    avisar). Esta funcion encuentra la celda ancla real del rango
+    combinado (si aplica) y escribe ahi, para que el valor SI se vea."""
+    celda = ws[coordenada]
+    if isinstance(celda, MergedCell):
+        for rango in ws.merged_cells.ranges:
+            if coordenada in rango:
+                celda = ws.cell(row=rango.min_row, column=rango.min_col)
+                break
+    celda.value = valor
+    if color_fuente:
+        celda.font = Font(color=color_fuente)
+    return celda
+
+
 def _fun_marcar_checkboxes(ws, mapa_celdas, valor_tramy):
     """Marca TODAS las opciones que coincidan (no solo la primera) -- un
     vehiculo de combustible dual (ej. 'GASOLINA Y GAS') debe marcar ambas."""
@@ -4264,11 +4283,9 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         else:
             _celda_soat_form, _celda_rtm_form = "AE49", "AE50"
         if datos_vehiculo.get("soat_vigente") is True:
-            hoja[_celda_soat_form] = "Vigente hasta " + (datos_vehiculo.get("soat_fecha_fin") or "")
-            hoja[_celda_soat_form].font = Font(color="FF000000")
+            _escribir_celda_segura(hoja, _celda_soat_form, "Vigente hasta " + (datos_vehiculo.get("soat_fecha_fin") or ""), color_fuente="FF000000")
         if datos_vehiculo.get("rtm_vigente") is True:
-            hoja[_celda_rtm_form] = "Vigente hasta " + (datos_vehiculo.get("rtm_fecha_fin") or "")
-            hoja[_celda_rtm_form].font = Font(color="FF000000")
+            _escribir_celda_segura(hoja, _celda_rtm_form, "Vigente hasta " + (datos_vehiculo.get("rtm_fecha_fin") or ""), color_fuente="FF000000")
 
     # Afirmacion de Traspaso tiene una celda con la fecha de hoy
     # (=TODAY()) que LibreOffice muestra en INGLES (ej. "15-August-2026")
@@ -4339,11 +4356,8 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         wb["DATOS"]["W2"] = linea_empresa
     celda_linea_empresa = APPJX_CELDA_LINEA_EMPRESA.get(clave_documento)
     if celda_linea_empresa:
-        try:
-            hoja[celda_linea_empresa] = linea_empresa
-        except AttributeError:
-            pass  # celda combinada -- no se puede escribir directo
-        hoja[celda_linea_empresa].number_format = "General"
+        celda_firma = _escribir_celda_segura(hoja, celda_linea_empresa, linea_empresa)
+        celda_firma.number_format = "General"
 
     # En los 4 documentos de MANDATO, algunas filas tienen texto con
     # salto de linea interno pero se quedaron con altura de una sola
