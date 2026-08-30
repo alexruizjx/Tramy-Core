@@ -4223,6 +4223,39 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
                 datos_vehiculo[_rol_relleno], _municipio_para_datos_falsos
             )
 
+    # Excepcion "Persona Indeterminada" (numero de documento 5134,
+    # activado con el checkbox del mismo nombre en Liquidacion) -- en
+    # los Formularios, el VENDEDOR/PROPIETARIO no debe mostrar ningun
+    # numero de documento, telefono, direccion ni municipio, no se
+    # resalta ningun tipo de documento, y el campo de nombres dice
+    # literalmente "PERSONA INDETERMINADA". El comprador sigue normal.
+    # Se revisan las dos formas en que puede llegar el documento del
+    # propietario (la clave plana usada por Formulario, y el objeto
+    # "propietario" anidado usado por el resto de documentos).
+    _doc_propietario_5134 = (
+        (datos_vehiculo.get("propietario_documento") or "").strip() == "5134"
+        or ((datos_vehiculo.get("propietario") or {}).get("numero_documento") or "").strip() == "5134"
+    )
+    if _doc_propietario_5134:
+        datos_vehiculo["propietario_documento"] = ""
+        datos_vehiculo["propietario_direccion"] = ""
+        datos_vehiculo["propietario_ciudad"] = ""
+        datos_vehiculo["propietario_telefono"] = ""
+        datos_vehiculo["propietario_primer_apellido"] = ""
+        datos_vehiculo["propietario_segundo_apellido"] = ""
+        datos_vehiculo["propietario_nombres"] = "PERSONA INDETERMINADA"
+        if datos_vehiculo.get("propietario"):
+            _propietario_copia = dict(datos_vehiculo["propietario"])
+            _propietario_copia["numero_documento"] = ""
+            _propietario_copia["tipo_documento"] = ""  # para que no se resalte CC/NIT
+            _propietario_copia["telefono"] = ""
+            _propietario_copia["direccion"] = ""
+            _propietario_copia["ciudad"] = ""
+            _propietario_copia["nombres"] = "PERSONA INDETERMINADA"
+            _propietario_copia["apellido"] = ""
+            _propietario_copia["segundo_apellido"] = ""
+            datos_vehiculo["propietario"] = _propietario_copia
+
     wb = _openpyxl.load_workbook(FUN_PLANTILLA, data_only=False, keep_vba=True)
     hoja = wb[nombre_hoja]
 
