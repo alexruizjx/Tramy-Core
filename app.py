@@ -4464,13 +4464,21 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         # deja intacto, y en vez de eso se agranda la altura de esas 2
         # filas especificas, para separar visualmente sin arriesgar
         # que el texto real se pierda de vista.
+        # La columna A sola es muy angosta (ancho ~15) -- con wrap_text
+        # activado, el texto se ajustaba en lineas de 2-3 palabras, lo
+        # cual se veia mal. Se combinan las celdas A hasta G (que estan
+        # vacias en estas 2 filas) para darle al texto mucho mas espacio
+        # horizontal, igual que ya se hace en otras partes de esta misma
+        # hoja (ej. A9:G11) para bloques de texto largo.
+        hoja.merge_cells("A3:G3")
         hoja["A3"] = "quien para efectos del presente contrato se denominará el MANDANTE VENDEDOR."
         hoja["A3"].alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
-        hoja.row_dimensions[3].height = 105
+        hoja.row_dimensions[3].height = 30
 
+        hoja.merge_cells("A5:G5")
         hoja["A5"] = "también mayor de edad, vecino(a) de ésta  ciudad Identificado(a) con Documento de identidad Numero:"
         hoja["A5"].alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
-        hoja.row_dimensions[5].height = 105
+        hoja.row_dimensions[5].height = 30
 
     # Precio de venta -- se escribe directo en la celda del documento
     # (ademas de en EXPORTAR) por el mismo motivo de siempre: una formula
