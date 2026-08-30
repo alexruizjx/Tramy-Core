@@ -4358,6 +4358,7 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     if celda_linea_empresa:
         celda_firma = _escribir_celda_segura(hoja, celda_linea_empresa, linea_empresa)
         celda_firma.number_format = "General"
+        celda_firma.font = Font(name="Century Gothic", size=14, bold=True, color="FF000000")
 
     # En los 4 documentos de MANDATO, algunas filas tienen texto con
     # salto de linea interno pero se quedaron con altura de una sola
