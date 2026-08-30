@@ -3744,60 +3744,63 @@ VERDE_MARCA = PatternFill(start_color="92D050", end_color="92D050", fill_type="s
 # Cada opcion marca DOS celdas: el numero/casilla y la etiqueta de texto,
 # para que la seleccion se vea claramente (no solo el numero).
 CELDAS_TRAMITE = {
-    "MATRICULA/ REGISTRO": ("A7", "B7"), "TRASPASO": ("E7", "F7"),
-    "TRASLADO MATRICULA / REGISTRO": ("I7", "J7"), "RADICADO  MATRICULA / REGISTRO": ("N7", "O7"),
-    "CAMBIO DE COLOR": ("Q7", "R7"), "CAMBIO DE SERVICIO": ("T7", "U7"),
-    "REGRABAR MOTOR": ("A9", "B9"), "REGRABAR CHASIS": ("E9", "F9"), "TRANSFORMACION": ("I9", "J9"),
-    "DUPLICADO LICENCIA TRANSITO": ("N9", "O9"), "INSCRIPC. PRENDA": ("Q9", "R9"), "LEVANTA PRENDA": ("T9", "U9"),
-    "CANCELACION MATRICULA / REGISTRO": ("A12", "B12"), "CAMBIO DE PLACAS": ("E12", "F12"),
-    "DUPLICADO DE PLACAS": ("I12", "J12"), "REMATRICULA": ("N12", "O12"),
-    "CAMBIO DE CARROCERIA": ("Q12", "R12"),
+    "MATRICULA/ REGISTRO": ("A8", "B8"), "TRASPASO": ("E8", "F8"),
+    "TRASLADO MATRICULA / REGISTRO": ("I8", "J8"), "RADICADO  MATRICULA / REGISTRO": ("N8", "O8"),
+    "CAMBIO DE COLOR": ("Q8", "R8"), "CAMBIO DE SERVICIO": ("T8", "U8"),
+    "REGRABAR MOTOR": ("A10", "B10"), "REGRABAR CHASIS": ("E10", "F10"), "TRANSFORMACION": ("I10", "J10"),
+    "DUPLICADO LICENCIA TRANSITO": ("N10", "O10"), "INSCRIPC. PRENDA": ("Q10", "R10"), "LEVANTA PRENDA": ("T10", "U10"),
+    "CANCELACION MATRICULA / REGISTRO": ("A13", "B13"), "CAMBIO DE PLACAS": ("E13", "F13"),
+    "DUPLICADO DE PLACAS": ("I13", "J13"), "REMATRICULA": ("N13", "O13"),
+    "CAMBIO DE CARROCERIA": ("Q13", "R13"),
 }
 # "OTROS" ya no vive aqui -- se marca aparte, solo cuando hay traslado (ver mas abajo)
-CELDA_OTROS_TRAMITE = ("T12", "U12")
+CELDA_OTROS_TRAMITE = ("T13", "U13")
 
 CELDAS_CLASE = {
-    "AUTOMOVIL": ("A17", "A16"), "BUS": ("D17", "D16"), "BUSETA": ("H17", "H16"),
-    "CAMION": ("L17", "L16"), "CAMIONETA": ("O17", "O16"), "CAMPERO": ("P17", "P16"),
-    "MICROBUS": ("S17", "S16"), "TRACTOCAMION": ("A19", "A18"), "MOTOCICLETA": ("D19", "D18"),
-    "MOTOCARRO": ("H19", "H18"), "MOTOTRICICLO": ("L19", "L18"), "CUATRIMOTO": ("O19", "O18"),
-    "VOLQUETA": ("P19", "P18"), "OTRO": ("S19", "S18"),
+    "AUTOMOVIL": ("A18", "A17"), "BUS": ("D18", "D17"), "BUSETA": ("H18", "H17"),
+    "CAMION": ("L18", "L17"), "CAMIONETA": ("O18", "O17"), "CAMPERO": ("P18", "P17"),
+    "MICROBUS": ("S18", "S17"), "TRACTOCAMION": ("A20", "A19"), "MOTOCICLETA": ("D20", "D19"),
+    "MOTOCARRO": ("H20", "H19"), "MOTOTRICICLO": ("L20", "L19"), "CUATRIMOTO": ("O20", "O19"),
+    "VOLQUETA": ("P20", "P19"), "OTRO": ("S20", "S19"),
 }
 CELDAS_COMBUSTIBLE = {
-    "GASOLINA": ("AC8", "AC7"), "DIESEL": ("AE8", "AE7"), "GAS": ("AF8", "AF7"),
-    "MIXTO": ("AG8", "AG7"), "ELECTRICO": ("AH8", "AH7"), "HIDROGENO": ("AI8", "AI7"),
-    "ETANOL": ("AJ8", "AJ7"), "BIODIESEL": ("AK8", "AK7"),
+    "GASOLINA": ("AC9", "AC8"), "DIESEL": ("AE9", "AE8"), "GAS": ("AF9", "AF8"),
+    "MIXTO": ("AG9", "AG8"), "ELECTRICO": ("AH9", "AH8"), "HIDROGENO": ("AI9", "AI8"),
+    "ETANOL": ("AJ9", "AJ8"), "BIODIESEL": ("AK9", "AK8"),
 }
 CELDAS_SERVICIO = {
-    "PARTICULAR": ("AE29", "AE28"), "PUBLICO": ("AF29", "AF28"), "DIPLOMATICO": ("AG29", "AG28"),
-    "OFICIAL": ("AH29", "AH28"), "ESPECIAL": ("AI29", "AI28"), "OTROS": ("AJ29", "AJ28"),
+    "PARTICULAR": ("AE30", "AE29"), "PUBLICO": ("AF30", "AF29"), "DIPLOMATICO": ("AG30", "AG29"),
+    "OFICIAL": ("AH30", "AH29"), "ESPECIAL": ("AI30", "AI29"), "OTROS": ("AJ30", "AJ29"),
 }
 # Datos del VEHICULO -- confirmado revisando la plantilla que estas
 # coordenadas son IDENTICAS en las 3 hojas de Formulario, asi que este
 # bloque aplica a las 3 por igual.
 CELDAS_REFERENCIA_SIMPLE_VEHICULO = {
-    "AJ3": "placa", "W7": "marca", "Z7": "linea", "W10": "color",
-    "AG10": "modelo", "AI10": "cilindrada",
-    # NOTA: "capacidad" (W13) NO va en este diccionario a proposito -- ya
+    "AJ4": "placa", "W8": "marca", "Z8": "linea", "W11": "color",
+    "AG11": "modelo", "AI11": "cilindrada",
+    # NOTA: "capacidad" (W14) NO va en este diccionario a proposito -- ya
     # se escribe aparte (ver APPJX_CELDA_CAPACIDAD mas abajo), con una
     # regla especial que trata "0" como vacio (0 pasajeros no es un dato
     # real, es la ausencia del dato). Si se agregara aqui tambien, este
     # bloque genérico volvia a escribir "0" encima de esa correccion.
-    "AE17": "numero_motor", "W19": "carroceria", "AE19": "numero_chasis",
-    "AE22": "numero_serie", "AE24": "vin", "AC2": "autoridad_transito",
+    # NOTA: "autoridad_transito" ya NO va aqui -- se movio de AC2 a AA3
+    # (ver el bloque explicito de AA3 en la funcion principal), porque
+    # dejo de ser una simple referencia identica en las 3 hojas.
+    "AE18": "numero_motor", "W20": "carroceria", "AE20": "numero_chasis",
+    "AE23": "numero_serie", "AE25": "vin",
 }
 # Datos de PERSONAS (propietario/comprador) -- estas coordenadas SI son
 # especificas del layout de la hoja BASE (en "(2)"/"(3)" caen en celdas
 # distintas por el espacio de la segunda persona), asi que este bloque
 # solo aplica a la hoja base.
 CELDAS_REFERENCIA_SIMPLE_PERSONAS = {
-    "A24": "propietario_primer_apellido", "I24": "propietario_segundo_apellido",
-    "P24": "propietario_nombres", "S26": "propietario_documento",
-    "A29": "propietario_direccion", "M29": "propietario_ciudad", "S29": "propietario_telefono",
-    "A37": "comprador_primer_apellido", "I37": "comprador_segundo_apellido",
-    "P37": "comprador_nombres", "S41": "comprador_documento",
-    "A44": "comprador_direccion", "M44": "comprador_ciudad", "S44": "comprador_telefono",
-    "AG41": "traslado_municipio",
+    "A25": "propietario_primer_apellido", "I25": "propietario_segundo_apellido",
+    "P25": "propietario_nombres", "S27": "propietario_documento",
+    "A30": "propietario_direccion", "M30": "propietario_ciudad", "S30": "propietario_telefono",
+    "A38": "comprador_primer_apellido", "I38": "comprador_segundo_apellido",
+    "P38": "comprador_nombres", "S42": "comprador_documento",
+    "A45": "comprador_direccion", "M45": "comprador_ciudad", "S45": "comprador_telefono",
+    "AG42": "traslado_municipio",
 }
 # Se mantiene el nombre viejo (union de ambos) por compatibilidad con
 # generar_fun, que SI aplica solo a un unico documento (el FUN clasico,
@@ -3966,7 +3969,7 @@ APPJX_DOCUMENTOS = {
 # valor de forma directa (en vez de depender de que se recalcule la
 # formula, que no siempre pasa de forma confiable al convertir a PDF).
 APPJX_CELDA_LINEA_EMPRESA = {
-    "formulario": "A51", "formulario_dos_vendedores": "A52", "formulario_dos_compradores": "A48",
+    "formulario": "A52", "formulario_dos_vendedores": "A53", "formulario_dos_compradores": "A49",
     "compraventa": "A35", "compraventa_dos_vendedores": "A36", "compraventa_dos_compradores": "A37",
     "compraventa_persona_juridica": "A35",
     "mandato": "A49", "mandato_persona_juridica": "A49",
@@ -3994,7 +3997,7 @@ APPJX_FILAS_ALTURA_EXTRA = {
 # listados aqui la muestran. Igual que con la linea de empresa, se
 # escribe directo por el mismo problema de recalculo de formulas.
 APPJX_CELDA_CAPACIDAD = {
-    "formulario": "W13", "formulario_dos_vendedores": "W13", "formulario_dos_compradores": "W13",
+    "formulario": "W14", "formulario_dos_vendedores": "W14", "formulario_dos_compradores": "W14",
     "compraventa": "B20", "compraventa_dos_vendedores": "B20",
     "compraventa_dos_compradores": "B20", "compraventa_persona_juridica": "B20",
 }
@@ -4024,20 +4027,20 @@ APPJX_CELDA_CAPACIDAD = {
 # que simplemente no resaltan nada ahi -- solo aparecen en el texto de
 # Mandato).
 CELDAS_TRAMITE_FORMULARIO = {
-    "MATRICULA INICIAL": ("A7", "B7"),
-    "TRASPASO DE PROPIEDAD": ("E7", "F7"),
-    "TRASLADO DE CUENTA": ("I7", "J7"),
-    "RADICADO DE CUENTA": ("N7", "O7"),
-    "CAMBIO DE COLOR": ("Q7", "R7"),
-    "REGRABACION DE MOTOR": ("A9", "B9"),
-    "REGRABACION DE CHASIS": ("E9", "F9"),
-    "DUPLICADO DE LICENCIA DE TRANSITO": ("N9", "O9"),
-    "INSCRIPCION DE PRENDA": ("Q9", "R9"),
-    "LEVANTAMIENTO DE PRENDA": ("T9", "U9"),
-    "CANCELACION DE CUENTA": ("A12", "B12"),
-    "DUPLICADO DE PLACAS": ("I12", "J12"),
+    "MATRICULA INICIAL": ("A8", "B8"),
+    "TRASPASO DE PROPIEDAD": ("E8", "F8"),
+    "TRASLADO DE CUENTA": ("I8", "J8"),
+    "RADICADO DE CUENTA": ("N8", "O8"),
+    "CAMBIO DE COLOR": ("Q8", "R8"),
+    "REGRABACION DE MOTOR": ("A10", "B10"),
+    "REGRABACION DE CHASIS": ("E10", "F10"),
+    "DUPLICADO DE LICENCIA DE TRANSITO": ("N10", "O10"),
+    "INSCRIPCION DE PRENDA": ("Q10", "R10"),
+    "LEVANTAMIENTO DE PRENDA": ("T10", "U10"),
+    "CANCELACION DE CUENTA": ("A13", "B13"),
+    "DUPLICADO DE PLACAS": ("I13", "J13"),
 }
-CELDA_OTROS_TRAMITE_FORMULARIO = ("T12", "U12")
+CELDA_OTROS_TRAMITE_FORMULARIO = ("T13", "U13")
 
 # Celdas de "Tipo de Servicio" (Particular/Publico/Diplomatico) -- a
 # diferencia de la cuadricula de TRAMITES (identica en las 3 hojas), esta
@@ -4049,13 +4052,13 @@ CELDA_OTROS_TRAMITE_FORMULARIO = ("T12", "U12")
 # Cada entrada son TODAS las celdas que hay que pintar de verde juntas.
 CELDAS_SERVICIO_POR_DOCUMENTO = {
     "formulario": {
-        "PARTICULAR": ["AE28", "AE29", "AE30"], "PUBLICO": ["AF28", "AF29", "AF30"], "DIPLOMATICO": ["AG29", "AG30"],
+        "PARTICULAR": ["AE29", "AE30", "AE31"], "PUBLICO": ["AF29", "AF30", "AF31"], "DIPLOMATICO": ["AG30", "AG31"],
     },
     "formulario_dos_vendedores": {
-        "PARTICULAR": ["AE29", "AE30", "AE31"], "PUBLICO": ["AF29", "AF30", "AF31"], "DIPLOMATICO": ["AG29", "AG30", "AG31"],
+        "PARTICULAR": ["AE30", "AE31", "AE32"], "PUBLICO": ["AF30", "AF31", "AF32"], "DIPLOMATICO": ["AG30", "AG31", "AG32"],
     },
     "formulario_dos_compradores": {
-        "PARTICULAR": ["AE28", "AE29", "AE30", "AE31"], "PUBLICO": ["AF28", "AF29", "AF30", "AF31"], "DIPLOMATICO": ["AG28", "AG29", "AG30", "AG31"],
+        "PARTICULAR": ["AE29", "AE30", "AE31", "AE32"], "PUBLICO": ["AF29", "AF30", "AF31", "AF32"], "DIPLOMATICO": ["AG29", "AG30", "AG31", "AG32"],
     },
 }
 
@@ -4067,16 +4070,16 @@ CELDAS_SERVICIO_POR_DOCUMENTO = {
 # ej. "C"/"N") -- se pintan ambas cuando existen las dos.
 CELDAS_TIPO_DOC_FORMULARIO = {
     "formulario": {
-        "propietario": {"CC": ["A25", "A26"], "NIT": ["C25", "C26"]},
-        "comprador": {"CC": ["A40", "A41"], "NIT": ["C40", "C41"]},
+        "propietario": {"CC": ["A26", "A27"], "NIT": ["C26", "C27"]},
+        "comprador": {"CC": ["A41", "A42"], "NIT": ["C41", "C42"]},
     },
     "formulario_dos_vendedores": {
-        "propietario": {"CC": ["A26", "A27"], "NIT": ["C26", "C27"]},
-        "comprador": {"CC": ["A42", "A43"], "NIT": ["C42", "C43"]},
+        "propietario": {"CC": ["A27", "A28"], "NIT": ["C27", "C28"]},
+        "comprador": {"CC": ["A43", "A44"], "NIT": ["C43", "C44"]},
     },
     "formulario_dos_compradores": {
-        "propietario": {"CC": ["A26"], "NIT": ["C26"]},
-        "comprador": {"CC": ["A40", "A41"], "NIT": ["C40", "C41"]},
+        "propietario": {"CC": ["A27"], "NIT": ["C27"]},
+        "comprador": {"CC": ["A41", "A42"], "NIT": ["C41", "C42"]},
     },
 }
 
@@ -4085,9 +4088,9 @@ CELDAS_TIPO_DOC_FORMULARIO = {
 # cada variante de Formulario tiene esta celda en una fila distinta
 # (confirmado revisando la plantilla real).
 APPJX_CELDA_TRASLADO_TEXTO = {
-    "formulario": "W41",
-    "formulario_dos_vendedores": "W43",
-    "formulario_dos_compradores": "W41",
+    "formulario": "W42",
+    "formulario_dos_vendedores": "W44",
+    "formulario_dos_compradores": "W42",
 }
 
 # Celdas de DIRECCION/CIUDAD/TELEFONO por documento y rol -- se escriben
@@ -4100,14 +4103,14 @@ APPJX_CELDA_TRASLADO_TEXTO = {
 # PERSONAS, mas abajo), que ya escribe vacio correctamente.
 APPJX_CELDAS_PERSONA_A_CORREGIR = {
     "formulario_dos_vendedores": {
-        "propietario": {"direccion": "A30", "ciudad": "M30", "telefono": "S30"},
-        "otro_propietario": {"direccion": "A31", "ciudad": "M31", "telefono": "S31"},
-        "comprador": {"direccion": "A46", "ciudad": "M46", "telefono": "S46"},
+        "propietario": {"direccion": "A31", "ciudad": "M31", "telefono": "S31"},
+        "otro_propietario": {"direccion": "A32", "ciudad": "M32", "telefono": "S32"},
+        "comprador": {"direccion": "A47", "ciudad": "M47", "telefono": "S47"},
     },
     "formulario_dos_compradores": {
-        "propietario": {"direccion": "A29", "ciudad": "M29", "telefono": "S29"},
-        "comprador": {"direccion": "A45", "ciudad": "M45", "telefono": "S45"},
-        "otro_comprador": {"direccion": "A44", "ciudad": "M44", "telefono": "S44"},
+        "propietario": {"direccion": "A30", "ciudad": "M30", "telefono": "S30"},
+        "comprador": {"direccion": "A46", "ciudad": "M46", "telefono": "S46"},
+        "otro_comprador": {"direccion": "A45", "ciudad": "M45", "telefono": "S45"},
     },
     "compraventa": {
         "propietario": {"telefono": "B7"},
@@ -4244,11 +4247,26 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     exportar["D44"] = datos_vehiculo.get("fecha_matricula_inicial", "")
 
     # Casilla "1. ORGANISMO DE TRANSITO" / "NOMBRE" -- solo existe en los
-    # 3 Formularios, en la celda AC2 (junto a la etiqueta "NOMBRE" en
-    # AA2). Se escribe directo (no via EXPORTAR) porque esta celda no
-    # tenia ninguna formula/referencia en la plantilla original.
+    # 3 Formularios, en la celda AA3 (se movio desde AC2 cuando se
+    # agrego una fila nueva a la plantilla). Se escribe directo (no via
+    # EXPORTAR) porque esta celda no tenia ninguna formula/referencia en
+    # la plantilla original.
     if nombre_hoja in ("FORMULARIO", "FORMULARIO (2)", "FORMULARIO (3)"):
-        hoja["AC2"] = datos_vehiculo.get("autoridad_transito", "")
+        hoja["AA3"] = datos_vehiculo.get("autoridad_transito", "")
+
+        # SOAT y RTM -- solo se escriben si estan VIGENTES (si no estan
+        # vigentes, o no hay dato, la celda queda vacia). "Formulario" y
+        # "Formulario (dos vendedores)" comparten las mismas celdas
+        # (AB51/AB52); "Formulario (dos compradores)" las tiene en un
+        # lugar distinto (AE49/AE50).
+        if nombre_hoja in ("FORMULARIO", "FORMULARIO (2)"):
+            _celda_soat_form, _celda_rtm_form = "AB51", "AB52"
+        else:
+            _celda_soat_form, _celda_rtm_form = "AE49", "AE50"
+        if datos_vehiculo.get("soat_vigente") is True:
+            hoja[_celda_soat_form] = "Vigente hasta " + (datos_vehiculo.get("soat_fecha_fin") or "")
+        if datos_vehiculo.get("rtm_vigente") is True:
+            hoja[_celda_rtm_form] = "Vigente hasta " + (datos_vehiculo.get("rtm_fecha_fin") or "")
 
     # Afirmacion de Traspaso tiene una celda con la fecha de hoy
     # (=TODAY()) que LibreOffice muestra en INGLES (ej. "15-August-2026")
@@ -4606,13 +4624,13 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
                         pass
         for celda in CELDA_OTROS_TRAMITE:
             hoja[celda].fill = sin_relleno
-        hoja["W38"].fill = sin_relleno  # bloque "ESPECIFIQUE LA PALABRA OTRO..." (combinado W38:AK40)
+        hoja["W39"].fill = sin_relleno  # bloque "ESPECIFIQUE LA PALABRA OTRO..." (combinado W39:AK41)
         # W41/AG41 muestran el texto de "traslado de cuenta" via formula
         # (=EXPORTAR!D51) -- LibreOffice no siempre recalcula esa formula
         # en la conversion a PDF, asi que se escribe vacio DIRECTAMENTE en
         # la celda visible en vez de depender de la formula. Protegido por
         # si acaso en "(2)"/"(3)" esa celda resulta combinada distinto.
-        for celda_fija in ("W41", "AG41"):
+        for celda_fija in ("W42", "AG42"):
             try:
                 hoja[celda_fija].value = ""
             except AttributeError:
@@ -4702,7 +4720,7 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         if datos_vehiculo.get("tramite"):
             _fun_marcar_checkboxes(hoja, CELDAS_TRAMITE, datos_vehiculo["tramite"])
             if "TRASLADO" in _fun_normalizar(datos_vehiculo["tramite"]):
-                hoja["W38"].fill = VERDE_MARCA
+                hoja["W39"].fill = VERDE_MARCA
 
     hojas_a_conservar = {nombre_hoja, "EXPORTAR", "DATOS"}
     for nombre in list(wb.sheetnames):
