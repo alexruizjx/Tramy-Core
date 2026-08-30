@@ -4466,11 +4466,11 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         # que el texto real se pierda de vista.
         hoja["A3"] = "quien para efectos del presente contrato se denominará el MANDANTE VENDEDOR."
         hoja["A3"].alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
-        hoja.row_dimensions[3].height = 60
+        hoja.row_dimensions[3].height = 105
 
         hoja["A5"] = "también mayor de edad, vecino(a) de ésta  ciudad Identificado(a) con Documento de identidad Numero:"
         hoja["A5"].alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
-        hoja.row_dimensions[5].height = 60
+        hoja.row_dimensions[5].height = 105
 
     # Precio de venta -- se escribe directo en la celda del documento
     # (ademas de en EXPORTAR) por el mismo motivo de siempre: una formula
