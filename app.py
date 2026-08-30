@@ -4265,8 +4265,10 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
             _celda_soat_form, _celda_rtm_form = "AE49", "AE50"
         if datos_vehiculo.get("soat_vigente") is True:
             hoja[_celda_soat_form] = "Vigente hasta " + (datos_vehiculo.get("soat_fecha_fin") or "")
+            hoja[_celda_soat_form].font = Font(color="FF000000")
         if datos_vehiculo.get("rtm_vigente") is True:
             hoja[_celda_rtm_form] = "Vigente hasta " + (datos_vehiculo.get("rtm_fecha_fin") or "")
+            hoja[_celda_rtm_form].font = Font(color="FF000000")
 
     # Afirmacion de Traspaso tiene una celda con la fecha de hoy
     # (=TODAY()) que LibreOffice muestra en INGLES (ej. "15-August-2026")
