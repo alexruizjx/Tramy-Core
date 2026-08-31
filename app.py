@@ -4307,25 +4307,22 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         hoja["AA3"] = datos_vehiculo.get("autoridad_transito", "")
 
         # SOAT y RTM -- solo se escriben si estan VIGENTES. Si no estan
-        # vigentes (o no hay dato), la celda queda como estaba (solo la
-        # etiqueta "SOAT = " / "RTM = ", sin nada despues) a proposito
-        # -- asi se puede llenar a mano al momento de imprimir y llevar
-        # el tramite. Las celdas YA TRAEN la etiqueta como parte de su
-        # texto (ej. "SOAT = ") -- hay que AGREGAR el valor al final,
-        # no reemplazar la celda completa (eso borraba la palabra
-        # "SOAT" por error). "Formulario" y "Formulario (dos
-        # vendedores)" comparten las mismas celdas (AB51/AB52);
-        # "Formulario (dos compradores)" las tiene en AB49/AB50.
+        # vigentes (o no hay dato), la celda del valor queda vacia a
+        # proposito -- asi se puede llenar a mano al momento de
+        # imprimir y llevar el tramite. La etiqueta ("SOAT = "/"RTM = ")
+        # vive aparte, en su propia celda de la plantilla (AB51/AB52 o
+        # AB49/AB50 segun el documento) y no se toca -- el VALOR va en
+        # una celda separada. "Formulario" y "Formulario (dos
+        # vendedores)" comparten las mismas celdas de valor (AE51/AE52);
+        # "Formulario (dos compradores)" las tiene en AE49/AE50.
         if nombre_hoja in ("FORMULARIO", "FORMULARIO (2)"):
-            _celda_soat_form, _celda_rtm_form = "AB51", "AB52"
+            _celda_soat_form, _celda_rtm_form = "AE51", "AE52"
         else:
-            _celda_soat_form, _celda_rtm_form = "AB49", "AB50"
+            _celda_soat_form, _celda_rtm_form = "AE49", "AE50"
         if datos_vehiculo.get("soat_vigente") is True:
-            _etiqueta_soat_previa = hoja[_celda_soat_form].value or "SOAT = "
-            _escribir_celda_segura(hoja, _celda_soat_form, _etiqueta_soat_previa + "Vigente hasta " + (datos_vehiculo.get("soat_fecha_fin") or ""), color_fuente="FF000000")
+            _escribir_celda_segura(hoja, _celda_soat_form, "Vigente hasta " + (datos_vehiculo.get("soat_fecha_fin") or ""), color_fuente="FF000000")
         if datos_vehiculo.get("rtm_vigente") is True:
-            _etiqueta_rtm_previa = hoja[_celda_rtm_form].value or "RTM = "
-            _escribir_celda_segura(hoja, _celda_rtm_form, _etiqueta_rtm_previa + "Vigente hasta " + (datos_vehiculo.get("rtm_fecha_fin") or ""), color_fuente="FF000000")
+            _escribir_celda_segura(hoja, _celda_rtm_form, "Vigente hasta " + (datos_vehiculo.get("rtm_fecha_fin") or ""), color_fuente="FF000000")
 
     # Afirmacion de Traspaso tiene una celda con la fecha de hoy
     # (=TODAY()) que LibreOffice muestra en INGLES (ej. "15-August-2026")
