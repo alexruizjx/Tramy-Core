@@ -4504,14 +4504,16 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         hoja[_celdas_otro_doc["documento"]] = _otro_persona.get("numero_documento") or ""
         hoja[_celdas_otro_doc["documento"]].number_format = "General"
 
-    # Rol "MANDATARIO" -- se conecta con las 5 hojas de Mandato. Estas
-    # celdas ya tenian una formula que apuntaba a EXPORTAR!D3-D6 (el rol
-    # "asesor", que nunca se conecto desde la interfaz, asi que siempre
-    # quedaban vacias) -- se sobrescriben directo con los datos de
-    # "mandatario" en su lugar. "MANDATO (4)" es la unica variante con
-    # espacio para un SEGUNDO mandatario (otro_mandatario).
+    # Rol "MANDATARIO" -- se conecta con 4 de las 5 hojas de Mandato.
+    # Estas celdas ya tenian una formula que apuntaba a EXPORTAR!D3-D6
+    # (el rol "asesor", que nunca se conecto desde la interfaz, asi que
+    # siempre quedaban vacias) -- se sobrescriben directo con los datos
+    # de "mandatario" en su lugar. "MANDATO (4)" es la unica variante
+    # con espacio para un SEGUNDO mandatario (otro_mandatario).
+    # NOTA: "mandato" (la hoja base, sin numero) ya NO esta en esta
+    # lista -- sus formulas originales de AppJX (en A4/A6) ya traen el
+    # dato correcto por su cuenta, asi que no hace falta sobrescribirlas.
     _CELDAS_ROL_MANDATARIO = {
-        "mandato": {"nombre": "A4", "documento": "A6"},
         "mandato_dos_vendedores": {"nombre": "B7", "documento": "F8"},
         "mandato_comprador_vendedor": {"nombre": "A7", "documento": "G8"},
         "mandato_persona_juridica": {"nombre": "D5", "documento": "F6"},
