@@ -4306,19 +4306,26 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     if nombre_hoja in ("FORMULARIO", "FORMULARIO (2)", "FORMULARIO (3)"):
         hoja["AA3"] = datos_vehiculo.get("autoridad_transito", "")
 
-        # SOAT y RTM -- solo se escriben si estan VIGENTES (si no estan
-        # vigentes, o no hay dato, la celda queda vacia). "Formulario" y
-        # "Formulario (dos vendedores)" comparten las mismas celdas
-        # (AB51/AB52); "Formulario (dos compradores)" las tiene en un
-        # lugar distinto (AE49/AE50).
+        # SOAT y RTM -- solo se escriben si estan VIGENTES. Si no estan
+        # vigentes (o no hay dato), la celda queda como estaba (solo la
+        # etiqueta "SOAT = " / "RTM = ", sin nada despues) a proposito
+        # -- asi se puede llenar a mano al momento de imprimir y llevar
+        # el tramite. Las celdas YA TRAEN la etiqueta como parte de su
+        # texto (ej. "SOAT = ") -- hay que AGREGAR el valor al final,
+        # no reemplazar la celda completa (eso borraba la palabra
+        # "SOAT" por error). "Formulario" y "Formulario (dos
+        # vendedores)" comparten las mismas celdas (AB51/AB52);
+        # "Formulario (dos compradores)" las tiene en AB49/AB50.
         if nombre_hoja in ("FORMULARIO", "FORMULARIO (2)"):
             _celda_soat_form, _celda_rtm_form = "AB51", "AB52"
         else:
-            _celda_soat_form, _celda_rtm_form = "AE49", "AE50"
+            _celda_soat_form, _celda_rtm_form = "AB49", "AB50"
         if datos_vehiculo.get("soat_vigente") is True:
-            _escribir_celda_segura(hoja, _celda_soat_form, "Vigente hasta " + (datos_vehiculo.get("soat_fecha_fin") or ""), color_fuente="FF000000")
+            _etiqueta_soat_previa = hoja[_celda_soat_form].value or "SOAT = "
+            _escribir_celda_segura(hoja, _celda_soat_form, _etiqueta_soat_previa + "Vigente hasta " + (datos_vehiculo.get("soat_fecha_fin") or ""), color_fuente="FF000000")
         if datos_vehiculo.get("rtm_vigente") is True:
-            _escribir_celda_segura(hoja, _celda_rtm_form, "Vigente hasta " + (datos_vehiculo.get("rtm_fecha_fin") or ""), color_fuente="FF000000")
+            _etiqueta_rtm_previa = hoja[_celda_rtm_form].value or "RTM = "
+            _escribir_celda_segura(hoja, _celda_rtm_form, _etiqueta_rtm_previa + "Vigente hasta " + (datos_vehiculo.get("rtm_fecha_fin") or ""), color_fuente="FF000000")
 
     # Afirmacion de Traspaso tiene una celda con la fecha de hoy
     # (=TODAY()) que LibreOffice muestra en INGLES (ej. "15-August-2026")
@@ -4384,22 +4391,27 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     # depende de que se recalcule "=DATOS!W2" y eso no siempre pasa de
     # forma confiable al convertir a PDF (el mismo problema visto con
     # las demas referencias directas).
+    # La firma real de cada documento ya viene conectada por formula
+    # ("=DATOS!W2") en la celda correcta de cada hoja -- se confirmo
+    # revisando la plantilla real que esa celda SI tiene el formato
+    # correcto (Century Gothic, negro, negrita). No hace falta escribir
+    # nada mas aparte de actualizar el valor real en DATOS!W2 -- las
+    # coordenadas usadas antes (APPJX_CELDA_LINEA_EMPRESA) estaban mal
+    # calculadas y apuntaban a una celda distinta a la de la formula,
+    # lo cual causaba una firma duplicada en el lugar equivocado.
     linea_empresa = datos_vehiculo.get("linea_empresa", "")
     if "DATOS" in wb.sheetnames:
         wb["DATOS"]["W2"] = linea_empresa
 
-    # La firma real del documento (la que ya trae la plantilla, con una
-    # formula tipo "=DATOS!W2") se deja intacta -- no se sobreescribe.
-    # El unico arreglo necesario es que, cuando el panel no tiene nada
-    # puesto (celda W2 vacia), Excel/LibreOffice muestra un "0" en la
-    # celda que tiene la formula (asi funciona una referencia a una
-    # celda vacia). Se busca esa celda automaticamente (sin necesitar
-    # su coordenada exacta) y se le pone un formato que oculta el cero.
-    for _fila_firma in hoja.iter_rows():
-        for _celda_firma_formula in _fila_firma:
-            _valor_formula = _celda_firma_formula.value
-            if isinstance(_valor_formula, str) and _valor_formula.startswith("=") and "DATOS" in _valor_formula.upper() and "W2" in _valor_formula.upper():
-                _celda_firma_formula.number_format = 'General;General;;@'
+    # "COMPRA VENTA" (la hoja base, no sus variantes) trae por error DOS
+    # celdas con la misma formula de firma (A35 y A38) -- A35 tiene un
+    # color de tema equivocado (azul) en la plantilla original. Se
+    # limpia esa celda duplicada para que solo se vea una firma (la de
+    # A38, que si tiene el color correcto).
+    if nombre_hoja == "COMPRA VENTA":
+        _celda_firma_duplicada = hoja["A35"]
+        if isinstance(_celda_firma_duplicada.value, str) and _celda_firma_duplicada.value.strip().upper() == "=DATOS!W2":
+            _celda_firma_duplicada.value = None
 
     # En los 4 documentos de MANDATO, algunas filas tienen texto con
     # salto de linea interno pero se quedaron con altura de una sola
