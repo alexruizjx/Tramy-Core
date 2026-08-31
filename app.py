@@ -433,29 +433,6 @@ MEDELLIN_TIPO_IDENTIFICACION = {
 MEDELLIN_GENERO = {"Masculino": "m", "Femenino": "f", "Otro": "o"}
 
 
-def _medellin_ip_bloqueada(page, etiqueta):
-    """Revisa si la pagina actual muestra el bloqueo del firewall (WAF)
-    de medellin.gov.co -- ese mensaje especifico ('Web Page Blocked!',
-    con un 'Attack ID') es DISTINTO a un error normal de la pagina, y
-    antes quedaba escondido entre el resto de texto de los diagnosticos,
-    dificil de notar sin leer el log completo con cuidado. Ahora se
-    revisa explicitamente y se imprime una linea bien visible si
-    aparece, para saber de inmediato (sin tener que interpretar nada)
-    que el problema es un bloqueo de IP y no un error de nuestro codigo."""
-    try:
-        texto_pagina = page.inner_text("body")
-    except Exception:
-        return False
-    if "Web Page Blocked" in texto_pagina or "Attack ID" in texto_pagina:
-        print(f"{etiqueta} ################################################", flush=True)
-        print(f"{etiqueta} ### IP BLOQUEADA POR EL FIREWALL DEL SITIO  ###", flush=True)
-        print(f"{etiqueta} ### (no es un error de Tramy -- espera un   ###", flush=True)
-        print(f"{etiqueta} ### buen rato antes de volver a intentar)   ###", flush=True)
-        print(f"{etiqueta} ################################################", flush=True)
-        return True
-    return False
-
-
 def medellin_crear_usuario(datos, usar_proxy=True):
     """Crea un usuario nuevo en el portal 'Movilidad en Linea' de la
     Alcaldia de Medellin (formulario de auto-registro). Los selectores
@@ -468,7 +445,7 @@ def medellin_crear_usuario(datos, usar_proxy=True):
     Antioquia/Medellin), que ya vienen preseleccionados.
     'usar_proxy' (True por defecto): el sitio de Medellin ha bloqueado la
     IP fija del servidor varias veces por exceso de peticiones -- se usa
-    el proxy residencial de DataImpulse por defecto para evitarlo."""
+    el proxy residencial de IPRoyal por defecto para evitarlo."""
     resultado = {"exito": False, "mensaje": ""}
     etiqueta = f"[MEDELLIN-{uuid.uuid4().hex[:6]}]"  # para poder filtrar SOLO estos logs entre los de otros procesos concurrentes
 
@@ -514,7 +491,7 @@ def medellin_crear_usuario(datos, usar_proxy=True):
                 pass
         page.on("response", _capturar_peticion)
 
-        MAX_INTENTOS_COMPLETOS = 1  # se bajo de 3 a 1 -- recargar y reenviar el formulario completo varias veces parece ser lo que dispara el bloqueo del firewall del sitio (visto en pruebas reales, "Attack ID" del WAF)
+        MAX_INTENTOS_COMPLETOS = 3  # si el formulario se queda pegado, se recarga la pagina y se vuelve a llenar todo desde cero, hasta esta cantidad de veces
         for intento_completo in range(MAX_INTENTOS_COMPLETOS):
           try:
             if intento_completo > 0:
@@ -524,30 +501,12 @@ def medellin_crear_usuario(datos, usar_proxy=True):
             page.goto(MEDELLIN_REGISTRO_URL, wait_until="load", timeout=60000)
             page.wait_for_timeout(2000)
 
-            if _medellin_ip_bloqueada(page, etiqueta):
-                resultado["error"] = "IP bloqueada por el firewall del sitio (no es un error de Tramy) -- espera un rato antes de volver a intentar."
-                resultado["mensaje"] = resultado["error"]
-                return resultado
-
             # 1. Tipo de Sociedad -- esto dispara (via jQuery) que se
             # muestren/oculten otros campos (Tipo de Entidad para
-            # Juridica, Apellidos/Genero para Natural). Se detecto en una
-            # prueba real que, aunque el VALOR quedaba bien puesto,
-            # "Tipo de Entidad" (que solo deberia verse para Juridica)
-            # seguia apareciendo en pantalla incluso eligiendo Natural --
-            # asi que se dispara el evento 'change' explicitamente por
-            # JavaScript, ademas de select_option(), para forzar a que
-            # esa logica de mostrar/ocultar si se ejecute.
+            # Juridica, Apellidos/Genero para Natural).
             valor_sociedad = MEDELLIN_TIPO_SOCIEDAD.get(datos["tipo_sociedad"], "N-Persona Natural")
             page.select_option("#cTipoSociedad", value=valor_sociedad)
-            page.evaluate("""() => {
-                var el = document.getElementById('cTipoSociedad');
-                if (el) {
-                    el.dispatchEvent(new Event('change', {bubbles: true}));
-                    el.dispatchEvent(new Event('click', {bubbles: true}));
-                }
-            }""")
-            page.wait_for_timeout(800)
+            page.wait_for_timeout(500)
 
             # 2. Tipo de Entidad -- solo aplica si es Persona Juridica
             if datos["tipo_sociedad"] == "Persona Juridica" and datos.get("tipo_entidad"):
@@ -571,26 +530,17 @@ def medellin_crear_usuario(datos, usar_proxy=True):
             page.wait_for_timeout(3000)
 
             # 4. Nombre / Razon Social
-            # Igual que Numero de Identificacion: se escribe caracter por
-            # caracter (no fill() de un solo golpe), ya que se detecto
-            # que TODOS los campos de texto se quedaban sin marcar como
-            # "validos" (columna tdOk) usando fill(), lo que bloqueaba
-            # el boton Siguiente aunque el VALOR quedara bien puesto.
-            page.click("#cNombre")
-            page.keyboard.type(datos["nombre"], delay=60)
+            page.fill("#cNombre", datos["nombre"])
 
             # 5. Apellidos y Genero -- solo aplican para Persona Natural
             if datos["tipo_sociedad"] == "Persona Natural":
-                page.click("#cApellidos")
-                page.keyboard.type(datos["apellidos"], delay=60)
+                page.fill("#cApellidos", datos["apellidos"])
                 valor_genero = MEDELLIN_GENERO.get(datos["genero"], "m")
                 page.select_option("#cGenero", value=valor_genero)
 
             # 6. Correo y Direccion
-            page.click("#cCorreoElectronico")
-            page.keyboard.type(datos["email"], delay=60)
-            page.click("#cDireccionResidencia")
-            page.keyboard.type(datos["direccion"], delay=60)
+            page.fill("#cCorreoElectronico", datos["email"])
+            page.fill("#cDireccionResidencia", datos["direccion"])
 
             # 7. Aceptar politicas de uso (obligatorio) y autorizar
             # notificaciones (opcional, pero conviene para que lleguen
@@ -646,8 +596,7 @@ def medellin_crear_usuario(datos, usar_proxy=True):
             page.click("#cTelefono")
             page.keyboard.type(datos["telefono"], delay=80)
             if datos.get("celular"):
-                page.click("#cCelular")
-                page.keyboard.type(datos["celular"], delay=60)
+                page.fill("#cCelular", datos["celular"])
             page.wait_for_timeout(3000)
 
             # 9. Pais, Departamento y Ciudad -- se seleccionan explicito
@@ -660,42 +609,8 @@ def medellin_crear_usuario(datos, usar_proxy=True):
             # automatico de Ciudad (patron comun de "selects en cascada").
             # Se prueba dejando que ese reinicio (si existe) ocurra ANTES,
             # dejando Ciudad como lo ULTIMO que se toca del formulario.
-            # Se busca la opcion de Colombia por su texto real, igual
-            # que se hace mas abajo con Departamento y Ciudad -- si el
-            # value supuesto ("CO") no es el correcto, el desplegable de
-            # Departamento nunca llega a poblarse con nada (justo lo que
-            # se vio en una prueba real: Departamento se quedaba con una
-            # sola opcion, "Seleccione..").
-            opciones_pais = page.evaluate("""
-                () => Array.from(document.querySelectorAll('#cPais option')).map(o => ({value: o.value, texto: o.textContent.trim()}))
-            """)
-            opcion_colombia = next((o for o in opciones_pais if "COLOMBIA" in o["texto"].upper()), None)
-            if opcion_colombia:
-                print(f"{etiqueta} Se encontro Colombia con value real: '{opcion_colombia['value']}'", flush=True)
-                page.select_option("#cPais", value=opcion_colombia["value"])
-            else:
-                print(f"{etiqueta} *** No se encontro ninguna opcion de Pais con 'COLOMBIA' en el texto -- se intenta con el value supuesto 'CO' como ultimo recurso.", flush=True)
-                page.select_option("#cPais", value="CO")
-            valor_pais_confirmado = page.evaluate("() => document.querySelector('#cPais').value")
-            print(f"{etiqueta} Valor real de Pais despues de seleccionarlo: '{valor_pais_confirmado}'", flush=True)
-            page.wait_for_timeout(1500)  # deja que el desplegable en cascada de Departamento termine de cargar sus opciones tras elegir Pais
-
-            # En vez de adivinar el "value" exacto del option de Antioquia
-            # (que fallo -- probablemente el formato real es distinto al
-            # que se supuso), se buscan las opciones REALES del
-            # desplegable y se selecciona la que tenga "ANTIOQUIA" en su
-            # texto visible, sin importar el formato interno del value.
-            opciones_depto = page.evaluate("""
-                () => Array.from(document.querySelectorAll('#cDepartamento option')).map(o => ({value: o.value, texto: o.textContent.trim()}))
-            """)
-            print(f"{etiqueta} === Opciones reales de Departamento ({len(opciones_depto)}): {opciones_depto[:5]}...", flush=True)
-            opcion_antioquia = next((o for o in opciones_depto if "ANTIOQUIA" in o["texto"].upper()), None)
-            if opcion_antioquia:
-                print(f"{etiqueta} Se encontro Antioquia con value real: '{opcion_antioquia['value']}'", flush=True)
-                page.select_option("#cDepartamento", value=opcion_antioquia["value"])
-            else:
-                print(f"{etiqueta} *** No se encontro ninguna opcion de Departamento con 'ANTIOQUIA' en el texto -- se intenta con el value supuesto como ultimo recurso.", flush=True)
-                page.select_option("#cDepartamento", value="05-ANTIOQUIA")
+            page.select_option("#cPais", value="CO")
+            page.select_option("#cDepartamento", value="05-ANTIOQUIA")
             page.wait_for_timeout(2500)  # dejar que cualquier reinicio automatico de Ciudad ya ocurra aqui
 
             try:
@@ -704,16 +619,7 @@ def medellin_crear_usuario(datos, usar_proxy=True):
             except Exception as e0:
                 print(f"{etiqueta} No se pudo leer ciudad (momento 0): {e0}", flush=True)
 
-            opciones_ciudad = page.evaluate("""
-                () => Array.from(document.querySelectorAll('#cCiudad option')).map(o => ({value: o.value, texto: o.textContent.trim()}))
-            """)
-            opcion_medellin = next((o for o in opciones_ciudad if "MEDELL" in o["texto"].upper()), None)
-            if opcion_medellin:
-                print(f"{etiqueta} Se encontro Medellin con value real: '{opcion_medellin['value']}'", flush=True)
-                page.select_option("#cCiudad", value=opcion_medellin["value"])
-            else:
-                print(f"{etiqueta} *** No se encontro ninguna opcion de Ciudad con 'MEDELL' en el texto -- se intenta con el value supuesto como ultimo recurso.", flush=True)
-                page.select_option("#cCiudad", value="05001-MEDELLÍN")
+            page.select_option("#cCiudad", value="05001-MEDELLÍN")
 
             # DIAGNOSTICO TEMPORAL -- revisar el valor de Ciudad en varios
             # momentos seguidos, para ver exactamente cuando se resetea.
@@ -822,23 +728,6 @@ def medellin_crear_usuario(datos, usar_proxy=True):
                 print(f"{etiqueta} No se pudo leer el texto de la pagina:", e_txt, flush=True)
             print(f"{etiqueta} === FIN DIAGNOSTICO despues de Siguiente ===", flush=True)
 
-            # Captura de pantalla REAL -- el texto solo no ha sido
-            # suficiente para diagnosticar bien varios de estos casos
-            # (los inputs de texto no aparecen en inner_text, solo las
-            # etiquetas), asi que se toma una foto real de la pagina en
-            # este punto especifico donde "Siguiente" no parecio avanzar.
-            try:
-                _ruta_captura_sig = f"/tmp/medellin_sig_{etiqueta.strip('[]').replace('MEDELLIN-', '')}.png"
-                page.screenshot(path=_ruta_captura_sig, full_page=True, timeout=8000)
-                _url_captura_sig = subir_a_r2(
-                    _ruta_captura_sig,
-                    f"diagnosticos/medellin_sig_{etiqueta.strip('[]').replace('MEDELLIN-', '')}.png",
-                    content_type="image/png"
-                )
-                print(f"{etiqueta} === Captura de pantalla (despues de Siguiente): {_url_captura_sig} ===", flush=True)
-            except Exception as e_captura_sig:
-                print(f"{etiqueta} No se pudo tomar/subir la captura de pantalla: {e_captura_sig}", flush=True)
-
             # 10. SEGUNDO PASO -- preguntas de Verdadero/Falso. IMPORTANTE:
             # estas preguntas son FIJAS (no se despliegan preguntas nuevas
             # segun las respuestas que se den), pero la CANTIDAD que
@@ -848,22 +737,7 @@ def medellin_crear_usuario(datos, usar_proxy=True):
             # de cada pregunta que SI aparezca y responde segun ese
             # texto.
             try:
-                # Se revisa varias veces seguidas (no solo una vez con
-                # una espera fija) antes de concluir que no hay
-                # preguntas -- se detecto (con una prueba manual real)
-                # que SI pueden aparecer preguntas para un registro en
-                # particular, pero el codigo las revisaba demasiado
-                # rapido, antes de que alcanzaran a renderizarse (la
-                # segunda pregunta en particular depende de una consulta
-                # sobre si la persona tiene vehiculos a su nombre, que
-                # puede tardar mas que la primera).
-                hay_preguntas = False
-                for _intento_preg in range(4):
-                    page.wait_for_timeout(1200)
-                    hay_preguntas = page.evaluate("() => document.querySelectorAll('.divPregunta').length > 0")
-                    if hay_preguntas:
-                        print(f"{etiqueta} Aparecieron preguntas en el intento de revision {_intento_preg+1}/4.", flush=True)
-                        break
+                hay_preguntas = page.evaluate("() => document.querySelectorAll('.divPregunta').length > 0")
                 if not hay_preguntas:
                     print(f"{etiqueta} No aparecio ninguna pregunta de Verdadero/Falso en este registro.", flush=True)
                     print(f"{etiqueta} === DIAGNOSTICO: estado de la pagina sin preguntas ===", flush=True)
@@ -891,58 +765,6 @@ def medellin_crear_usuario(datos, usar_proxy=True):
                     except Exception as e_btns:
                         print(f"{etiqueta} No se pudo revisar los botones visibles: {e_btns}", flush=True)
                     print(f"{etiqueta} === FIN DIAGNOSTICO sin preguntas ===", flush=True)
-
-                    # Si no aparecio ninguna pregunta, el "Siguiente"
-                    # sigue siendo el unico boton disponible -- hay que
-                    # darle clic OTRA VEZ para que el registro continue
-                    # (antes el codigo se quedaba aqui sin hacer nada
-                    # mas, dejando el registro a medias).
-                    if page.locator("#inpBtnNext").count() > 0:
-                        print(f"{etiqueta} Se le da clic a 'Siguiente' de nuevo, ya que no hubo preguntas que responder.", flush=True)
-                        contenido_antes_siguiente2 = page.inner_text("body")
-                        esperas_reintento_sig2 = [3000, 5000, 8000]
-                        for intento_sig2, espera_ms_sig2 in enumerate(esperas_reintento_sig2):
-                            if page.locator("#inpBtnNext").count() == 0:
-                                print(f"{etiqueta} El boton 'Siguiente' ya no existe -- la pagina avanzo.", flush=True)
-                                break
-                            try:
-                                page.click("#inpBtnNext", force=True, timeout=5000)
-                            except Exception as e_click_sig2:
-                                print(f"{etiqueta} No se pudo hacer clic en Siguiente (probablemente deshabilitado temporalmente): {e_click_sig2}", flush=True)
-                            page.wait_for_timeout(espera_ms_sig2)
-                            contenido_despues_siguiente2 = page.inner_text("body")
-                            if contenido_despues_siguiente2 != contenido_antes_siguiente2:
-                                print(f"{etiqueta} Segundo clic en Siguiente avanzo la pagina (intento {intento_sig2+1}, espero {espera_ms_sig2}ms).", flush=True)
-                                break
-                            print(f"{etiqueta} Segundo clic en Siguiente NO parece haber avanzado (intento {intento_sig2+1}/{len(esperas_reintento_sig2)}, espero {espera_ms_sig2}ms), reintentando...", flush=True)
-                        else:
-                            print(f"{etiqueta} *** Segundo clic en Siguiente no avanzo despues de {len(esperas_reintento_sig2)} intentos -- se continua de todas formas.", flush=True)
-
-                        print(f"{etiqueta} === DIAGNOSTICO: despues del segundo clic en Siguiente ===", flush=True)
-                        print(f"{etiqueta} URL actual:", page.url, flush=True)
-                        try:
-                            print(etiqueta, page.inner_text("body")[:2000], flush=True)
-                        except Exception as e_txt4:
-                            print(f"{etiqueta} No se pudo leer el texto de la pagina:", e_txt4, flush=True)
-                        print(f"{etiqueta} === FIN DIAGNOSTICO despues del segundo clic en Siguiente ===", flush=True)
-
-                        # Captura de pantalla REAL en este punto -- el
-                        # texto (inner_text) no muestra lo que hay
-                        # escrito DENTRO de los campos (solo las
-                        # etiquetas), asi que no basta para saber si el
-                        # formulario sigue lleno o se vacio, o si hay
-                        # algun mensaje de error/validacion visible.
-                        try:
-                            _ruta_captura_med = f"/tmp/medellin_captura_{etiqueta.strip('[]').replace('MEDELLIN-', '')}.png"
-                            page.screenshot(path=_ruta_captura_med, full_page=True, timeout=8000)
-                            _url_captura_med = subir_a_r2(
-                                _ruta_captura_med,
-                                f"diagnosticos/medellin_{etiqueta.strip('[]').replace('MEDELLIN-', '')}.png",
-                                content_type="image/png"
-                            )
-                            print(f"{etiqueta} === Captura de pantalla: {_url_captura_med} ===", flush=True)
-                        except Exception as e_captura_med:
-                            print(f"{etiqueta} No se pudo tomar/subir la captura de pantalla: {e_captura_med}", flush=True)
                 else:
                     preguntas = page.evaluate("""() => {
                         var divs = document.querySelectorAll('.divPregunta');
@@ -1194,73 +1016,36 @@ def medellin_activar_cuenta(usuario_temporal, password_temporal, nueva_password,
     pide el sitio la primera vez. Reutiliza el mismo patron de login
     real por Playwright que ya usamos para revisar citas.
     'usar_proxy': si es True, la conexion pasa por el proxy residencial
-    de DataImpulse en vez de la IP fija del servidor -- util porque el
-    sitio de Medellin ha bloqueado esa IP fija varias veces por exceso
-    de peticiones."""
+    de IPRoyal en vez de la IP fija del servidor -- util porque el sitio
+    de Medellin ha bloqueado esa IP fija varias veces por exceso de
+    peticiones."""
     etiqueta = f"[MEDELLIN-ACTIVAR-{uuid.uuid4().hex[:6]}]"
     resultado = {"exito": False, "mensaje": ""}
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
-        proxy_config = _dataimpulse_proxy_config(etiqueta) if usar_proxy else None
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            viewport={"width": 1366, "height": 900},
-            proxy=proxy_config,
-        )
+        proxy_config = None
+        if usar_proxy:
+            if IPROYAL_USER and IPROYAL_PASS:
+                proxy_config = {
+                    "server": f"http://{IPROYAL_HOST}:{IPROYAL_PORT}",
+                    "username": IPROYAL_USER,
+                    "password": IPROYAL_PASS,
+                }
+                print(f"{etiqueta} Usando proxy residencial de IPRoyal para esta consulta.", flush=True)
+            else:
+                print(f"{etiqueta} *** ALERTA: se pidio usar el proxy, pero faltan las credenciales de IPRoyal en las variables de entorno (IPROYAL_USER/IPROYAL_PASS) -- esta consulta va SIN proxy, usando la IP normal del servidor.", flush=True)
+        context = browser.new_context(proxy=proxy_config)
         page = context.new_page()
 
         try:
             print(f"{etiqueta} Iniciando sesion con credenciales temporales (usuario: {usuario_temporal})...", flush=True)
             page.goto(MEDELLIN_LOGIN_URL, timeout=30000)
-
-            if _medellin_ip_bloqueada(page, etiqueta):
-                resultado["mensaje"] = "IP bloqueada por el firewall del sitio (no es un error de Tramy) -- espera un rato antes de volver a intentar."
-                return resultado
-
-            # Diagnostico ANTES de llenar nada -- para confirmar que los
-            # selectores (input[name="user"], input[name="passw"]) son
-            # los correctos para ESTA pagina real.
-            print(f"{etiqueta} === DIAGNOSTICO: HTML de la pagina de login (antes de llenar) ===", flush=True)
-            try:
-                print(etiqueta, page.content()[:4000], flush=True)
-            except Exception as e_html0:
-                print(f"{etiqueta} No se pudo volcar el HTML: {e_html0}", flush=True)
-
-            page.click('input[name="user"]')
-            page.keyboard.type(usuario_temporal, delay=60)
-            page.click('input[name="passw"]')
-            page.keyboard.type(password_temporal, delay=60)
-
-            # En vez de asumir que Enter dispara la navegacion, se busca
-            # un boton real de inicio de sesion primero -- si no se
-            # encuentra ninguno, se cae al Enter como respaldo.
-            contenido_antes_login = page.inner_text("body")
-            boton_login = None
-            for selector_boton in ['button[type="submit"]', 'input[type="submit"]', 'button:has-text("Iniciar")', 'button:has-text("Ingresar")', 'a:has-text("Iniciar")']:
-                if page.locator(selector_boton).count() > 0:
-                    boton_login = selector_boton
-                    break
-
-            if boton_login:
-                print(f"{etiqueta} Se encontro boton de login con el selector: {boton_login}", flush=True)
-                page.click(boton_login, force=True)
-            else:
-                print(f"{etiqueta} No se encontro un boton de login explicito -- se usa Enter como respaldo.", flush=True)
+            page.fill('input[name="user"]', usuario_temporal)
+            page.fill('input[name="passw"]', password_temporal)
+            with page.expect_navigation(timeout=30000):
                 page.press('input[name="passw"]', "Enter")
-
-            # Se espera a que la pagina cambie (sin asumir que sera una
-            # "navegacion" clasica -- puede ser una actualizacion via
-            # AJAX sin cambiar de URL).
-            for _intento_login in range(6):
-                page.wait_for_timeout(2000)
-                if page.inner_text("body") != contenido_antes_login:
-                    print(f"{etiqueta} La pagina cambio tras el login (intento {_intento_login+1}/6).", flush=True)
-                    break
-            else:
-                print(f"{etiqueta} *** La pagina NO parecio cambiar tras el login, despues de 6 intentos -- se continua de todas formas.", flush=True)
-
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(3000)
 
             print(f"{etiqueta} === DIAGNOSTICO: pagina despues del login con credenciales temporales ===", flush=True)
             print(f"{etiqueta} URL actual:", page.url, flush=True)
@@ -1290,17 +1075,6 @@ def medellin_activar_cuenta(usuario_temporal, password_temporal, nueva_password,
                 print(etiqueta, page.inner_text("body")[:2000], flush=True)
             except Exception:
                 pass
-            try:
-                _ruta_captura_act = f"/tmp/medellin_activar_{etiqueta.strip('[]').replace('MEDELLIN-ACTIVAR-', '')}.png"
-                page.screenshot(path=_ruta_captura_act, full_page=True, timeout=8000)
-                _url_captura_act = subir_a_r2(
-                    _ruta_captura_act,
-                    f"diagnosticos/medellin_activar_{etiqueta.strip('[]').replace('MEDELLIN-ACTIVAR-', '')}.png",
-                    content_type="image/png"
-                )
-                print(f"{etiqueta} === Captura de pantalla del error: {_url_captura_act} ===", flush=True)
-            except Exception as e_captura_act:
-                print(f"{etiqueta} No se pudo tomar/subir la captura de pantalla: {e_captura_act}", flush=True)
         finally:
             context.close(); browser.close()
 
@@ -1333,10 +1107,10 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
     'Punto de atención Sao Paulo'). Si se deja vacio, se revisan todas
     las sedes como antes.
     'usar_proxy' (opcional): si es True, la conexion pasa por el proxy
-    residencial de DataImpulse (IP distinta en cada peticion) en vez de
-    la IP fija del servidor -- pensado para las ventanas de monitoreo
-    muy frecuente (ej. cada 30 segundos), donde el sitio de Medellin
-    puede bloquear la IP fija por exceso de peticiones seguidas.
+    residencial de IPRoyal (IP distinta en cada peticion) en vez de la
+    IP fija del servidor -- pensado para las ventanas de monitoreo muy
+    frecuente (ej. cada 30 segundos), donde el sitio de Medellin puede
+    bloquear la IP fija por exceso de peticiones seguidas.
     Devuelve una tupla (hay_citas: bool, detalle: dict|None)."""
     etiqueta = f"[MEDELLIN-CITAS-{uuid.uuid4().hex[:6]}]"
 
@@ -1345,7 +1119,17 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
             "--single-process", "--no-zygote", "--disable-setuid-sandbox"
         ])
-        proxy_config = _dataimpulse_proxy_config(etiqueta) if usar_proxy else None
+        proxy_config = None
+        if usar_proxy:
+            if IPROYAL_USER and IPROYAL_PASS:
+                proxy_config = {
+                    "server": f"http://{IPROYAL_HOST}:{IPROYAL_PORT}",
+                    "username": IPROYAL_USER,
+                    "password": IPROYAL_PASS,
+                }
+                print(f"{etiqueta} Usando proxy residencial de IPRoyal para esta consulta.", flush=True)
+            else:
+                print(f"{etiqueta} *** ALERTA: se pidio usar el proxy, pero faltan las credenciales de IPRoyal en las variables de entorno (IPROYAL_USER/IPROYAL_PASS) -- esta consulta va SIN proxy, usando la IP normal del servidor.", flush=True)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
             viewport={"width": 1366, "height": 900},
@@ -1363,27 +1147,7 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
         ERRORES_TUNEL_PROXY = ("ERR_TUNNEL_CONNECTION_FAILED", "ERR_PROXY_CONNECTION_FAILED", "ERR_PROXY_AUTH_UNSUPPORTED")
         for intento_proxy in range(3):
             try:
-                # "wait_until='load'" nunca se disparaba en pruebas
-                # reales (el log de Playwright confirmo que solo llegaba
-                # a dispararse "domcontentloaded") -- es un patron comun
-                # en sitios tipo Angular/SPA, que pueden quedar con
-                # alguna conexion o actividad de fondo que evita que el
-                # evento "load" clasico se dispare nunca. Se espera
-                # "domcontentloaded" en su lugar (que SI se confirmo que
-                # ocurre), y se agrega una pausa fija despues para darle
-                # tiempo a la app de Angular de terminar de armar la
-                # pagina.
-                page.goto(MEDELLIN_INICIO_SESION_URL, wait_until="domcontentloaded", timeout=45000)
-                # En vez de solo una pausa fija, se espera activamente a
-                # que el campo de usuario aparezca (Angular puede tardar
-                # una cantidad de tiempo variable en terminar de armar
-                # la pagina) -- se vio en una prueba real que a veces el
-                # campo aun no existia con solo 3 segundos de espera.
-                try:
-                    page.wait_for_selector('input[name="user"]', timeout=15000)
-                except Exception:
-                    print(f"{etiqueta} El campo de usuario no aparecio en 15 segundos -- se continua de todas formas.", flush=True)
-                page.wait_for_timeout(1000)
+                page.goto(MEDELLIN_INICIO_SESION_URL, wait_until="load", timeout=45000)
                 break  # la pagina cargo bien, no hace falta reintentar
             except Exception as e_goto_inicial:
                 if proxy_config and any(err in str(e_goto_inicial) for err in ERRORES_TUNEL_PROXY) and intento_proxy < 2:
@@ -1401,9 +1165,6 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
         try:
             page.wait_for_timeout(2000)
 
-            if _medellin_ip_bloqueada(page, etiqueta):
-                return False, {"error": "IP bloqueada por el firewall del sitio (no es un error de Tramy) -- espera un rato antes de volver a intentar."}
-
             # 2. Login -- OJO: el login real del sitio es un ENVIO DE
             # FORMULARIO NORMAL (navegacion completa, Sec-Fetch-Mode:
             # navigate), NO una peticion tipo API/AJAX. Se probo primero
@@ -1412,10 +1173,8 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
             # se envia con Enter, para que el navegador dispare la MISMA
             # navegacion completa que dispara una persona real.
             try:
-                page.click('input[name="user"]')
-                page.keyboard.type(usuario, delay=60)
-                page.click('input[name="passw"]')
-                page.keyboard.type(password, delay=60)
+                page.fill('input[name="user"]', usuario)
+                page.fill('input[name="passw"]', password)
             except Exception as e_login_campos:
                 print(f"{etiqueta} No se encontraron los campos de login con los selectores esperados: {e_login_campos}", flush=True)
                 try:
@@ -1431,27 +1190,8 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
                 except Exception:
                     pass
                 raise
-            # Antes se asumia que el Enter siempre dispara una
-            # "navegacion" clasica (page.expect_navigation) -- se
-            # confirmo en otro modulo de Medellin que esto puede fallar
-            # (el Enter no siempre dispara ese evento de forma
-            # confiable). Se hace mas robusto: se intenta la navegacion
-            # clasica primero (con un timeout mas corto), y si no
-            # ocurre, se cae a solo esperar que el CONTENIDO de la
-            # pagina cambie, sin importar si fue via navegacion o AJAX.
-            contenido_antes_login_citas = page.inner_text("body")
-            try:
-                with page.expect_navigation(wait_until="domcontentloaded", timeout=8000):
-                    page.press('input[name="passw"]', "Enter")
-            except Exception:
-                print(f"{etiqueta} El Enter no disparo una navegacion clasica -- se revisa si el contenido cambio de otra forma.", flush=True)
-                for _intento_login_citas in range(6):
-                    page.wait_for_timeout(2000)
-                    if page.inner_text("body") != contenido_antes_login_citas:
-                        print(f"{etiqueta} La pagina cambio tras el login (intento {_intento_login_citas+1}/6).", flush=True)
-                        break
-                else:
-                    print(f"{etiqueta} *** La pagina NO parecio cambiar tras el login -- se continua de todas formas.", flush=True)
+            with page.expect_navigation(wait_until="load", timeout=20000):
+                page.press('input[name="passw"]', "Enter")
             page.wait_for_timeout(2000)
 
             # 3. Confirmar que la sesion quedo autenticada (revisa el
@@ -1527,17 +1267,6 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
 
         except Exception as e:
             print(f"{etiqueta} Error: {e}", flush=True)
-            try:
-                _ruta_captura_citas = f"/tmp/medellin_citas_{etiqueta.strip('[]').replace('MEDELLIN-CITAS-', '')}.png"
-                page.screenshot(path=_ruta_captura_citas, full_page=True, timeout=8000)
-                _url_captura_citas = subir_a_r2(
-                    _ruta_captura_citas,
-                    f"diagnosticos/medellin_citas_{etiqueta.strip('[]').replace('MEDELLIN-CITAS-', '')}.png",
-                    content_type="image/png"
-                )
-                print(f"{etiqueta} === Captura de pantalla del error: {_url_captura_citas} ===", flush=True)
-            except Exception as e_captura_citas:
-                print(f"{etiqueta} No se pudo tomar/subir la captura de pantalla: {e_captura_citas}", flush=True)
             return False, {"error": str(e)}
         finally:
             context.close(); browser.close()
@@ -3744,63 +3473,60 @@ VERDE_MARCA = PatternFill(start_color="92D050", end_color="92D050", fill_type="s
 # Cada opcion marca DOS celdas: el numero/casilla y la etiqueta de texto,
 # para que la seleccion se vea claramente (no solo el numero).
 CELDAS_TRAMITE = {
-    "MATRICULA/ REGISTRO": ("A8", "B8"), "TRASPASO": ("E8", "F8"),
-    "TRASLADO MATRICULA / REGISTRO": ("I8", "J8"), "RADICADO  MATRICULA / REGISTRO": ("N8", "O8"),
-    "CAMBIO DE COLOR": ("Q8", "R8"), "CAMBIO DE SERVICIO": ("T8", "U8"),
-    "REGRABAR MOTOR": ("A10", "B10"), "REGRABAR CHASIS": ("E10", "F10"), "TRANSFORMACION": ("I10", "J10"),
-    "DUPLICADO LICENCIA TRANSITO": ("N10", "O10"), "INSCRIPC. PRENDA": ("Q10", "R10"), "LEVANTA PRENDA": ("T10", "U10"),
-    "CANCELACION MATRICULA / REGISTRO": ("A13", "B13"), "CAMBIO DE PLACAS": ("E13", "F13"),
-    "DUPLICADO DE PLACAS": ("I13", "J13"), "REMATRICULA": ("N13", "O13"),
-    "CAMBIO DE CARROCERIA": ("Q13", "R13"),
+    "MATRICULA/ REGISTRO": ("A7", "B7"), "TRASPASO": ("E7", "F7"),
+    "TRASLADO MATRICULA / REGISTRO": ("I7", "J7"), "RADICADO  MATRICULA / REGISTRO": ("N7", "O7"),
+    "CAMBIO DE COLOR": ("Q7", "R7"), "CAMBIO DE SERVICIO": ("T7", "U7"),
+    "REGRABAR MOTOR": ("A9", "B9"), "REGRABAR CHASIS": ("E9", "F9"), "TRANSFORMACION": ("I9", "J9"),
+    "DUPLICADO LICENCIA TRANSITO": ("N9", "O9"), "INSCRIPC. PRENDA": ("Q9", "R9"), "LEVANTA PRENDA": ("T9", "U9"),
+    "CANCELACION MATRICULA / REGISTRO": ("A12", "B12"), "CAMBIO DE PLACAS": ("E12", "F12"),
+    "DUPLICADO DE PLACAS": ("I12", "J12"), "REMATRICULA": ("N12", "O12"),
+    "CAMBIO DE CARROCERIA": ("Q12", "R12"),
 }
 # "OTROS" ya no vive aqui -- se marca aparte, solo cuando hay traslado (ver mas abajo)
-CELDA_OTROS_TRAMITE = ("T13", "U13")
+CELDA_OTROS_TRAMITE = ("T12", "U12")
 
 CELDAS_CLASE = {
-    "AUTOMOVIL": ("A18", "A17"), "BUS": ("D18", "D17"), "BUSETA": ("H18", "H17"),
-    "CAMION": ("L18", "L17"), "CAMIONETA": ("O18", "O17"), "CAMPERO": ("P18", "P17"),
-    "MICROBUS": ("S18", "S17"), "TRACTOCAMION": ("A20", "A19"), "MOTOCICLETA": ("D20", "D19"),
-    "MOTOCARRO": ("H20", "H19"), "MOTOTRICICLO": ("L20", "L19"), "CUATRIMOTO": ("O20", "O19"),
-    "VOLQUETA": ("P20", "P19"), "OTRO": ("S20", "S19"),
+    "AUTOMOVIL": ("A17", "A16"), "BUS": ("D17", "D16"), "BUSETA": ("H17", "H16"),
+    "CAMION": ("L17", "L16"), "CAMIONETA": ("O17", "O16"), "CAMPERO": ("P17", "P16"),
+    "MICROBUS": ("S17", "S16"), "TRACTOCAMION": ("A19", "A18"), "MOTOCICLETA": ("D19", "D18"),
+    "MOTOCARRO": ("H19", "H18"), "MOTOTRICICLO": ("L19", "L18"), "CUATRIMOTO": ("O19", "O18"),
+    "VOLQUETA": ("P19", "P18"), "OTRO": ("S19", "S18"),
 }
 CELDAS_COMBUSTIBLE = {
-    "GASOLINA": ("AC9", "AC8"), "DIESEL": ("AE9", "AE8"), "GAS": ("AF9", "AF8"),
-    "MIXTO": ("AG9", "AG8"), "ELECTRICO": ("AH9", "AH8"), "HIDROGENO": ("AI9", "AI8"),
-    "ETANOL": ("AJ9", "AJ8"), "BIODIESEL": ("AK9", "AK8"),
+    "GASOLINA": ("AC8", "AC7"), "DIESEL": ("AE8", "AE7"), "GAS": ("AF8", "AF7"),
+    "MIXTO": ("AG8", "AG7"), "ELECTRICO": ("AH8", "AH7"), "HIDROGENO": ("AI8", "AI7"),
+    "ETANOL": ("AJ8", "AJ7"), "BIODIESEL": ("AK8", "AK7"),
 }
 CELDAS_SERVICIO = {
-    "PARTICULAR": ("AE30", "AE29"), "PUBLICO": ("AF30", "AF29"), "DIPLOMATICO": ("AG30", "AG29"),
-    "OFICIAL": ("AH30", "AH29"), "ESPECIAL": ("AI30", "AI29"), "OTROS": ("AJ30", "AJ29"),
+    "PARTICULAR": ("AE29", "AE28"), "PUBLICO": ("AF29", "AF28"), "DIPLOMATICO": ("AG29", "AG28"),
+    "OFICIAL": ("AH29", "AH28"), "ESPECIAL": ("AI29", "AI28"), "OTROS": ("AJ29", "AJ28"),
 }
 # Datos del VEHICULO -- confirmado revisando la plantilla que estas
 # coordenadas son IDENTICAS en las 3 hojas de Formulario, asi que este
 # bloque aplica a las 3 por igual.
 CELDAS_REFERENCIA_SIMPLE_VEHICULO = {
-    "AJ4": "placa", "W8": "marca", "Z8": "linea", "W11": "color",
-    "AG11": "modelo", "AI11": "cilindrada",
-    # NOTA: "capacidad" (W14) NO va en este diccionario a proposito -- ya
+    "AJ3": "placa", "W7": "marca", "Z7": "linea", "W10": "color",
+    "AG10": "modelo", "AI10": "cilindrada",
+    # NOTA: "capacidad" (W13) NO va en este diccionario a proposito -- ya
     # se escribe aparte (ver APPJX_CELDA_CAPACIDAD mas abajo), con una
     # regla especial que trata "0" como vacio (0 pasajeros no es un dato
     # real, es la ausencia del dato). Si se agregara aqui tambien, este
     # bloque genérico volvia a escribir "0" encima de esa correccion.
-    # NOTA: "autoridad_transito" ya NO va aqui -- se movio de AC2 a AA3
-    # (ver el bloque explicito de AA3 en la funcion principal), porque
-    # dejo de ser una simple referencia identica en las 3 hojas.
-    "AE18": "numero_motor", "W20": "carroceria", "AE20": "numero_chasis",
-    "AE23": "numero_serie", "AE25": "vin",
+    "AE17": "numero_motor", "W19": "carroceria", "AE19": "numero_chasis",
+    "AE22": "numero_serie", "AE24": "vin", "AC2": "autoridad_transito",
 }
 # Datos de PERSONAS (propietario/comprador) -- estas coordenadas SI son
 # especificas del layout de la hoja BASE (en "(2)"/"(3)" caen en celdas
 # distintas por el espacio de la segunda persona), asi que este bloque
 # solo aplica a la hoja base.
 CELDAS_REFERENCIA_SIMPLE_PERSONAS = {
-    "A25": "propietario_primer_apellido", "I25": "propietario_segundo_apellido",
-    "P25": "propietario_nombres", "S27": "propietario_documento",
-    "A30": "propietario_direccion", "M30": "propietario_ciudad", "S30": "propietario_telefono",
-    "A38": "comprador_primer_apellido", "I38": "comprador_segundo_apellido",
-    "P38": "comprador_nombres", "S42": "comprador_documento",
-    "A45": "comprador_direccion", "M45": "comprador_ciudad", "S45": "comprador_telefono",
-    "AG42": "traslado_municipio",
+    "A24": "propietario_primer_apellido", "I24": "propietario_segundo_apellido",
+    "P24": "propietario_nombres", "S26": "propietario_documento",
+    "A29": "propietario_direccion", "M29": "propietario_ciudad", "S29": "propietario_telefono",
+    "A37": "comprador_primer_apellido", "I37": "comprador_segundo_apellido",
+    "P37": "comprador_nombres", "S41": "comprador_documento",
+    "A44": "comprador_direccion", "M44": "comprador_ciudad", "S44": "comprador_telefono",
+    "AG41": "traslado_municipio",
 }
 # Se mantiene el nombre viejo (union de ambos) por compatibilidad con
 # generar_fun, que SI aplica solo a un unico documento (el FUN clasico,
@@ -3826,25 +3552,6 @@ def _fun_coincide(valor_tramy, etiqueta_formulario):
     if a == b:
         return True
     return re.search(r"\b" + re.escape(b) + r"\b", a) is not None
-
-
-def _escribir_celda_segura(ws, coordenada, valor, color_fuente=None):
-    """Escribe un valor en una celda, manejando el caso de que sea parte
-    de una celda COMBINADA -- escribir directo en una celda combinada
-    que no es la esquina superior izquierda lanza AttributeError en
-    openpyxl (o, peor, falla en silencio si el llamador lo atrapa sin
-    avisar). Esta funcion encuentra la celda ancla real del rango
-    combinado (si aplica) y escribe ahi, para que el valor SI se vea."""
-    celda = ws[coordenada]
-    if isinstance(celda, MergedCell):
-        for rango in ws.merged_cells.ranges:
-            if coordenada in rango:
-                celda = ws.cell(row=rango.min_row, column=rango.min_col)
-                break
-    celda.value = valor
-    if color_fuente:
-        celda.font = Font(color=color_fuente)
-    return celda
 
 
 def _fun_marcar_checkboxes(ws, mapa_celdas, valor_tramy):
@@ -3973,9 +3680,8 @@ APPJX_DOCUMENTOS = {
     "mandato_persona_juridica":      ("Mandato (persona jurídica)",              "MANDATO NIT"),
     "mandato_dos_vendedores":        ("Mandato (dos vendedores)",                "MANDATO (2)"),
     "mandato_comprador_vendedor":    ("Mandato (comprador y vendedor)",          "MANDATO (3)"),
-    "mandato_4":                     ("Mandato (dos mandatarios)",               "MANDATO (4)"),
     "traspaso_indeterminado":        ("Traspaso indeterminado",                  "INDETERMINADO"),
-    "revocatoria_indeterminado":     ("Traspaso a Favor del interesado",         "REVOCATORIA"),
+    "revocatoria_indeterminado":     ("Revocatoria traspaso indeterminado",      "REVOCATORIA"),
     "afirmacion_traspaso":           ("Afirmación de traspaso",                  "AFIRMACION"),
     "levantamiento_prenda":          ("Levantamiento de prenda",                 "LEVANTAMIENTO PRENDA"),
     "inscripcion_prenda":            ("Inscripción de prenda",                   "INSCRIPCION PRENDA"),
@@ -3988,7 +3694,7 @@ APPJX_DOCUMENTOS = {
 # valor de forma directa (en vez de depender de que se recalcule la
 # formula, que no siempre pasa de forma confiable al convertir a PDF).
 APPJX_CELDA_LINEA_EMPRESA = {
-    "formulario": "A52", "formulario_dos_vendedores": "A53", "formulario_dos_compradores": "A49",
+    "formulario": "A51", "formulario_dos_vendedores": "A52", "formulario_dos_compradores": "A48",
     "compraventa": "A35", "compraventa_dos_vendedores": "A36", "compraventa_dos_compradores": "A37",
     "compraventa_persona_juridica": "A35",
     "mandato": "A49", "mandato_persona_juridica": "A49",
@@ -4016,7 +3722,7 @@ APPJX_FILAS_ALTURA_EXTRA = {
 # listados aqui la muestran. Igual que con la linea de empresa, se
 # escribe directo por el mismo problema de recalculo de formulas.
 APPJX_CELDA_CAPACIDAD = {
-    "formulario": "W14", "formulario_dos_vendedores": "W14", "formulario_dos_compradores": "W14",
+    "formulario": "W13", "formulario_dos_vendedores": "W13", "formulario_dos_compradores": "W13",
     "compraventa": "B20", "compraventa_dos_vendedores": "B20",
     "compraventa_dos_compradores": "B20", "compraventa_persona_juridica": "B20",
 }
@@ -4046,20 +3752,20 @@ APPJX_CELDA_CAPACIDAD = {
 # que simplemente no resaltan nada ahi -- solo aparecen en el texto de
 # Mandato).
 CELDAS_TRAMITE_FORMULARIO = {
-    "MATRICULA INICIAL": ("A8", "B8"),
-    "TRASPASO DE PROPIEDAD": ("E8", "F8"),
-    "TRASLADO DE CUENTA": ("I8", "J8"),
-    "RADICADO DE CUENTA": ("N8", "O8"),
-    "CAMBIO DE COLOR": ("Q8", "R8"),
-    "REGRABACION DE MOTOR": ("A10", "B10"),
-    "REGRABACION DE CHASIS": ("E10", "F10"),
-    "DUPLICADO DE LICENCIA DE TRANSITO": ("N10", "O10"),
-    "INSCRIPCION DE PRENDA": ("Q10", "R10"),
-    "LEVANTAMIENTO DE PRENDA": ("T10", "U10"),
-    "CANCELACION DE CUENTA": ("A13", "B13"),
-    "DUPLICADO DE PLACAS": ("I13", "J13"),
+    "MATRICULA INICIAL": ("A7", "B7"),
+    "TRASPASO DE PROPIEDAD": ("E7", "F7"),
+    "TRASLADO DE CUENTA": ("I7", "J7"),
+    "RADICADO DE CUENTA": ("N7", "O7"),
+    "CAMBIO DE COLOR": ("Q7", "R7"),
+    "REGRABACION DE MOTOR": ("A9", "B9"),
+    "REGRABACION DE CHASIS": ("E9", "F9"),
+    "DUPLICADO DE LICENCIA DE TRANSITO": ("N9", "O9"),
+    "INSCRIPCION DE PRENDA": ("Q9", "R9"),
+    "LEVANTAMIENTO DE PRENDA": ("T9", "U9"),
+    "CANCELACION DE CUENTA": ("A12", "B12"),
+    "DUPLICADO DE PLACAS": ("I12", "J12"),
 }
-CELDA_OTROS_TRAMITE_FORMULARIO = ("T13", "U13")
+CELDA_OTROS_TRAMITE_FORMULARIO = ("T12", "U12")
 
 # Celdas de "Tipo de Servicio" (Particular/Publico/Diplomatico) -- a
 # diferencia de la cuadricula de TRAMITES (identica en las 3 hojas), esta
@@ -4071,13 +3777,13 @@ CELDA_OTROS_TRAMITE_FORMULARIO = ("T13", "U13")
 # Cada entrada son TODAS las celdas que hay que pintar de verde juntas.
 CELDAS_SERVICIO_POR_DOCUMENTO = {
     "formulario": {
-        "PARTICULAR": ["AE29", "AE30", "AE31"], "PUBLICO": ["AF29", "AF30", "AF31"], "DIPLOMATICO": ["AG30", "AG31"],
+        "PARTICULAR": ["AE28", "AE29", "AE30"], "PUBLICO": ["AF28", "AF29", "AF30"], "DIPLOMATICO": ["AG29", "AG30"],
     },
     "formulario_dos_vendedores": {
-        "PARTICULAR": ["AE30", "AE31", "AE32"], "PUBLICO": ["AF30", "AF31", "AF32"], "DIPLOMATICO": ["AG30", "AG31", "AG32"],
+        "PARTICULAR": ["AE29", "AE30", "AE31"], "PUBLICO": ["AF29", "AF30", "AF31"], "DIPLOMATICO": ["AG29", "AG30", "AG31"],
     },
     "formulario_dos_compradores": {
-        "PARTICULAR": ["AE29", "AE30", "AE31", "AE32"], "PUBLICO": ["AF29", "AF30", "AF31", "AF32"], "DIPLOMATICO": ["AG29", "AG30", "AG31", "AG32"],
+        "PARTICULAR": ["AE28", "AE29", "AE30", "AE31"], "PUBLICO": ["AF28", "AF29", "AF30", "AF31"], "DIPLOMATICO": ["AG28", "AG29", "AG30", "AG31"],
     },
 }
 
@@ -4089,16 +3795,16 @@ CELDAS_SERVICIO_POR_DOCUMENTO = {
 # ej. "C"/"N") -- se pintan ambas cuando existen las dos.
 CELDAS_TIPO_DOC_FORMULARIO = {
     "formulario": {
-        "propietario": {"CC": ["A26", "A27"], "NIT": ["C26", "C27"]},
-        "comprador": {"CC": ["A41", "A42"], "NIT": ["C41", "C42"]},
+        "propietario": {"CC": ["A25", "A26"], "NIT": ["C25", "C26"]},
+        "comprador": {"CC": ["A40", "A41"], "NIT": ["C40", "C41"]},
     },
     "formulario_dos_vendedores": {
-        "propietario": {"CC": ["A27", "A28"], "NIT": ["C27", "C28"]},
-        "comprador": {"CC": ["A43", "A44"], "NIT": ["C43", "C44"]},
+        "propietario": {"CC": ["A26", "A27"], "NIT": ["C26", "C27"]},
+        "comprador": {"CC": ["A42", "A43"], "NIT": ["C42", "C43"]},
     },
     "formulario_dos_compradores": {
-        "propietario": {"CC": ["A27"], "NIT": ["C27"]},
-        "comprador": {"CC": ["A41", "A42"], "NIT": ["C41", "C42"]},
+        "propietario": {"CC": ["A26"], "NIT": ["C26"]},
+        "comprador": {"CC": ["A40", "A41"], "NIT": ["C40", "C41"]},
     },
 }
 
@@ -4107,9 +3813,9 @@ CELDAS_TIPO_DOC_FORMULARIO = {
 # cada variante de Formulario tiene esta celda en una fila distinta
 # (confirmado revisando la plantilla real).
 APPJX_CELDA_TRASLADO_TEXTO = {
-    "formulario": "W42",
-    "formulario_dos_vendedores": "W44",
-    "formulario_dos_compradores": "W42",
+    "formulario": "W41",
+    "formulario_dos_vendedores": "W43",
+    "formulario_dos_compradores": "W41",
 }
 
 # Celdas de DIRECCION/CIUDAD/TELEFONO por documento y rol -- se escriben
@@ -4122,14 +3828,14 @@ APPJX_CELDA_TRASLADO_TEXTO = {
 # PERSONAS, mas abajo), que ya escribe vacio correctamente.
 APPJX_CELDAS_PERSONA_A_CORREGIR = {
     "formulario_dos_vendedores": {
-        "propietario": {"direccion": "A31", "ciudad": "M31", "telefono": "S31"},
-        "otro_propietario": {"direccion": "A32", "ciudad": "M32", "telefono": "S32"},
-        "comprador": {"direccion": "A47", "ciudad": "M47", "telefono": "S47"},
+        "propietario": {"direccion": "A30", "ciudad": "M30", "telefono": "S30"},
+        "otro_propietario": {"direccion": "A31", "ciudad": "M31", "telefono": "S31"},
+        "comprador": {"direccion": "A46", "ciudad": "M46", "telefono": "S46"},
     },
     "formulario_dos_compradores": {
-        "propietario": {"direccion": "A30", "ciudad": "M30", "telefono": "S30"},
-        "comprador": {"direccion": "A46", "ciudad": "M46", "telefono": "S46"},
-        "otro_comprador": {"direccion": "A45", "ciudad": "M45", "telefono": "S45"},
+        "propietario": {"direccion": "A29", "ciudad": "M29", "telefono": "S29"},
+        "comprador": {"direccion": "A45", "ciudad": "M45", "telefono": "S45"},
+        "otro_comprador": {"direccion": "A44", "ciudad": "M44", "telefono": "S44"},
     },
     "compraventa": {
         "propietario": {"telefono": "B7"},
@@ -4223,39 +3929,6 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
                 datos_vehiculo[_rol_relleno], _municipio_para_datos_falsos
             )
 
-    # Excepcion "Persona Indeterminada" (numero de documento 5134,
-    # activado con el checkbox del mismo nombre en Liquidacion) -- en
-    # los Formularios, el VENDEDOR/PROPIETARIO no debe mostrar ningun
-    # numero de documento, telefono, direccion ni municipio, no se
-    # resalta ningun tipo de documento, y el campo de nombres dice
-    # literalmente "PERSONA INDETERMINADA". El comprador sigue normal.
-    # Se revisan las dos formas en que puede llegar el documento del
-    # propietario (la clave plana usada por Formulario, y el objeto
-    # "propietario" anidado usado por el resto de documentos).
-    _doc_propietario_5134 = (
-        (datos_vehiculo.get("propietario_documento") or "").strip() == "5134"
-        or ((datos_vehiculo.get("propietario") or {}).get("numero_documento") or "").strip() == "5134"
-    )
-    if _doc_propietario_5134:
-        datos_vehiculo["propietario_documento"] = ""
-        datos_vehiculo["propietario_direccion"] = ""
-        datos_vehiculo["propietario_ciudad"] = ""
-        datos_vehiculo["propietario_telefono"] = ""
-        datos_vehiculo["propietario_primer_apellido"] = ""
-        datos_vehiculo["propietario_segundo_apellido"] = ""
-        datos_vehiculo["propietario_nombres"] = "PERSONA INDETERMINADA"
-        if datos_vehiculo.get("propietario"):
-            _propietario_copia = dict(datos_vehiculo["propietario"])
-            _propietario_copia["numero_documento"] = ""
-            _propietario_copia["tipo_documento"] = ""  # para que no se resalte CC/NIT
-            _propietario_copia["telefono"] = ""
-            _propietario_copia["direccion"] = ""
-            _propietario_copia["ciudad"] = ""
-            _propietario_copia["nombres"] = "PERSONA INDETERMINADA"
-            _propietario_copia["apellido"] = ""
-            _propietario_copia["segundo_apellido"] = ""
-            datos_vehiculo["propietario"] = _propietario_copia
-
     wb = _openpyxl.load_workbook(FUN_PLANTILLA, data_only=False, keep_vba=True)
     hoja = wb[nombre_hoja]
 
@@ -4299,33 +3972,11 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     exportar["D44"] = datos_vehiculo.get("fecha_matricula_inicial", "")
 
     # Casilla "1. ORGANISMO DE TRANSITO" / "NOMBRE" -- solo existe en los
-    # 3 Formularios, en la celda AA3 (se movio desde AC2 cuando se
-    # agrego una fila nueva a la plantilla). Se escribe directo (no via
-    # EXPORTAR) porque esta celda no tenia ninguna formula/referencia en
-    # la plantilla original.
+    # 3 Formularios, en la celda AC2 (junto a la etiqueta "NOMBRE" en
+    # AA2). Se escribe directo (no via EXPORTAR) porque esta celda no
+    # tenia ninguna formula/referencia en la plantilla original.
     if nombre_hoja in ("FORMULARIO", "FORMULARIO (2)", "FORMULARIO (3)"):
-        hoja["AA3"] = datos_vehiculo.get("autoridad_transito", "")
-
-        # SOAT y RTM -- solo se escriben si estan VIGENTES. Si no estan
-        # vigentes (o no hay dato), la celda queda como estaba (solo la
-        # etiqueta "SOAT = " / "RTM = ", sin nada despues) a proposito
-        # -- asi se puede llenar a mano al momento de imprimir y llevar
-        # el tramite. Las celdas YA TRAEN la etiqueta como parte de su
-        # texto (ej. "SOAT = ") -- hay que AGREGAR el valor al final,
-        # no reemplazar la celda completa (eso borraba la palabra
-        # "SOAT" por error). "Formulario" y "Formulario (dos
-        # vendedores)" comparten las mismas celdas (AB51/AB52);
-        # "Formulario (dos compradores)" las tiene en AB49/AB50.
-        if nombre_hoja in ("FORMULARIO", "FORMULARIO (2)"):
-            _celda_soat_form, _celda_rtm_form = "AB51", "AB52"
-        else:
-            _celda_soat_form, _celda_rtm_form = "AB49", "AB50"
-        if datos_vehiculo.get("soat_vigente") is True:
-            _etiqueta_soat_previa = hoja[_celda_soat_form].value or "SOAT = "
-            _escribir_celda_segura(hoja, _celda_soat_form, _etiqueta_soat_previa + "Vigente hasta " + (datos_vehiculo.get("soat_fecha_fin") or ""), color_fuente="FF000000")
-        if datos_vehiculo.get("rtm_vigente") is True:
-            _etiqueta_rtm_previa = hoja[_celda_rtm_form].value or "RTM = "
-            _escribir_celda_segura(hoja, _celda_rtm_form, _etiqueta_rtm_previa + "Vigente hasta " + (datos_vehiculo.get("rtm_fecha_fin") or ""), color_fuente="FF000000")
+        hoja["AC2"] = datos_vehiculo.get("autoridad_transito", "")
 
     # Afirmacion de Traspaso tiene una celda con la fecha de hoy
     # (=TODAY()) que LibreOffice muestra en INGLES (ej. "15-August-2026")
@@ -4358,7 +4009,7 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         )
 
     exportar["D51"] = ""  # traslado_municipio -- vacio explicito, si no la formula '=EXPORTAR!D51' en FORMULARIO muestra "0" (una celda totalmente vacia, sin ni siquiera comillas vacias, se lee como cero en una referencia directa)
-    exportar["D24"] = datos_vehiculo.get("precio_venta") or ""  # precio -- viene del campo "Precio de venta" en Tramites (Preparacion/Liquidacion); si no se indica, queda vacio para llenarlo a mano en el documento impreso
+    exportar["D24"] = ""  # precio -- la plantilla trae un valor de prueba guardado (9.000.000); se deja vacio para que se llene a mano en el documento impreso
     exportar["D24"].number_format = "General"
 
     # Tramites seleccionados en Preparacion, conectados con los 4
@@ -4391,27 +4042,16 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     # depende de que se recalcule "=DATOS!W2" y eso no siempre pasa de
     # forma confiable al convertir a PDF (el mismo problema visto con
     # las demas referencias directas).
-    # La firma real de cada documento ya viene conectada por formula
-    # ("=DATOS!W2") en la celda correcta de cada hoja -- se confirmo
-    # revisando la plantilla real que esa celda SI tiene el formato
-    # correcto (Century Gothic, negro, negrita). No hace falta escribir
-    # nada mas aparte de actualizar el valor real en DATOS!W2 -- las
-    # coordenadas usadas antes (APPJX_CELDA_LINEA_EMPRESA) estaban mal
-    # calculadas y apuntaban a una celda distinta a la de la formula,
-    # lo cual causaba una firma duplicada en el lugar equivocado.
     linea_empresa = datos_vehiculo.get("linea_empresa", "")
     if "DATOS" in wb.sheetnames:
         wb["DATOS"]["W2"] = linea_empresa
-
-    # "COMPRA VENTA" (la hoja base, no sus variantes) trae por error DOS
-    # celdas con la misma formula de firma (A35 y A38) -- A35 tiene un
-    # color de tema equivocado (azul) en la plantilla original. Se
-    # limpia esa celda duplicada para que solo se vea una firma (la de
-    # A38, que si tiene el color correcto).
-    if nombre_hoja == "COMPRA VENTA":
-        _celda_firma_duplicada = hoja["A35"]
-        if isinstance(_celda_firma_duplicada.value, str) and _celda_firma_duplicada.value.strip().upper() == "=DATOS!W2":
-            _celda_firma_duplicada.value = None
+    celda_linea_empresa = APPJX_CELDA_LINEA_EMPRESA.get(clave_documento)
+    if celda_linea_empresa:
+        try:
+            hoja[celda_linea_empresa] = linea_empresa
+        except AttributeError:
+            pass  # celda combinada -- no se puede escribir directo
+        hoja[celda_linea_empresa].number_format = "General"
 
     # En los 4 documentos de MANDATO, algunas filas tienen texto con
     # salto de linea interno pero se quedaron con altura de una sola
@@ -4480,116 +4120,6 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         hoja["I9"].number_format = "General"
         hoja["I10"] = _comprador_nit.get("numero_documento") or ""
         hoja["I10"].number_format = "General"
-
-    # Rol "OTRO" -- se conecta con estas 6 hojas especificas. En
-    # "COMPRA VENTA NIT" y "MANDATO NIT" las celdas estaban vacias (sin
-    # formula previa); en las otras 4 SI habia una formula que mostraba
-    # al propietario por defecto (=EXPORTAR!D8/D9/D10 para el nombre,
-    # =EXPORTAR!D11 para el documento) -- se sobrescribe con los datos
-    # de "otro" en todos los casos, escribiendo directo (no por formula)
-    # para que tambien funcione bien si "otro" queda vacio.
-    _CELDAS_ROL_OTRO = {
-        "compraventa_persona_juridica": {"nombre": "H7", "documento": "J8"},
-        "mandato_persona_juridica": {"nombre": "C1", "documento": "G2"},
-        "revocatoria_indeterminado": {"nombre": "B7", "documento": "C8"},
-        "levantamiento_prenda": {"nombre": "A8", "documento": "C9"},
-        "inscripcion_prenda": {"nombre": "D3", "documento": "C4"},
-        "acta_responsabilidad": {"nombre": "D3", "documento": "C4"},
-    }
-    if clave_documento in _CELDAS_ROL_OTRO:
-        _otro_persona = datos_vehiculo.get("otro") or {}
-        _nombre_completo_otro = " ".join(filter(None, [
-            _otro_persona.get("nombres"), _otro_persona.get("apellido"), _otro_persona.get("segundo_apellido"),
-        ]))
-        _celdas_otro_doc = _CELDAS_ROL_OTRO[clave_documento]
-        hoja[_celdas_otro_doc["nombre"]] = _nombre_completo_otro
-        hoja[_celdas_otro_doc["nombre"]].number_format = "General"
-        hoja[_celdas_otro_doc["documento"]] = _otro_persona.get("numero_documento") or ""
-        hoja[_celdas_otro_doc["documento"]].number_format = "General"
-
-    # Rol "MANDATARIO" -- se conecta con las 5 hojas de Mandato. Estas
-    # celdas ya tenian una formula que apuntaba a EXPORTAR!D3-D6 (el rol
-    # "asesor", que nunca se conecto desde la interfaz, asi que siempre
-    # quedaban vacias) -- se sobrescriben directo con los datos de
-    # "mandatario" en su lugar. "MANDATO (4)" es la unica variante con
-    # espacio para un SEGUNDO mandatario (otro_mandatario).
-    _CELDAS_ROL_MANDATARIO = {
-        "mandato": {"nombre": "A4", "documento": "A6"},
-        "mandato_dos_vendedores": {"nombre": "B7", "documento": "F8"},
-        "mandato_comprador_vendedor": {"nombre": "A7", "documento": "G8"},
-        "mandato_persona_juridica": {"nombre": "D5", "documento": "F6"},
-        "mandato_4": {"nombre": "C4", "documento": "A6"},
-    }
-    if clave_documento in _CELDAS_ROL_MANDATARIO:
-        _mandatario_persona = datos_vehiculo.get("mandatario") or {}
-        _nombre_completo_mandatario = " ".join(filter(None, [
-            _mandatario_persona.get("nombres"), _mandatario_persona.get("apellido"), _mandatario_persona.get("segundo_apellido"),
-        ]))
-        _celdas_mandatario_doc = _CELDAS_ROL_MANDATARIO[clave_documento]
-        hoja[_celdas_mandatario_doc["nombre"]] = _nombre_completo_mandatario
-        hoja[_celdas_mandatario_doc["nombre"]].number_format = "General"
-        hoja[_celdas_mandatario_doc["documento"]] = _mandatario_persona.get("numero_documento") or ""
-        hoja[_celdas_mandatario_doc["documento"]].number_format = "General"
-
-    # Segundo mandatario -- SOLO existe en "MANDATO (4)" por ahora.
-    if clave_documento == "mandato_4":
-        _otro_mandatario_persona = datos_vehiculo.get("otro_mandatario") or {}
-        _nombre_completo_otro_mandatario = " ".join(filter(None, [
-            _otro_mandatario_persona.get("nombres"), _otro_mandatario_persona.get("apellido"), _otro_mandatario_persona.get("segundo_apellido"),
-        ]))
-        hoja["B7"] = _nombre_completo_otro_mandatario
-        hoja["B7"].number_format = "General"
-        hoja["F8"] = _otro_mandatario_persona.get("numero_documento") or ""
-        hoja["F8"].number_format = "General"
-
-        # A3 y A5 se ven con las lineas montadas (superpuestas con el
-        # texto justo encima) al convertir a PDF. El intento anterior de
-        # arreglar esto (agregando saltos de linea AL INICIO del texto)
-        # termino "recortando" el texto -- la fila no tenia suficiente
-        # altura para mostrar los saltos de linea Y el texto real, asi
-        # que el texto quedaba fuera del area visible (invisible, pero
-        # seguia estando ahi). Se corrige de otra forma: el texto se
-        # deja intacto, y en vez de eso se agranda la altura de esas 2
-        # filas especificas, para separar visualmente sin arriesgar
-        # que el texto real se pierda de vista.
-        # La columna A sola es muy angosta (ancho ~15) -- con wrap_text
-        # activado, el texto se ajustaba en lineas de 2-3 palabras, lo
-        # cual se veia mal. Se combinan las celdas A hasta G (que estan
-        # vacias en estas 2 filas) para darle al texto mucho mas espacio
-        # horizontal, igual que ya se hace en otras partes de esta misma
-        # hoja (ej. A9:G11) para bloques de texto largo.
-        hoja.merge_cells("A3:G3")
-        hoja["A3"] = "quien para efectos del presente contrato se denominará el MANDANTE VENDEDOR."
-        hoja["A3"].alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
-        hoja.row_dimensions[3].height = 30
-
-        hoja.merge_cells("A5:G5")
-        hoja["A5"] = "también mayor de edad, vecino(a) de ésta  ciudad Identificado(a) con Documento de identidad Numero:"
-        hoja["A5"].alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
-        hoja.row_dimensions[5].height = 30
-
-        # A49 trae una formula que no se necesita -- se elimina dejando
-        # la celda vacia.
-        hoja["A49"] = None
-
-    # Precio de venta -- se escribe directo en la celda del documento
-    # (ademas de en EXPORTAR) por el mismo motivo de siempre: una formula
-    # que apunta a una celda vacia se evalua como 0, sin importar el
-    # formato de la celda de destino.
-    _CELDA_PRECIO_VENTA = {
-        "compraventa": "G3",
-        "compraventa_dos_vendedores": "G10",
-        "compraventa_dos_compradores": "G10",
-    }
-    if clave_documento in _CELDA_PRECIO_VENTA:
-        _celda_precio = _CELDA_PRECIO_VENTA[clave_documento]
-        _precio_venta_raw = datos_vehiculo.get("precio_venta")
-        try:
-            _precio_venta_valor = float(str(_precio_venta_raw).replace(",", "").replace(".", "").strip()) if _precio_venta_raw else ""
-        except (ValueError, TypeError):
-            _precio_venta_valor = _precio_venta_raw or ""
-        hoja[_celda_precio] = _precio_venta_valor
-        hoja[_celda_precio].number_format = '"$"#,##0'
 
     # Las celdas DENTRO del documento (no en EXPORTAR) que muestran estos
     # datos de personas dependen de que LibreOffice recalcule su formula
@@ -4694,13 +4224,13 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
                         pass
         for celda in CELDA_OTROS_TRAMITE:
             hoja[celda].fill = sin_relleno
-        hoja["W39"].fill = sin_relleno  # bloque "ESPECIFIQUE LA PALABRA OTRO..." (combinado W39:AK41)
+        hoja["W38"].fill = sin_relleno  # bloque "ESPECIFIQUE LA PALABRA OTRO..." (combinado W38:AK40)
         # W41/AG41 muestran el texto de "traslado de cuenta" via formula
         # (=EXPORTAR!D51) -- LibreOffice no siempre recalcula esa formula
         # en la conversion a PDF, asi que se escribe vacio DIRECTAMENTE en
         # la celda visible en vez de depender de la formula. Protegido por
         # si acaso en "(2)"/"(3)" esa celda resulta combinada distinto.
-        for celda_fija in ("W42", "AG42"):
+        for celda_fija in ("W41", "AG41"):
             try:
                 hoja[celda_fija].value = ""
             except AttributeError:
@@ -4790,7 +4320,7 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         if datos_vehiculo.get("tramite"):
             _fun_marcar_checkboxes(hoja, CELDAS_TRAMITE, datos_vehiculo["tramite"])
             if "TRASLADO" in _fun_normalizar(datos_vehiculo["tramite"]):
-                hoja["W39"].fill = VERDE_MARCA
+                hoja["W38"].fill = VERDE_MARCA
 
     hojas_a_conservar = {nombre_hoja, "EXPORTAR", "DATOS"}
     for nombre in list(wb.sheetnames):
@@ -8418,35 +7948,10 @@ def diagnostico_proxy_dataimpulse_endpoint():
         return jsonify({"error": "Faltan las credenciales de DataImpulse en las variables de entorno (DATAIMPULSE_USER/DATAIMPULSE_PASS)."}), 400
 
     proxy_url = f"http://{DATAIMPULSE_USER}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{DATAIMPULSE_PORT}"
-    url_prueba = request.args.get("url", "https://movilidad.envigado.gov.co/portal-servicios/#/agendar-cita-publica")
     try:
         resultado = subprocess.run(
-            ["curl", "-v", "--proxy", proxy_url, "--max-time", "30", url_prueba],
-            capture_output=True, text=True, timeout=35
-        )
-        return jsonify({
-            "ok": True,
-            "codigo_salida": resultado.returncode,
-            "salida_estandar": resultado.stdout[-2000:],
-            "salida_error_detallada": resultado.stderr[-4000:],
-        })
-    except subprocess.TimeoutExpired:
-        return jsonify({"ok": False, "error": "Timeout -- el comando tardo mas de 35 segundos sin responder."}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/diagnostico-sin-proxy", methods=["GET"])
-def diagnostico_sin_proxy_endpoint():
-    """Igual que /diagnostico-proxy-dataimpulse, pero SIN usar ningun
-    proxy -- directo desde la IP del servidor de Railway. Se usa para
-    comparar: si el bloqueo (Attack ID del WAF) aparece IGUAL sin
-    proxy, es un bloqueo generico a trafico automatizado/datacenter; si
-    solo aparece CON proxy, es especifico a IPs residenciales/proxy."""
-    url_prueba = request.args.get("url", "https://www.medellin.gov.co")
-    try:
-        resultado = subprocess.run(
-            ["curl", "-v", "--max-time", "30", url_prueba],
+            ["curl", "-v", "--proxy", proxy_url, "--max-time", "30",
+             "https://movilidad.envigado.gov.co/portal-servicios/#/agendar-cita-publica"],
             capture_output=True, text=True, timeout=35
         )
         return jsonify({
