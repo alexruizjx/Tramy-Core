@@ -15,17 +15,8 @@ from pywebpush import webpush, WebPushException
 import threading
 import boto3
 from botocore.config import Config
-from datetime import datetime, timedelta, date, timezone
-
-# Colombia esta siempre en UTC-5 (no tiene horario de verano) -- se usa
-# un desfase FIJO en vez de ZoneInfo("America/Bogota"), porque esa
-# depende de que el sistema tenga instalada la base de datos de zonas
-# horarias (tzdata) -- la imagen de Railway NO la tiene por defecto, y
-# eso tumbaba toda la aplicacion al arrancar (ZoneInfoNotFoundError).
-# Un desfase fijo no depende de nada externo y para Colombia siempre es
-# correcto (nunca cambia por horario de verano).
-TZ_COLOMBIA = timezone(timedelta(hours=-5))
-from flask import Flask, request, jsonify, send_file
+from datetime import datetime, timedelta, date
+from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 from pypdf import PdfWriter
 from flask_cors import CORS
@@ -55,15 +46,6 @@ IPROYAL_HOST = os.environ.get("IPROYAL_HOST", "geo.iproyal.com")
 IPROYAL_PORT = os.environ.get("IPROYAL_PORT", "12321")
 IPROYAL_USER = os.environ.get("IPROYAL_USER", "")
 IPROYAL_PASS = os.environ.get("IPROYAL_PASS", "")
-# DataImpulse -- proxy residencial usado para el monitoreo/reserva de
-# citas de Envigado, para evitar que el sitio detecte el trafico
-# repetido del servidor como sospechoso y escale la dificultad del
-# captcha. Host/puerto por defecto segun la documentacion de
-# DataImpulse -- ajustar via variables de entorno si difieren.
-DATAIMPULSE_HOST = os.environ.get("DATAIMPULSE_HOST", "gw.dataimpulse.com")
-DATAIMPULSE_PORT = os.environ.get("DATAIMPULSE_PORT", "823")
-DATAIMPULSE_USER = os.environ.get("DATAIMPULSE_USER", "")
-DATAIMPULSE_PASS = os.environ.get("DATAIMPULSE_PASS", "")
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_CLAIMS = {"sub": "mailto:soporte@tramy.app"}
 
@@ -266,49 +248,6 @@ def job_error(job_id, mensaje_error):
 #  CACHE IMPUESTOS ANTIOQUIA
 # ============================================================
 
-def _dataimpulse_proxy_config(etiqueta=""):
-    """Construye la configuracion de proxy residencial de DataImpulse
-    para usar con Playwright (browser.new_context(proxy=...)). Devuelve
-    None si faltan credenciales (y avisa por log), para que el llamador
-    pueda decidir seguir sin proxy en vez de fallar."""
-    if DATAIMPULSE_USER and DATAIMPULSE_PASS:
-        print(f"{etiqueta} Usando proxy residencial de DataImpulse.", flush=True)
-        return {
-            "server": f"http://{DATAIMPULSE_HOST}:{DATAIMPULSE_PORT}",
-            "username": DATAIMPULSE_USER,
-            "password": DATAIMPULSE_PASS,
-        }
-    print(f"{etiqueta} *** ALERTA: se pidio usar el proxy de DataImpulse, pero faltan las credenciales (DATAIMPULSE_USER/DATAIMPULSE_PASS) -- esta sesion va SIN proxy, usando la IP normal del servidor.", flush=True)
-    return None
-
-
-def _avaluo_declaracion_mas_reciente(data3):
-    """Devuelve el avaluoComercial de la declaracion MAS RECIENTE
-    (la de mayor vigencia) dentro de listaDetallePagos -- este es el
-    avaluo real que aparece en el certificado (ej. 10.979.000 para la
-    vigencia 2026), a diferencia de estadoCuenta.avaluoComercial, que es
-    un campo GENERAL de la Gobernacion que no siempre coincide con el
-    avaluo de la ultima declaracion presentada (se confirmo con un caso
-    real: el campo general traia $12.639.000 mientras la declaracion
-    2026 real era $10.979.000)."""
-    lista = data3.get("listaDetallePagos", []) or []
-    mejor = None
-    mejor_vigencia = -1
-    for d in lista:
-        try:
-            vig = int(d.get("vigencia", 0) or 0)
-        except (TypeError, ValueError):
-            continue
-        if vig > mejor_vigencia:
-            mejor_vigencia = vig
-            mejor = d
-    if mejor and mejor.get("avaluoComercial"):
-        return mejor["avaluoComercial"]
-    # Respaldo: si no hay declaraciones (caso raro), se usa el campo
-    # general -- mejor un valor aproximado que nada.
-    return (data3.get("estadoCuenta", {}) or {}).get("avaluoComercial", 0) or 0
-
-
 def cache_antioquia_buscar(placa):
     """Busca PAZ_Y_SALVO en caché para el año actual."""
     try:
@@ -377,7 +316,7 @@ def cache_antioquia_eliminar_vigencia(placa, anio):
 
 
 ENVIGADO_CITAS_SEDES = {
-    "Sede Principal": 5,  # idSubsede confirmado por log real (antes se tenia 1, incorrecto)
+    "Vegas (El Colombiano)": 1,
     "City Plaza": 3,
 }
 ENVIGADO_CITAS_ID_SERVICIO = "90"
@@ -454,7 +393,17 @@ def medellin_crear_usuario(datos, usar_proxy=True):
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
             "--single-process", "--no-zygote", "--disable-setuid-sandbox"
         ])
-        proxy_config = _dataimpulse_proxy_config(etiqueta) if usar_proxy else None
+        proxy_config = None
+        if usar_proxy:
+            if IPROYAL_USER and IPROYAL_PASS:
+                proxy_config = {
+                    "server": f"http://{IPROYAL_HOST}:{IPROYAL_PORT}",
+                    "username": IPROYAL_USER,
+                    "password": IPROYAL_PASS,
+                }
+                print(f"{etiqueta} Usando proxy residencial de IPRoyal para este registro.", flush=True)
+            else:
+                print(f"{etiqueta} *** ALERTA: se pidio usar el proxy, pero faltan las credenciales de IPRoyal en las variables de entorno (IPROYAL_USER/IPROYAL_PASS) -- este registro va SIN proxy, usando la IP normal del servidor.", flush=True)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
             viewport={"width": 1366, "height": 900},
@@ -1272,67 +1221,39 @@ def medellin_hay_citas_disponibles(usuario, password, placa, id_servicio=MEDELLI
             context.close(); browser.close()
 
 
-def _envigado_proximo_dia_habil():
-    """Calcula el proximo dia habil (lunes a viernes) a partir de hoy, en
-    formato 'DD/MM/YYYY' -- igual al formato que usa la API de Envigado
-    para 'diaAtencion'. Si hoy es viernes o fin de semana, salta al
-    proximo lunes."""
-    hoy = datetime.now().date()
-    siguiente = hoy + timedelta(days=1)
-    while siguiente.weekday() >= 5:  # 5=sabado, 6=domingo
-        siguiente += timedelta(days=1)
-    return siguiente.strftime("%d/%m/%Y")
-
-
-def envigado_hay_puntos_disponibles(usar_proxy=True):
-    """Revisa, para CADA sede, si el PROXIMO DIA HABIL especificamente
-    tiene fechas de atencion disponibles -- no solo si el servicio esta
-    listado (eso casi siempre es cierto y causaba falsos positivos, ya
-    que 'getPuntosAtencionServiciosLowcode' solo dice que sedes OFRECEN
-    el tramite, sin decir si tienen cupo). Usa un NAVEGADOR REAL
-    (Playwright) en vez de peticiones HTTP directas -- se probo con
-    peticiones directas primero (replicando payload y encabezados
-    exactos capturados de un HAR real), pero el servidor seguia
-    devolviendo error 500 solo en este endpoint especifico (el mismo
-    enfoque SI funciona para otros endpoints de Envigado, como el
-    monitor de turnos) -- lo mas probable es que este endpoint en
-    particular tenga alguna proteccion anti-bot que detecta que la
-    conexion no viene de un navegador real. Se llena el formulario igual
-    que lo haria una persona, con datos de prueba que no corresponden a
-    ningun ciudadano real.
-    'usar_proxy' (True por defecto): el trafico repetido del monitoreo
-    desde la misma IP del servidor puede hacer que el sitio escale la
-    dificultad del captcha -- se usa el proxy residencial de DataImpulse
-    por defecto para evitarlo.
-    Devuelve una lista de {"sede": nombre, "fecha": "DD/MM/YYYY"} -- una
-    entrada por cada sede que SI tiene el proximo dia habil disponible
-    (vacia [] si ninguna sede lo tiene), o None si algo fallo."""
-    fecha_objetivo = _envigado_proximo_dia_habil()
-    resultado_final = []
-    respuestas_capturadas = {}
-    todas_las_urls_vistas = []  # diagnostico -- para ver TODAS las peticiones de red relacionadas a citas, sin importar el nombre exacto
-    etiqueta = f"[ENVIGADO-CHEQUEO-{uuid.uuid4().hex[:6]}]"
+def envigado_hay_puntos_disponibles():
+    """Revisa si hay ALGUN punto de atencion con citas disponibles para
+    el servicio vigilado. Usa un NAVEGADOR REAL (Playwright) en vez de
+    peticiones HTTP directas -- se probo con peticiones directas primero
+    (replicando payload y encabezados exactos capturados de un HAR real),
+    pero el servidor seguia devolviendo error 500 solo en este endpoint
+    especifico (el mismo enfoque SI funciona para otros endpoints de
+    Envigado, como el monitor de turnos) -- lo mas probable es que este
+    endpoint en particular tenga alguna proteccion anti-bot que detecta
+    que la conexion no viene de un navegador real. Se llena el formulario
+    igual que lo haria una persona, con datos de prueba que no
+    corresponden a ningun ciudadano real, y se intercepta la respuesta de
+    getPuntosAtencionServiciosLowcode directamente de la red.
+    Devuelve la lista cruda que entrega el sitio (vacia [] si no hay nada
+    disponible en ningun lado en este momento), o None si algo fallo."""
+    resultado_capturado = {"datos": None, "capturado": False}
 
     def _capturar_respuesta(response):
-        if "backavit" in response.url or "citas" in response.url:
-            todas_las_urls_vistas.append(response.url)
-        for nombre_endpoint in ["getPuntosAtencionServiciosLowcode", "getFechasDisponibles"]:
-            if nombre_endpoint in response.url:
-                try:
-                    respuestas_capturadas[nombre_endpoint] = response.json()
-                except Exception:
-                    pass
+        if "getPuntosAtencionServiciosLowcode" in response.url:
+            try:
+                resultado_capturado["datos"] = response.json()
+                resultado_capturado["capturado"] = True
+            except Exception:
+                pass
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True, args=[
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
             "--single-process", "--no-zygote", "--disable-setuid-sandbox"
         ])
-        proxy_config = _dataimpulse_proxy_config(etiqueta) if usar_proxy else None
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
             viewport={"width": 390, "height": 844},
-            proxy=proxy_config,
         )
         page = context.new_page()
         page.on("response", _capturar_respuesta)
@@ -1495,20 +1416,19 @@ def envigado_hay_puntos_disponibles(usar_proxy=True):
                 print("Aviso 'sin agenda disponible' detectado justo despues de 'Agregar servicio' -- confirmado, no hay citas.", flush=True)
                 return []
 
-            # Esperar a que la peticion de puntos se dispare y la
-            # respuesta llegue. Se revisa el aviso de "sin agenda" en
-            # cada vuelta tambien, por si aparece justo en este momento
-            # (a veces tarda un poco en mostrarse despues del clic).
+            # Esperar a que la peticion se dispare y la respuesta llegue.
+            # Se revisa el aviso de "sin agenda" en cada vuelta tambien,
+            # por si aparece justo en este momento (a veces tarda un poco
+            # en mostrarse despues del clic).
             for _ in range(10):
-                if "getPuntosAtencionServiciosLowcode" in respuestas_capturadas:
+                if resultado_capturado["capturado"]:
                     break
                 if _envigado_hay_aviso_sin_agenda(page):
                     print("Aviso 'sin agenda disponible' detectado mientras se esperaba la respuesta -- confirmado, no hay citas.", flush=True)
                     return []
                 page.wait_for_timeout(1000)
 
-            puntos = respuestas_capturadas.get("getPuntosAtencionServiciosLowcode")
-            if not puntos:
+            if not resultado_capturado["capturado"]:
                 # Diagnostico: se imprime un resumen del HTML visible para
                 # poder ajustar los selectores si algo no coincidio.
                 print("=== DIAGNOSTICO citas Envigado: no se capturo la respuesta esperada ===", flush=True)
@@ -1519,86 +1439,6 @@ def envigado_hay_puntos_disponibles(usar_proxy=True):
                 except Exception as e_txt:
                     print("No se pudo leer el texto de la pagina:", e_txt, flush=True)
                 print("=== FIN DIAGNOSTICO ===", flush=True)
-                context.close(); browser.close()
-                return []
-
-            print(f"Puntos de atencion encontrados (revisando fecha objetivo {fecha_objetivo}): {puntos}", flush=True)
-
-            # Por cada punto/sede que ofrece el tramite, se elige esa sede
-            # y se revisa si el PROXIMO DIA HABIL especificamente esta en
-            # su lista de fechas disponibles -- esto es lo que realmente
-            # confirma que hay cupo, a diferencia de solo listar el
-            # tramite como ofrecido.
-            for punto in puntos:
-                nombre_sede = punto.get("nombreSubsede") or "Sede desconocida"
-                id_subsede = punto.get("idSubsede")
-                if id_subsede is None:
-                    continue
-
-                respuestas_capturadas.pop("getFechasDisponibles", None)
-                try:
-                    # Se selecciona por el TEXTO VISIBLE de la opcion
-                    # (nombre de la sede), no por su "value" interno --
-                    # se confirmo con diagnostico real que el <select> de
-                    # Angular no usa el idSubsede puro como value (nunca
-                    # se encontraba una opcion con ese valor exacto,
-                    # aunque el <select> si tenia opciones renderizadas).
-                    # select_option con "label" busca por el texto que ve
-                    # el usuario, evitando ese problema. Se reintenta por
-                    # si las opciones aun no han terminado de renderizarse.
-                    seleccionado_ok = False
-                    for intento_sede in range(5):
-                        try:
-                            page.select_option('#seleccione_punto_atencion', label=nombre_sede, timeout=2000)
-                            seleccionado_ok = True
-                            break
-                        except Exception:
-                            page.wait_for_timeout(500)
-                    if not seleccionado_ok:
-                        # Respaldo: el texto exacto no coincidio (puede
-                        # tener espacios/mayusculas distintas) -- se busca
-                        # cualquier <option> cuyo texto CONTENGA el nombre
-                        # de la sede, sin importar mayusculas/espacios.
-                        seleccionado_ok = page.evaluate(f"""() => {{
-                            var el = document.querySelector('#seleccione_punto_atencion');
-                            if (!el) return false;
-                            var buscado = {json.dumps(nombre_sede)}.trim().toLowerCase();
-                            for (var i = 0; i < el.options.length; i++) {{
-                                var texto = (el.options[i].textContent || '').trim().toLowerCase();
-                                if (texto.indexOf(buscado) >= 0 || buscado.indexOf(texto) >= 0) {{
-                                    el.selectedIndex = i;
-                                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                                    return true;
-                                }}
-                            }}
-                            return false;
-                        }}""")
-                    print(f"Sede '{nombre_sede}' (idSubsede={id_subsede}) -- se pudo seleccionar por texto: {seleccionado_ok}", flush=True)
-                    if seleccionado_ok:
-                        page.evaluate("""() => {
-                            var el = document.querySelector('#seleccione_punto_atencion');
-                            if (el) el.dispatchEvent(new Event('change', { bubbles: true }));
-                        }""")
-                except Exception as e_sede:
-                    print(f"No se pudo seleccionar la sede '{nombre_sede}': {e_sede}", flush=True)
-                    continue
-                page.wait_for_timeout(1500)
-
-                for _ in range(10):
-                    if "getFechasDisponibles" in respuestas_capturadas:
-                        break
-                    page.wait_for_timeout(1000)
-
-                if "getFechasDisponibles" not in respuestas_capturadas:
-                    print(f"Sede '{nombre_sede}': NUNCA se capturo la respuesta de getFechasDisponibles (la peticion no se disparo, o tardo mas de 10 segundos).", flush=True)
-                    print(f"Todas las URLs de red relacionadas a citas vistas hasta ahora: {todas_las_urls_vistas}", flush=True)
-
-                fechas_disponibles = respuestas_capturadas.get("getFechasDisponibles") or []
-                dias_atencion = [f.get("diaAtencion") for f in fechas_disponibles if isinstance(f, dict)]
-                print(f"Fechas disponibles en '{nombre_sede}': {dias_atencion} (respuesta cruda: {fechas_disponibles})", flush=True)
-
-                if fecha_objetivo in dias_atencion:
-                    resultado_final.append({"sede": nombre_sede, "fecha": fecha_objetivo})
 
         except Exception as e:
             print(f"Error en el flujo de Playwright para citas Envigado: {e}", flush=True)
@@ -1608,17 +1448,16 @@ def envigado_hay_puntos_disponibles(usar_proxy=True):
                 print("=== FIN DIAGNOSTICO ===", flush=True)
             except Exception:
                 pass
-            return None
         finally:
             context.close(); browser.close()
 
-    return resultado_final
+    return resultado_capturado["datos"]
 
 
 def envigado_revisar_citas_disponibles(dias_adelante=14):
-    """Revisa si el proximo dia habil tiene cupo en alguna sede, y guarda
-    el resultado en la base de datos. 'dias_adelante' ya no se usa (se
-    revisa unicamente el proximo dia habil, no un rango de dias) -- se
+    """Revisa si hay ALGUN punto de atencion con citas disponibles (una
+    sola peticion, no dia por dia), y guarda el resultado en la base de
+    datos. 'dias_adelante' ya no se usa para hacer mas peticiones -- se
     deja como parametro por compatibilidad con quien ya llama esta
     funcion. Devuelve una tupla (resultados, hubo_error):
     - resultados: lista de {sede, fecha, cantidad_horarios}
@@ -1633,36 +1472,26 @@ def envigado_revisar_citas_disponibles(dias_adelante=14):
     conn = get_db_conn()
     cur = conn.cursor()
 
-    # Limpieza general: se borra CUALQUIER registro cuya fecha de cita ya
-    # paso, sin importar el resultado de esta consulta -- antes solo se
-    # limpiaban los resultados vacios del dia de HOY, asi que un positivo
-    # de dias anteriores que nunca se volvio a consultar se quedaba
-    # mostrandose para siempre.
-    cur.execute("""
-        DELETE FROM envigado_citas_disponibles
-        WHERE TO_DATE(fecha_dia, 'DD/MM/YYYY') < CURRENT_DATE
-    """)
-
     if isinstance(puntos, list) and len(puntos) > 0:
-        # 'puntos' ya viene filtrado -- cada elemento es una sede que SI
-        # tiene el proximo dia habil disponible de verdad (no solo que
-        # ofrece el tramite).
-        print("=== CITAS ENVIGADO: hay cupo para el proximo dia habil ===", flush=True)
+        # Aun no conocemos la estructura exacta de una respuesta CON datos
+        # (solo hemos visto la vacia) -- se imprime completa en los logs
+        # para poder revisarla y afinar el formato la primera vez que se
+        # dispare de verdad.
+        print("=== CITAS ENVIGADO: se encontraron puntos disponibles ===", flush=True)
         print(puntos, flush=True)
         print("=== FIN ===", flush=True)
-        for p in puntos:
-            resultados.append({
-                "sede": p["sede"],
-                "fecha": p["fecha"],
-                "cantidad_horarios": 1  # se confirma que hay cupo; el conteo exacto de horas se ve al reservar
-            })
-            cur.execute("""
-                INSERT INTO envigado_citas_disponibles (sede, id_subsede, fecha_dia, cantidad_horarios, verificado_en)
-                VALUES (%s, %s, %s, %s, NOW())
-                ON CONFLICT (sede, fecha_dia) DO UPDATE SET
-                    cantidad_horarios=EXCLUDED.cantidad_horarios, verificado_en=NOW()
-            """, (p["sede"], 0, p["fecha"], 1))
-
+        fecha_hoy = datetime.now().strftime("%d/%m/%Y")
+        resultados.append({
+            "sede": "Ver detalle en logs del servidor",
+            "fecha": fecha_hoy,
+            "cantidad_horarios": len(puntos)
+        })
+        cur.execute("""
+            INSERT INTO envigado_citas_disponibles (sede, id_subsede, fecha_dia, cantidad_horarios, verificado_en)
+            VALUES (%s, %s, %s, %s, NOW())
+            ON CONFLICT (sede, fecha_dia) DO UPDATE SET
+                cantidad_horarios=EXCLUDED.cantidad_horarios, verificado_en=NOW()
+        """, ("Detectado (ver logs)", 0, fecha_hoy, len(puntos)))
     else:
         # Sin citas en este momento -- se limpia cualquier resultado
         # positivo anterior guardado hoy, para no mostrar un aviso viejo
@@ -1678,11 +1507,6 @@ def envigado_revisar_citas_disponibles(dias_adelante=14):
 
 
 ENVIGADO_RECAPTCHA_SITEKEY = "6LdZ-WUsAAAAAEEs0_PbIzNhEoDTBqV1CwBEE8B-"  # confirmado con un HAR real
-
-# Carpeta temporal donde se guardan las capturas de pantalla del flujo de
-# reserva de citas de Envigado -- se sirven despues via /envigado-captura.
-CAPTURAS_ENVIGADO_DIR = "/tmp/capturas_envigado"
-os.makedirs(CAPTURAS_ENVIGADO_DIR, exist_ok=True)
 
 
 def envigado_reservar_cita(solicitud):
@@ -1725,11 +1549,9 @@ def envigado_reservar_cita(solicitud):
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
             "--single-process", "--no-zygote", "--disable-setuid-sandbox"
         ])
-        proxy_config = _dataimpulse_proxy_config(etiqueta)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
             viewport={"width": 390, "height": 844},
-            proxy=proxy_config,
         )
         page = context.new_page()
         page.on("response", _capturar_respuesta)
@@ -1820,39 +1642,6 @@ def envigado_reservar_cita(solicitud):
             puntos = respuestas_capturadas.get("getPuntosAtencionServiciosLowcode") or []
             print(f"{etiqueta} Puntos de atencion encontrados: {puntos}", flush=True)
             if not puntos:
-                # Diagnostico enriquecido -- antes esta funcion solo
-                # reportaba "vacio" sin mas detalle. Se imprime el texto
-                # visible y los campos reales del formulario en este
-                # punto, para distinguir si el sitio de verdad respondio
-                # "sin puntos" o si la respuesta nunca se capturo (ej. el
-                # clic en "Agregar servicio" no disparo la peticion).
-                print(f"{etiqueta} === DIAGNOSTICO: puntos vacio -- revisando estado de la pagina ===", flush=True)
-                print(f"{etiqueta} URL actual: {page.url}", flush=True)
-                print(f"{etiqueta} Se capturo getPuntosAtencionServiciosLowcode en absoluto: {'getPuntosAtencionServiciosLowcode' in respuestas_capturadas}", flush=True)
-                try:
-                    print(f"{etiqueta} Texto visible de la pagina (primeros 2000 caracteres):", flush=True)
-                    print(page.inner_text("body")[:2000], flush=True)
-                except Exception as e_txt:
-                    print(f"{etiqueta} No se pudo leer el texto de la pagina: {e_txt}", flush=True)
-                try:
-                    campos_diag = page.evaluate("""() => {
-                        var els = document.querySelectorAll('input, select, textarea');
-                        var resultado = [];
-                        els.forEach(function(el){
-                            resultado.push({
-                                tag: el.tagName, name: el.name || null, id: el.id || null,
-                                value: (el.value || '').substring(0, 40),
-                                visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
-                            });
-                        });
-                        return resultado;
-                    }""")
-                    print(f"{etiqueta} Campos reales (con su valor actual) en este punto:", flush=True)
-                    for c in campos_diag:
-                        print(f"{etiqueta}   {c}", flush=True)
-                except Exception as e_campos:
-                    print(f"{etiqueta} No se pudieron listar los campos: {e_campos}", flush=True)
-                print(f"{etiqueta} === FIN DIAGNOSTICO ===", flush=True)
                 resultado["mensaje"] = "No se encontraron puntos de atención con este trámite."
                 return resultado
 
@@ -1869,41 +1658,13 @@ def envigado_reservar_cita(solicitud):
             print(f"{etiqueta} Sede elegida: {sede_elegida}", flush=True)
 
             # --- Elegir la sede en el <select> real ---
-            # Se selecciona por el TEXTO VISIBLE de la opcion (nombre de
-            # la sede), no por su "value" interno -- se confirmo con
-            # diagnostico real que el <select> de Angular no usa el
-            # idSubsede puro como value.
-            id_subsede_elegida = sede_elegida.get("idSubsede")
-            nombre_sede_elegida = sede_elegida.get("nombreSubsede") or ""
-            seleccionado_ok = False
-            for intento_sede in range(5):
-                try:
-                    page.select_option('#seleccione_punto_atencion', label=nombre_sede_elegida, timeout=2000)
-                    seleccionado_ok = True
-                    break
-                except Exception:
-                    page.wait_for_timeout(500)
-            if not seleccionado_ok:
-                seleccionado_ok = page.evaluate(f"""() => {{
-                    var el = document.querySelector('#seleccione_punto_atencion');
-                    if (!el) return false;
-                    var buscado = {json.dumps(nombre_sede_elegida)}.trim().toLowerCase();
-                    for (var i = 0; i < el.options.length; i++) {{
-                        var texto = (el.options[i].textContent || '').trim().toLowerCase();
-                        if (texto.indexOf(buscado) >= 0 || buscado.indexOf(texto) >= 0) {{
-                            el.selectedIndex = i;
-                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                            return true;
-                        }}
-                    }}
-                    return false;
-                }}""")
-            if seleccionado_ok:
-                page.evaluate("""() => {
-                    var el = document.querySelector('#seleccione_punto_atencion');
-                    if (el) el.dispatchEvent(new Event('change', { bubbles: true }));
-                }""")
-            print(f"{etiqueta} Sede '{nombre_sede_elegida}' (idSubsede={id_subsede_elegida}) -- se pudo seleccionar por texto: {seleccionado_ok}", flush=True)
+            page.evaluate(f"""() => {{
+                var el = document.querySelector('#seleccione_punto_atencion');
+                if (!el) return false;
+                el.value = '{sede_elegida.get("idSubsede")}';
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                return true;
+            }}""")
             page.wait_for_timeout(1500)
 
             for _ in range(10):
@@ -1922,48 +1683,14 @@ def envigado_reservar_cita(solicitud):
 
             # --- Elegir la fecha en el datepicker ---
             respuestas_capturadas.pop("getHorasDisponibles", None)
-
-            # Confirmado por diagnostico real: el sitio usa la libreria
-            # "Air Datepicker" -- cada dia es un <div> con
-            # data-date/data-month/data-year (mes de 0 a 11), y hay que
-            # hacer CLIC en la celda del dia exacto para que se dispare
-            # la consulta de horas disponibles (escribir texto en el
-            # input no basta).
-            dia_num, mes_num, anio_num = fecha_elegida.split("/")
-            mes_datepicker = str(int(mes_num) - 1)  # Air Datepicker usa el mes de 0 a 11
-            dia_datepicker = str(int(dia_num))  # sin cero a la izquierda, ej "19" no "019"
-
-            page.click('#agendarCitaDatePicker', timeout=5000)
-            page.wait_for_timeout(800)
-
-            selector_dia = (
-                f'.datepicker--cell-day[data-date="{dia_datepicker}"]'
-                f'[data-month="{mes_datepicker}"][data-year="{anio_num}"]:not(.-other-month-)'
-            )
-            fecha_click_ok = False
-            try:
-                page.click(selector_dia, timeout=5000)
-                fecha_click_ok = True
-            except Exception as e_click_dia:
-                print(f"{etiqueta} No se pudo hacer clic en la celda del dia ({selector_dia}): {e_click_dia}", flush=True)
-
-            print(f"{etiqueta} Clic en el dia {fecha_elegida} del calendario -- exitoso: {fecha_click_ok}", flush=True)
-
-            # Respaldo (por si la libreria cambia o el selector no
-            # coincide): escribir el texto directamente en el input.
-            if not fecha_click_ok:
-                try:
-                    page.fill('#agendarCitaDatePicker', fecha_elegida, timeout=5000)
-                    page.locator('#agendarCitaDatePicker').press('Tab')
-                except Exception:
-                    page.evaluate(f"""() => {{
-                        var el = document.querySelector('#agendarCitaDatePicker');
-                        if (!el) return false;
-                        el.value = '{fecha_elegida}';
-                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                        return true;
-                    }}""")
+            page.evaluate(f"""() => {{
+                var el = document.querySelector('#agendarCitaDatePicker');
+                if (!el) return false;
+                el.value = '{fecha_elegida}';
+                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                return true;
+            }}""")
             page.wait_for_timeout(1500)
 
             for _ in range(10):
@@ -1973,43 +1700,7 @@ def envigado_reservar_cita(solicitud):
             horas_disponibles = respuestas_capturadas.get("getHorasDisponibles") or []
             print(f"{etiqueta} Horas disponibles para {fecha_elegida}: {horas_disponibles}", flush=True)
             if not horas_disponibles:
-                # Diagnostico enriquecido -- igual que se hizo antes con
-                # la sede, para ver que esta pasando realmente en la
-                # pagina cuando esto falla.
-                print(f"{etiqueta} === DIAGNOSTICO: horas vacias -- revisando estado de la pagina ===", flush=True)
-                try:
-                    valor_datepicker_actual = page.evaluate("""() => {
-                        var el = document.querySelector('#agendarCitaDatePicker');
-                        return el ? el.value : null;
-                    }""")
-                    print(f"{etiqueta} Valor actual del datepicker: {valor_datepicker_actual!r}", flush=True)
-                except Exception:
-                    pass
-                try:
-                    print(f"{etiqueta} Texto visible de la pagina (primeros 2000 caracteres):", flush=True)
-                    print(page.inner_text("body")[:2000], flush=True)
-                except Exception as e_txt:
-                    print(f"{etiqueta} No se pudo leer el texto de la pagina: {e_txt}", flush=True)
-                print(f"{etiqueta} === FIN DIAGNOSTICO ===", flush=True)
                 resultado["mensaje"] = f"No se encontraron horas disponibles para el {fecha_elegida} (puede que el datepicker no haya respondido como se esperaba -- revisar diagnostico)."
-                return resultado
-
-            # 'horas_disponibles' viene AGRUPADA por franja (ej. "7:00 AM
-            # - 12:00 PM", "1:00 PM - 7:00 PM"), cada grupo con su propia
-            # lista interna "horarios" -- se aplanan todos los horarios
-            # individuales de todos los grupos en una sola lista antes de
-            # buscar el mas cercano (si no, min() comparaba los GRUPOS
-            # completos entre si, que no tienen "horaIni" propio, y el
-            # resultado quedaba con idControlCapacidad/idTaquilla/horaIni
-            # vacios).
-            horarios_individuales = []
-            for grupo in horas_disponibles:
-                if isinstance(grupo, dict) and isinstance(grupo.get("horarios"), list):
-                    horarios_individuales.extend(grupo["horarios"])
-                elif isinstance(grupo, dict) and "horaIni" in grupo:
-                    horarios_individuales.append(grupo)  # por si algun dia SI viene plano
-            if not horarios_individuales:
-                resultado["mensaje"] = f"Se encontraron franjas para el {fecha_elegida}, pero ninguna tenia horarios individuales dentro."
                 return resultado
 
             # Se busca la hora mas cercana a la hora aproximada pedida.
@@ -2018,7 +1709,7 @@ def envigado_reservar_cita(solicitud):
             # si no hay coincidencia exacta se toma la mas cercana.
             hora_pedida = int(solicitud["hora_aproximada"])
             mejor_horario = min(
-                horarios_individuales,
+                horas_disponibles,
                 key=lambda h: abs((h.get("horaIni", 0) // 100) - hora_pedida)
             )
             print(f"{etiqueta} Horario elegido (mas cercano a las {hora_pedida}:00): {mejor_horario}", flush=True)
@@ -2036,235 +1727,11 @@ def envigado_reservar_cita(solicitud):
             }}""")
             page.wait_for_timeout(1000)
 
-            # --- Confirmado por pruebas reales que sede/fecha/hora se
-            # eligen bien -- se procede a resolver el reCAPTCHA. Se
-            # SIGUE deteniendo justo antes del envio final (el clic que
-            # si reservaria la cita de verdad), para confirmar primero
-            # que el captcha se acepta correctamente. ---
-            print(f"{etiqueta} Resolviendo reCAPTCHA con 2captcha (puede tardar 15-40 segundos)...", flush=True)
-            try:
-                token_captcha = resolver_recaptcha_2captcha(ENVIGADO_RECAPTCHA_SITEKEY, page.url)
-                print(f"{etiqueta} Token de 2captcha obtenido (primeros 30 caracteres): {token_captcha[:30]}...", flush=True)
-            except Exception as e_captcha:
-                resultado["mensaje"] = f"No se pudo resolver el reCAPTCHA: {e_captcha}"
-                return resultado
-
-            # Se inyecta el token en el textarea estandar de reCAPTCHA v2.
-            # Se confirmo con diagnostico real que el sitio tiene un
-            # <div id="widgetReCaptcha"> vacio -- el widget de Google
-            # nunca termino de renderizarse ahi (posiblemente por el
-            # entorno headless/automatizado). No hace falta el widget
-            # visual para que el formulario acepte la respuesta: si el
-            # textarea "g-recaptcha-response" no existe, se CREA
-            # manualmente dentro de ese div (es exactamente lo que el
-            # script de Google crea normalmente al renderizar), y se le
-            # pone el token ahi.
-            resultado_inyeccion = page.evaluate(f"""() => {{
-                var resultado = {{ textarea_encontrado: false, textarea_creado: false, callback_llamado: false, callback_nombre: null }};
-                var textarea = document.getElementById('g-recaptcha-response');
-                if (!textarea) {{
-                    var contenedor = document.getElementById('widgetReCaptcha') || document.body;
-                    textarea = document.createElement('textarea');
-                    textarea.id = 'g-recaptcha-response';
-                    textarea.name = 'g-recaptcha-response';
-                    textarea.style.width = '250px';
-                    textarea.style.height = '40px';
-                    textarea.style.border = '1px solid #c1c1c1';
-                    textarea.style.margin = '10px 25px';
-                    textarea.style.padding = '0px';
-                    textarea.style.resize = 'none';
-                    textarea.style.display = 'none';
-                    contenedor.appendChild(textarea);
-                    resultado.textarea_creado = true;
-                }}
-                textarea.style.display = 'block';
-                textarea.value = {json.dumps(token_captcha)};
-                textarea.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                textarea.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                resultado.textarea_encontrado = true;
-
-                var widget = document.querySelector('.g-recaptcha[data-callback], div[data-callback]');
-                if (widget) {{
-                    var nombreCallback = widget.getAttribute('data-callback');
-                    resultado.callback_nombre = nombreCallback;
-                    if (nombreCallback && typeof window[nombreCallback] === 'function') {{
-                        window[nombreCallback]({json.dumps(token_captcha)});
-                        resultado.callback_llamado = true;
-                    }}
-                }}
-                return resultado;
-            }}""")
-            print(f"{etiqueta} Resultado de inyectar el token: {resultado_inyeccion}", flush=True)
-
-            # El sitio usa AngularJS (clasico) -- el boton "Confirmar cita"
-            # probablemente esta deshabilitado por una expresion tipo
-            # ng-disabled que Angular solo revisa de nuevo cuando corre su
-            # "digest cycle" (no se entera de cambios hechos por fuera de
-            # su propio framework, como crear un textarea a mano). Se
-            # busca el scope de Angular mas cercano al boton y se le
-            # fuerza un $apply() para que reevalue todas sus condiciones,
-            # incluida la del boton.
-            #
-            # ADEMAS: si la condicion del boton llama directamente a
-            # grecaptcha.getResponse() (la funcion real de Google, en vez
-            # de leer el textarea), esa funcion no sabe nada de nuestro
-            # token porque nunca se llamo grecaptcha.render() de verdad
-            # -- se SOBRESCRIBE esa funcion para que siempre devuelva
-            # nuestro token ya resuelto, sin importar el widget id.
-            resultado_angular = page.evaluate(f"""() => {{
-                var resultado = {{ angular_encontrado: false, apply_ok: false, boton_disabled_despues: null, grecaptcha_sobreescrito: false }};
-
-                if (typeof grecaptcha !== 'undefined') {{
-                    try {{
-                        grecaptcha.getResponse = function(id) {{ return {json.dumps(token_captcha)}; }};
-                        resultado.grecaptcha_sobreescrito = true;
-                    }} catch (e) {{
-                        resultado.error_grecaptcha = String(e);
-                    }}
-                }}
-
-                if (typeof angular === 'undefined') return resultado;
-                resultado.angular_encontrado = true;
-                var boton = document.getElementById('btnGuardarCita');
-                var el = boton || document.querySelector('[ng-app]') || document.body;
-                try {{
-                    var scope = angular.element(el).scope();
-                    if (!scope) {{
-                        // A veces el elemento exacto no tiene scope propio -- se busca hacia arriba.
-                        var actual = el;
-                        while (actual && !scope) {{
-                            scope = angular.element(actual).scope();
-                            actual = actual.parentElement;
-                        }}
-                    }}
-                    if (scope) {{
-                        scope.$apply();
-                        resultado.apply_ok = true;
-                    }}
-                }} catch (e) {{
-                    resultado.error = String(e);
-                }}
-                if (boton) resultado.boton_disabled_despues = boton.disabled;
-                return resultado;
-            }}""")
-            print(f"{etiqueta} Resultado de forzar el digest de Angular: {resultado_angular}", flush=True)
-
-            # El boton sigue deshabilitado a pesar de forzar el digest y
-            # sobrescribir grecaptcha.getResponse -- en vez de seguir
-            # adivinando el mecanismo, se lee DIRECTAMENTE del boton (y
-            # de su scope de Angular) que atributos/variables controlan
-            # su estado, para saber con certeza que falta.
-            diagnostico_boton = page.evaluate("""() => {
-                var boton = document.getElementById('btnGuardarCita');
-                if (!boton) return { error: 'boton no encontrado' };
-                var atributos = {};
-                for (var i = 0; i < boton.attributes.length; i++) {
-                    var a = boton.attributes[i];
-                    atributos[a.name] = a.value;
-                }
-                var resultado = { atributos: atributos };
-                try {
-                    var scope = angular.element(boton).scope();
-                    if (!scope) {
-                        var actual = boton;
-                        while (actual && !scope) {
-                            scope = angular.element(actual).scope();
-                            actual = actual.parentElement;
-                        }
-                    }
-                    if (scope) {
-                        // Se listan las propiedades del scope que parezcan
-                        // relacionadas a captcha, formulario, o validez.
-                        var propsRelevantes = {};
-                        for (var key in scope) {
-                            if (scope.hasOwnProperty(key) && /captcha|valid|form|disable|recaptcha/i.test(key)) {
-                                try { propsRelevantes[key] = JSON.stringify(scope[key]).substring(0, 200); }
-                                catch (e2) { propsRelevantes[key] = '(no se pudo convertir a texto)'; }
-                            }
-                        }
-                        resultado.scope_propiedades_relevantes = propsRelevantes;
-                    }
-                } catch (e) {
-                    resultado.error_scope = String(e);
-                }
-                return resultado;
-            }""")
-            print(f"{etiqueta} Diagnostico directo del boton (atributos y scope): {diagnostico_boton}", flush=True)
-
-            # Confirmado por diagnostico real: el boton usa
-            # ng-disabled="ctrl.isBloquearAgendarCita" -- es una
-            # propiedad del CONTROLADOR (sintaxis "controller as ctrl"),
-            # no del scope raiz directamente. Se pone en false y se
-            # fuerza el digest de nuevo para que Angular actualice el
-            # atributo "disabled" real del boton en el DOM.
-            resultado_forzar_boton = page.evaluate("""() => {
-                var resultado = { ctrl_encontrado: false, valor_anterior: null, valor_nuevo: null, boton_disabled_final: null };
-                var boton = document.getElementById('btnGuardarCita');
-                if (!boton) return resultado;
-                try {
-                    var scope = angular.element(boton).scope();
-                    if (!scope) {
-                        var actual = boton;
-                        while (actual && !scope) {
-                            scope = angular.element(actual).scope();
-                            actual = actual.parentElement;
-                        }
-                    }
-                    if (scope && scope.ctrl) {
-                        resultado.ctrl_encontrado = true;
-                        resultado.valor_anterior = scope.ctrl.isBloquearAgendarCita;
-                        scope.$apply(function() {
-                            scope.ctrl.isBloquearAgendarCita = false;
-                        });
-                        resultado.valor_nuevo = scope.ctrl.isBloquearAgendarCita;
-                    }
-                } catch (e) {
-                    resultado.error = String(e);
-                }
-                resultado.boton_disabled_final = boton.disabled;
-                return resultado;
-            }""")
-            print(f"{etiqueta} Resultado de forzar ctrl.isBloquearAgendarCita a false: {resultado_forzar_boton}", flush=True)
-
-            # Si no se encontro el textarea en la pagina principal, puede
-            # estar dentro de un iframe (asi renderiza normalmente
-            # reCAPTCHA) -- se busca en TODOS los frames de la pagina, y
-            # tambien se lista cualquier elemento relacionado a captcha
-            # (iframe con "recaptcha" en el src, cualquier id/clase que
-            # contenga "captcha") para entender la estructura real.
-            if not resultado_inyeccion.get("textarea_encontrado"):
-                print(f"{etiqueta} === DIAGNOSTICO: buscando captcha en iframes ===", flush=True)
-                try:
-                    todos_los_frames = page.frames
-                    print(f"{etiqueta} Cantidad de frames en la pagina: {len(todos_los_frames)}", flush=True)
-                    for f in todos_los_frames:
-                        print(f"{etiqueta} Frame URL: {f.url}", flush=True)
-                except Exception as e_frames:
-                    print(f"{etiqueta} No se pudieron listar los frames: {e_frames}", flush=True)
-                try:
-                    elementos_captcha = page.evaluate("""() => {
-                        var resultado = [];
-                        document.querySelectorAll('[id*="captcha" i], [class*="captcha" i], iframe').forEach(function(el){
-                            resultado.push({
-                                tag: el.tagName, id: el.id || null, clase: el.className || null,
-                                src: el.src || null,
-                                visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
-                            });
-                        });
-                        return resultado;
-                    }""")
-                    print(f"{etiqueta} Elementos relacionados a captcha/iframes en la pagina principal: {elementos_captcha}", flush=True)
-                except Exception as e_elcap:
-                    print(f"{etiqueta} No se pudieron listar elementos de captcha: {e_elcap}", flush=True)
-                print(f"{etiqueta} === FIN DIAGNOSTICO captcha ===", flush=True)
-
-            page.wait_for_timeout(1500)
-
-            # --- DIAGNOSTICO: se detiene ANTES de confirmar la cita de
-            # verdad -- primero hay que revisar en estos logs que el
-            # captcha se haya aceptado (ej. que no aparezca un mensaje de
-            # error de captcha en la pagina), antes de dar el ultimo paso
-            # que si aparta una cita real. ---
+            # --- DIAGNOSTICO: se detiene ANTES de resolver el reCAPTCHA
+            # y confirmar la cita de verdad -- primero hay que confirmar
+            # que la seleccion de sede/fecha/hora de arriba funciono bien
+            # (revisando estos logs), antes de dar el paso final que si
+            # aparta una cita real. ---
             print(f"{etiqueta} === DIAGNOSTICO: estado antes de confirmar (aun NO se ha reservado nada) ===", flush=True)
             print(f"{etiqueta} idControlCapacidad={id_control_capacidad}, idTaquilla={id_taquilla}, horaIni={hora_ini_valor}, fecha={fecha_elegida}", flush=True)
             try:
@@ -2277,7 +1744,7 @@ def envigado_reservar_cita(solicitud):
                     var resultado = [];
                     botones.forEach(function(b){
                         if (b.offsetWidth || b.offsetHeight || b.getClientRects().length) {
-                            resultado.push({tag: b.tagName, texto: (b.innerText||b.value||'').trim(), id: b.id||null, disabled: !!b.disabled});
+                            resultado.push({tag: b.tagName, texto: (b.innerText||b.value||'').trim(), id: b.id||null});
                         }
                     });
                     return resultado;
@@ -2286,88 +1753,7 @@ def envigado_reservar_cita(solicitud):
             except Exception:
                 pass
 
-            # --- PASO FINAL: clic real en "Confirmar cita" -- esto SI
-            # reserva la cita de verdad. Se captura la respuesta de
-            # agendarCitaGAComponentes (el endpoint real de confirmacion,
-            # ya venia previsto en _capturar_respuesta) para saber si
-            # salio bien y obtener el numero de atencion. ---
-            resultado["capturas"] = {}
-
-            captura_antes = f"{etiqueta.strip('[]')}_1_antes_confirmar.png"
-            try:
-                page.screenshot(path=os.path.join(CAPTURAS_ENVIGADO_DIR, captura_antes), full_page=False, timeout=8000)
-                resultado["capturas"]["antes_confirmar"] = captura_antes
-                print(f"{etiqueta} Captura guardada: {captura_antes}", flush=True)
-            except Exception as e_cap1:
-                print(f"{etiqueta} No se pudo tomar captura antes de confirmar: {e_cap1}", flush=True)
-
-            respuestas_capturadas.pop("agendarCitaGAComponentes", None)
-            print(f"{etiqueta} Haciendo clic en 'Confirmar cita' -- ESTO RESERVA LA CITA DE VERDAD...", flush=True)
-            try:
-                page.click('#btnGuardarCita', timeout=8000)
-            except Exception as e_clic_confirmar:
-                resultado["mensaje"] = f"No se pudo hacer clic en 'Confirmar cita': {e_clic_confirmar}"
-                return resultado
-
-            for _ in range(15):
-                if "agendarCitaGAComponentes" in respuestas_capturadas:
-                    break
-                page.wait_for_timeout(1000)
-
-            respuesta_confirmacion = respuestas_capturadas.get("agendarCitaGAComponentes")
-            print(f"{etiqueta} Respuesta de agendarCitaGAComponentes: {respuesta_confirmacion}", flush=True)
-
-            captura_despues = f"{etiqueta.strip('[]')}_2_despues_confirmar.png"
-            try:
-                page.screenshot(path=os.path.join(CAPTURAS_ENVIGADO_DIR, captura_despues), full_page=False, timeout=8000)
-                resultado["capturas"]["despues_confirmar"] = captura_despues
-                print(f"{etiqueta} Captura guardada: {captura_despues}", flush=True)
-            except Exception as e_cap2:
-                print(f"{etiqueta} No se pudo tomar captura despues de confirmar: {e_cap2}", flush=True)
-
-            try:
-                print(f"{etiqueta} Texto visible de la pagina despues del clic final:", page.inner_text("body")[:2000], flush=True)
-            except Exception:
-                pass
-
-            # Si no se capturo la respuesta esperada, se listan TODAS las
-            # peticiones de red vistas justo despues del clic (por si el
-            # endpoint real de confirmacion tiene otro nombre), y
-            # cualquier mensaje de error visible en la pagina.
-            if not respuesta_confirmacion:
-                print(f"{etiqueta} === DIAGNOSTICO: no se capturo la confirmacion -- revisando alternativas ===", flush=True)
-                print(f"{etiqueta} Todas las respuestas capturadas hasta ahora: {list(respuestas_capturadas.keys())}", flush=True)
-                try:
-                    posibles_errores = page.evaluate("""() => {
-                        var resultado = [];
-                        document.querySelectorAll('[class*="error" i], [class*="alert" i], .toast, .swal2-popup, .modal').forEach(function(el){
-                            if (el.offsetWidth || el.offsetHeight || el.getClientRects().length) {
-                                resultado.push({tag: el.tagName, clase: el.className, texto: (el.innerText||'').trim().substring(0, 300)});
-                            }
-                        });
-                        return resultado;
-                    }""")
-                    print(f"{etiqueta} Elementos de error/alerta/modal visibles: {posibles_errores}", flush=True)
-                except Exception as e_err:
-                    print(f"{etiqueta} No se pudieron listar posibles errores: {e_err}", flush=True)
-                print(f"{etiqueta} === FIN DIAGNOSTICO confirmacion ===", flush=True)
-
-            if respuesta_confirmacion:
-                # La estructura exacta se confirma con el resultado real
-                # -- se buscan las claves mas probables para el numero de
-                # atencion, sin asumir un unico nombre de campo.
-                nro_atencion = None
-                if isinstance(respuesta_confirmacion, dict):
-                    for clave_posible in ("nroAtencion", "numeroAtencion", "nro_atencion", "codigo", "id"):
-                        if respuesta_confirmacion.get(clave_posible):
-                            nro_atencion = respuesta_confirmacion[clave_posible]
-                            break
-                resultado["exito"] = True
-                resultado["nro_atencion"] = nro_atencion
-                resultado["mensaje"] = f"Cita reservada exitosamente para el {fecha_elegida} a las {hora_ini_valor}." + (f" Nro. atencion: {nro_atencion}" if nro_atencion else "")
-                resultado["detalle"] = respuesta_confirmacion
-            else:
-                resultado["mensaje"] = "Se hizo clic en 'Confirmar cita' pero no se pudo confirmar el resultado (revisar diagnostico en los logs y las capturas -- puede que si se haya reservado)."
+            resultado["mensaje"] = "Se detuvo justo antes de confirmar (a proposito) -- revisa el diagnostico en los logs para confirmar que sede/fecha/hora se eligieron bien, y avisa para programar el ultimo paso (captcha + confirmar)."
             return resultado
 
         except Exception as e:
@@ -2382,6 +1768,56 @@ def envigado_reservar_cita(solicitud):
             context.close(); browser.close()
 
 
+
+    """Revisa si hay ALGUN punto de atencion con citas disponibles (una
+    sola peticion, no dia por dia), y guarda el resultado en la base de
+    datos. 'dias_adelante' ya no se usa para hacer mas peticiones -- se
+    deja como parametro por compatibilidad con quien ya llama esta
+    funcion. Devuelve una tupla (resultados, hubo_error):
+    - resultados: lista de {sede, fecha, cantidad_horarios}
+    - hubo_error: True si la consulta fallo por dentro (para NO
+      confundirlo con un "confirmado, sin citas ahora mismo")."""
+    puntos = envigado_hay_puntos_disponibles()
+    if puntos is None:
+        print("Error consultando disponibilidad de citas Envigado (ver logs arriba).", flush=True)
+        return [], True
+
+    resultados = []
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    if isinstance(puntos, list) and len(puntos) > 0:
+        # Aun no conocemos la estructura exacta de una respuesta CON datos
+        # (solo hemos visto la vacia) -- se imprime completa en los logs
+        # para poder revisarla y afinar el formato la primera vez que se
+        # dispare de verdad.
+        print("=== CITAS ENVIGADO: se encontraron puntos disponibles ===", flush=True)
+        print(puntos, flush=True)
+        print("=== FIN ===", flush=True)
+        fecha_hoy = datetime.now().strftime("%d/%m/%Y")
+        resultados.append({
+            "sede": "Ver detalle en logs del servidor",
+            "fecha": fecha_hoy,
+            "cantidad_horarios": len(puntos)
+        })
+        cur.execute("""
+            INSERT INTO envigado_citas_disponibles (sede, id_subsede, fecha_dia, cantidad_horarios, verificado_en)
+            VALUES (%s, %s, %s, %s, NOW())
+            ON CONFLICT (sede, fecha_dia) DO UPDATE SET
+                cantidad_horarios=EXCLUDED.cantidad_horarios, verificado_en=NOW()
+        """, ("Detectado (ver logs)", 0, fecha_hoy, len(puntos)))
+    else:
+        # Sin citas en este momento -- se limpia cualquier resultado
+        # positivo anterior guardado hoy, para no mostrar un aviso viejo
+        # que ya no es cierto.
+        cur.execute("""
+            DELETE FROM envigado_citas_disponibles
+            WHERE verificado_en::date = CURRENT_DATE
+        """)
+
+    conn.commit()
+    cur.close(); conn.close()
+    return resultados, False
 
 
 ENVIGADO_TURNOS_API = "https://gacomponentes.envigado.gov.co/backga/back-ga/turnos/findAtencionesMonitor"
@@ -2744,7 +2180,7 @@ def _programador_automatico_loop():
 threading.Thread(target=_programador_automatico_loop, daemon=True).start()
 
 
-def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_monitor=3, numeros_vigilados=None, placas_por_numero=None):
+def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_monitor=1, numeros_vigilados=None):
     """Revisa el "monitor de turnos" de Envigado cada pocos segundos,
     durante 'duracion_segundos'. Cada vez que aparece un idGestionAtencion
     que no habiamos visto, lo guarda con la hora en que Tramy lo detecto
@@ -2753,15 +2189,11 @@ def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_mo
     Si se indica 'numeros_vigilados' (lista, ej. ["C-89", "G-78"]), en
     cuanto aparezca CUALQUIERA de esos numeros se agrega a
     _envigado_monitoreo_estado['encontrados'] para que el frontend pueda
-    mostrar una alerta destacada (con sonido y vibracion).
-    'placas_por_numero' (dict opcional, ej. {"C-89": "ABC123"}) -- si el
-    usuario indico la placa de esa cita al agregarla a vigilar, se guarda
-    junto con el turno capturado para mostrarla en la alerta."""
+    mostrar una alerta destacada (con sonido y vibracion)."""
     fin = time.time() + duracion_segundos
     ids_vistos = set()
-    hoy_str = datetime.now(TZ_COLOMBIA).strftime("%d/%m/%Y")
+    hoy_str = datetime.now().strftime("%d/%m/%Y")
     numeros_vigilados_norm = set((n or "").strip().upper() for n in (numeros_vigilados or []))
-    placas_por_numero = placas_por_numero or {}
 
     while time.time() < fin:
         if _envigado_monitoreo_estado["detener"]:
@@ -2769,7 +2201,7 @@ def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_mo
         try:
             params = {
                 "idMonitor": id_monitor,
-                "cantidadTurnos": 20,
+                "cantidadTurnos": 10,
                 "fechaInicio": f"{hoy_str} 00:00:00",
                 "fechaFin": f"{hoy_str} 23:59:59",
                 "_": str(int(time.time() * 1000)),
@@ -2787,28 +2219,16 @@ def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_mo
                     ids_vistos.add(idg)
                     nro_norm = (item.get("nroAtencion") or "").strip().upper()
                     es_vigilado = bool(numeros_vigilados_norm and nro_norm in numeros_vigilados_norm)
-                    placa_asociada = placas_por_numero.get(nro_norm, "")
 
                     cur.execute("""
                         INSERT INTO envigado_turnos_llamados
                             (id_gestion_atencion, nro_atencion, nombre_usuario, nombre_taquilla,
-                             nombre_servicio, id_estado, fue_vigilado, placa, detectado_en)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                             nombre_servicio, id_estado, fue_vigilado, detectado_en)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
                         ON CONFLICT (id_gestion_atencion) DO NOTHING
                     """, (idg, item.get("nroAtencion"), item.get("nombreUsuario"),
                           item.get("nombreTaquilla"), item.get("nombreServicio"),
-                          item.get("idEstadoGestionAtencion"), es_vigilado, placa_asociada))
-
-                    if es_vigilado:
-                        cur.execute("""
-                            UPDATE envigado_citas_vigiladas_historial
-                            SET encontrado = TRUE, taquilla = %s, nombre_usuario = %s, detectado_en = NOW()
-                            WHERE id = (
-                                SELECT id FROM envigado_citas_vigiladas_historial
-                                WHERE numero = %s AND encontrado = FALSE AND fecha_cita = CURRENT_DATE
-                                ORDER BY creado_en DESC LIMIT 1
-                            )
-                        """, (item.get("nombreTaquilla"), item.get("nombreUsuario"), nro_norm))
+                          item.get("idEstadoGestionAtencion"), es_vigilado))
                 conn.commit()
                 cur.close(); conn.close()
         except Exception as e:
@@ -2817,22 +2237,6 @@ def _envigado_polling_turnos(duracion_segundos=7200, intervalo_segundos=8, id_mo
 
     _envigado_monitoreo_estado["activo"] = False
     _envigado_monitoreo_estado["detener"] = False
-
-
-def _envigado_polling_turnos_con_espera(espera_segundos, duracion_segundos, **kwargs_polling):
-    """Espera 'espera_segundos' antes de arrancar el monitoreo real -- para
-    poder programar un inicio en el futuro (ej. 5 minutos antes de la
-    hora de una cita), sin necesitar un servicio de tareas programadas
-    aparte. El estado 'activo' ya queda en True desde que se programa
-    (no solo cuando arranca de verdad), para que el boton de iniciar se
-    bloquee de una vez y no se pueda programar dos veces por error."""
-    if espera_segundos > 0:
-        time.sleep(espera_segundos)
-    if _envigado_monitoreo_estado["detener"]:
-        _envigado_monitoreo_estado["activo"] = False
-        _envigado_monitoreo_estado["detener"] = False
-        return
-    _envigado_polling_turnos(duracion_segundos=duracion_segundos, **kwargs_polling)
 
 
 def cache_antioquia_guardar_paz_salvo(placa, avaluo, estado_veh):
@@ -3301,6 +2705,19 @@ def _parsear_resultado_runt_vehiculo(page):
     def campo(nombre):
         return plano_lower.get(nombre.lower(), "")
 
+    def campo_primero_valido(*nombres):
+        """Prueba varios nombres de campo en orden, y devuelve el primero
+        que tenga un valor real (ni vacio ni '0') -- por ejemplo, en el
+        RUNT 'Pasajeros Sentados' trae el dato real (ej. '4'), mientras
+        que 'Capacidad de Pasajeros' casi siempre viene en '0' aunque el
+        vehiculo si tenga capacidad -- sin este orden de prioridad, el
+        '0' se quedaba primero y tapaba el dato bueno."""
+        for nombre in nombres:
+            valor = campo(nombre)
+            if valor and valor.strip() != "0":
+                return valor
+        return ""
+
     datos = {
         "marca": campo("Marca"),
         "linea": campo("Línea"),
@@ -3319,13 +2736,7 @@ def _parsear_resultado_runt_vehiculo(page):
         "puertas": campo("Puertas"),
         "capacidad_carga": campo("Capacidad de Carga"),
         "peso_bruto_vehicular": campo("Peso Bruto Vehicular"),
-        # Son DOS datos reales y distintos en el RUNT (confirmado con un
-        # caso real) -- antes se mezclaban con una logica de "el primero
-        # que no sea 0", pero eso a veces devolvia el dato de UN campo
-        # guardado bajo el nombre del OTRO. Ahora cada uno se lee por su
-        # propia etiqueta exacta, sin adivinar ni mezclar.
-        "capacidad_pasajeros": campo("Capacidad de Pasajeros"),
-        "pasajeros_sentados": campo("Capacidad Pasajeros Sentados") or campo("Pasajeros Sentados"),
+        "capacidad_pasajeros": campo_primero_valido("Capacidad Pasajeros Sentados", "Pasajeros Sentados", "Capacidad Pax Sentados", "Capacidad de Pasajeros"),
         "numero_ejes": campo("Número de Ejes"),
         "estado_vehiculo": campo("Estado del vehículo"),
         "gravamenes_propiedad": campo("Gravámenes a la propiedad").upper() == "SI",
@@ -3501,25 +2912,11 @@ CELDAS_SERVICIO = {
     "PARTICULAR": ("AE29", "AE28"), "PUBLICO": ("AF29", "AF28"), "DIPLOMATICO": ("AG29", "AG28"),
     "OFICIAL": ("AH29", "AH28"), "ESPECIAL": ("AI29", "AI28"), "OTROS": ("AJ29", "AJ28"),
 }
-# Datos del VEHICULO -- confirmado revisando la plantilla que estas
-# coordenadas son IDENTICAS en las 3 hojas de Formulario, asi que este
-# bloque aplica a las 3 por igual.
-CELDAS_REFERENCIA_SIMPLE_VEHICULO = {
+CELDAS_REFERENCIA_SIMPLE = {
     "AJ3": "placa", "W7": "marca", "Z7": "linea", "W10": "color",
-    "AG10": "modelo", "AI10": "cilindrada",
-    # NOTA: "capacidad" (W13) NO va en este diccionario a proposito -- ya
-    # se escribe aparte (ver APPJX_CELDA_CAPACIDAD mas abajo), con una
-    # regla especial que trata "0" como vacio (0 pasajeros no es un dato
-    # real, es la ausencia del dato). Si se agregara aqui tambien, este
-    # bloque genérico volvia a escribir "0" encima de esa correccion.
+    "AG10": "modelo", "AI10": "cilindrada", "W13": "capacidad",
     "AE17": "numero_motor", "W19": "carroceria", "AE19": "numero_chasis",
-    "AE22": "numero_serie", "AE24": "vin", "AC2": "autoridad_transito",
-}
-# Datos de PERSONAS (propietario/comprador) -- estas coordenadas SI son
-# especificas del layout de la hoja BASE (en "(2)"/"(3)" caen en celdas
-# distintas por el espacio de la segunda persona), asi que este bloque
-# solo aplica a la hoja base.
-CELDAS_REFERENCIA_SIMPLE_PERSONAS = {
+    "AE22": "numero_serie", "AE24": "vin",
     "A24": "propietario_primer_apellido", "I24": "propietario_segundo_apellido",
     "P24": "propietario_nombres", "S26": "propietario_documento",
     "A29": "propietario_direccion", "M29": "propietario_ciudad", "S29": "propietario_telefono",
@@ -3528,12 +2925,6 @@ CELDAS_REFERENCIA_SIMPLE_PERSONAS = {
     "A44": "comprador_direccion", "M44": "comprador_ciudad", "S44": "comprador_telefono",
     "AG41": "traslado_municipio",
 }
-# Se mantiene el nombre viejo (union de ambos) por compatibilidad con
-# generar_fun, que SI aplica solo a un unico documento (el FUN clasico,
-# no las hojas de AppJX) y no tiene este problema de coordenadas
-# distintas entre variantes.
-CELDAS_REFERENCIA_SIMPLE = {**CELDAS_REFERENCIA_SIMPLE_VEHICULO, **CELDAS_REFERENCIA_SIMPLE_PERSONAS}
-
 
 
 def _fun_normalizar(texto):
@@ -3728,183 +3119,6 @@ APPJX_CELDA_CAPACIDAD = {
 }
 
 
-# Celdas de TELEFONO en cada documento que dependen de una formula
-# (=EXPORTAR!D14 o similar) que, cuando la celda de origen esta vacia,
-# Excel/LibreOffice la evalua como el NUMERO 0 (asi es como Excel trata
-# SIEMPRE una referencia a una celda vacia, sin importar el formato de
-# la celda que muestra el resultado -- cambiar el numero_format NO
-# alcanza a arreglar esto). La solucion real es escribir el valor de
-# telefono DIRECTO en la celda del documento (no depender de la
-# formula), igual que ya se hace con otros datos fragiles como la linea
-# de empresa o la capacidad. Cada entrada dice que ROL de persona
-# corresponde a esa celda.
-# Casillas de TRAMITE en las 3 variantes de Formulario -- confirmado
-# revisando la plantilla real que la cuadrilla de 18 casillas (filas
-# 7, 9 y 12) es IDENTICA en las 3 hojas (Formulario, Formulario (2),
-# Formulario (3)), asi que un solo mapeo aplica a las tres. Cada entrada
-# tiene DOS celdas (numero + etiqueta) que se pintan de verde juntas.
-# Los 14 tramites "canonicos" -- estos MISMOS nombres se usan en los 3
-# lugares donde se elige un tramite (el catalogo real de Liquidacion se
-# normaliza a estos, y Preparacion + el modulo de documentos de
-# Liquidacion los muestran identicos). Cada uno mapea a su casilla en
-# Formulario cuando existe (algunos, como "CAMBIO DE MOTOR" o
-# "REGRABACION DE SERIE", no tienen casilla propia en la plantilla, asi
-# que simplemente no resaltan nada ahi -- solo aparecen en el texto de
-# Mandato).
-CELDAS_TRAMITE_FORMULARIO = {
-    "MATRICULA INICIAL": ("A7", "B7"),
-    "TRASPASO DE PROPIEDAD": ("E7", "F7"),
-    "TRASLADO DE CUENTA": ("I7", "J7"),
-    "RADICADO DE CUENTA": ("N7", "O7"),
-    "CAMBIO DE COLOR": ("Q7", "R7"),
-    "REGRABACION DE MOTOR": ("A9", "B9"),
-    "REGRABACION DE CHASIS": ("E9", "F9"),
-    "DUPLICADO DE LICENCIA DE TRANSITO": ("N9", "O9"),
-    "INSCRIPCION DE PRENDA": ("Q9", "R9"),
-    "LEVANTAMIENTO DE PRENDA": ("T9", "U9"),
-    "CANCELACION DE CUENTA": ("A12", "B12"),
-    "DUPLICADO DE PLACAS": ("I12", "J12"),
-}
-CELDA_OTROS_TRAMITE_FORMULARIO = ("T12", "U12")
-
-# Celdas de "Tipo de Servicio" (Particular/Publico/Diplomatico) -- a
-# diferencia de la cuadricula de TRAMITES (identica en las 3 hojas), esta
-# seccion SI cambia de posicion entre variantes (confirmado revisando la
-# plantilla real: en "FORMULARIO" el texto esta en la fila 28 y el
-# recuadro que se resalta en las filas 29-30; en "FORMULARIO (2)" todo
-# baja una fila (texto en 29, recuadro en 31-32); en "FORMULARIO (3)" el
-# texto vuelve a la fila 28 pero el recuadro queda en las filas 30-31).
-# Cada entrada son TODAS las celdas que hay que pintar de verde juntas.
-CELDAS_SERVICIO_POR_DOCUMENTO = {
-    "formulario": {
-        "PARTICULAR": ["AE28", "AE29", "AE30"], "PUBLICO": ["AF28", "AF29", "AF30"], "DIPLOMATICO": ["AG29", "AG30"],
-    },
-    "formulario_dos_vendedores": {
-        "PARTICULAR": ["AE29", "AE30", "AE31"], "PUBLICO": ["AF29", "AF30", "AF31"], "DIPLOMATICO": ["AG29", "AG30", "AG31"],
-    },
-    "formulario_dos_compradores": {
-        "PARTICULAR": ["AE28", "AE29", "AE30", "AE31"], "PUBLICO": ["AF28", "AF29", "AF30", "AF31"], "DIPLOMATICO": ["AG28", "AG29", "AG30", "AG31"],
-    },
-}
-
-# Celdas de "Tipo de documento" (C.C / NIT / N.N / Pasaporte / C.Extranj. /
-# T.Identi.) del propietario y del comprador -- SOLO se resaltan C.C y
-# NIT (los demas tipos no se marcan, segun se pidio explicitamente).
-# Confirmado revisando la plantilla real: cada casilla tiene una celda de
-# ETIQUETA (fila de arriba) y, quiza, una celda de CODIGO (fila de abajo,
-# ej. "C"/"N") -- se pintan ambas cuando existen las dos.
-CELDAS_TIPO_DOC_FORMULARIO = {
-    "formulario": {
-        "propietario": {"CC": ["A25", "A26"], "NIT": ["C25", "C26"]},
-        "comprador": {"CC": ["A40", "A41"], "NIT": ["C40", "C41"]},
-    },
-    "formulario_dos_vendedores": {
-        "propietario": {"CC": ["A26", "A27"], "NIT": ["C26", "C27"]},
-        "comprador": {"CC": ["A42", "A43"], "NIT": ["C42", "C43"]},
-    },
-    "formulario_dos_compradores": {
-        "propietario": {"CC": ["A26"], "NIT": ["C26"]},
-        "comprador": {"CC": ["A40", "A41"], "NIT": ["C40", "C41"]},
-    },
-}
-
-# Celda donde se escribe DIRECTO (no por formula) el texto de traslado de
-# cuenta cuando se elige el tramite "TRASLADO MATRICULA / REGISTRO" --
-# cada variante de Formulario tiene esta celda en una fila distinta
-# (confirmado revisando la plantilla real).
-APPJX_CELDA_TRASLADO_TEXTO = {
-    "formulario": "W41",
-    "formulario_dos_vendedores": "W43",
-    "formulario_dos_compradores": "W41",
-}
-
-# Celdas de DIRECCION/CIUDAD/TELEFONO por documento y rol -- se escriben
-# DIRECTO (no por formula) porque una formula que apunta a una celda
-# vacia se evalua como 0 en Excel/LibreOffice, sin importar el formato
-# de la celda de destino (confirmado con casos reales: paso primero con
-# telefono, luego se confirmo que direccion/ciudad tienen el mismo
-# problema en "FORMULARIO (2)"). No se incluye la hoja base "FORMULARIO"
-# aqui porque esa ya tiene su propio manejo (CELDAS_REFERENCIA_SIMPLE_
-# PERSONAS, mas abajo), que ya escribe vacio correctamente.
-APPJX_CELDAS_PERSONA_A_CORREGIR = {
-    "formulario_dos_vendedores": {
-        "propietario": {"direccion": "A30", "ciudad": "M30", "telefono": "S30"},
-        "otro_propietario": {"direccion": "A31", "ciudad": "M31", "telefono": "S31"},
-        "comprador": {"direccion": "A46", "ciudad": "M46", "telefono": "S46"},
-    },
-    "formulario_dos_compradores": {
-        "propietario": {"direccion": "A29", "ciudad": "M29", "telefono": "S29"},
-        "comprador": {"direccion": "A45", "ciudad": "M45", "telefono": "S45"},
-        "otro_comprador": {"direccion": "A44", "ciudad": "M44", "telefono": "S44"},
-    },
-    "compraventa": {
-        "propietario": {"telefono": "B7"},
-        "comprador": {"telefono": "B14"},
-    },
-    "compraventa_dos_vendedores": {
-        "propietario": {"telefono": "B7"},
-        "otro_propietario": {"telefono": "G7"},
-        "comprador": {"telefono": "B14"},
-    },
-    "compraventa_dos_compradores": {
-        "propietario": {"telefono": "B7"},
-        "otro_comprador": {"telefono": "G7"},
-        "comprador": {"telefono": "B14"},
-    },
-    "compraventa_persona_juridica": {
-        "propietario": {"telefono": "B7"},
-        "comprador": {"telefono": "B14"},
-    },
-}
-
-
-import random
-
-# Mismas listas que ya existen en Preparacion (boton "Datos Falsos") --
-# se guardan tambien aqui para poder rellenar automaticamente los datos
-# del propietario cuando falten, al generar un documento desde
-# Liquidacion (que no tiene ese boton en su interfaz).
-TRAMY_PREFIJOS_TELEFONO_FALSO = ["310508", "313205", "301528", "320854", "300633", "323787", "315325", "314458", "333477", "316968"]
-TRAMY_DIRECCIONES_FALSAS = [
-    "Cra 80  # 50 - 52 apto (201)", "Cra 69 # 32 - 25 (401) Palomares",
-    "Calle 34  # 22 - 38 201 Urb calle larga", "Calle 21 # 18 - 26 apto 301",
-    "Diag  77  # 32 - 40 Ed el bosque (501)", "Calle 58 # 70 - 25 granero la palma",
-    "Diag 30  82 - 48 edificio puente verde (908)", "Cl 98a  #65-122",
-    "Calle 50 # 42-54", "Cr 36  #10 B-38", "Calle 81a #52a-60 (piso 4)",
-    "Cra 45 # 42-42 (apto 501)", "Calle 12 # 31-185 edificio la cigala",
-    "Diagonal 49 # 34-92 (urb casa verde casa 18)", "Calle 155b # 8C-22 apto 502",
-    "Carrera 69A #93-20 torre 2 apto 1010", "Carrera 87 N° 46 - 33",
-    "Cra 59 No 36- 56 casa 3", "Calle 54 #85-40 apto 201", "Cr 55 #69-07 esquina apto 501",
-    "Cra 52 # 1-81 la pola", "Calle 51 #49-11 Of. 603", "Transversal 34 A Sur No 32 D -18",
-    "Calle 38 Sur 43-85 Cons. 201", "Carrera 50 A # 33-74", "Calle 18 #58-06",
-    "Calle 39B Sur # 38-9", "Carrera 42 #14-74", "Calle 30A # 79-117",
-    "Calle 78 SUR # 57-83 Local 110", "CRA 65 Nº 43-10", "Carrera 22 # 80 Sur - 32",
-    "Calle 60 sur # 20-16 Diagonal a Andar", "Carrera 43 B #12-157", "Calle 65 # 87 - 59",
-    "Calle 46 N. 54-48 Almacén AYACUCHO", "Cr 42 16 A sur 41 - Mall Aerocentro, local 1",
-]
-
-
-def _rellenar_datos_falsos_si_faltan(persona, municipio_vehiculo):
-    """Si la persona no tiene telefono/direccion/ciudad, se rellenan con
-    datos de prueba (igual que el boton 'Datos Falsos' de Preparacion) --
-    si YA tiene algun dato puesto, ese se respeta y no se toca. Se usa
-    para que los documentos generados desde Liquidacion (que no tiene
-    ese boton) igual salgan completos, ya que las secretarias de
-    transito no reciben documentos con campos en blanco."""
-    if not persona:
-        return persona
-    persona = dict(persona)  # no modificar el original
-    if not persona.get("telefono"):
-        prefijo = random.choice(TRAMY_PREFIJOS_TELEFONO_FALSO)
-        resto = str(random.randint(1000, 9999))
-        persona["telefono"] = prefijo + resto
-    if not persona.get("direccion"):
-        persona["direccion"] = random.choice(TRAMY_DIRECCIONES_FALSAS) + " *"
-    if not persona.get("ciudad") and municipio_vehiculo:
-        persona["ciudad"] = municipio_vehiculo.strip().upper()
-    return persona
-
-
 def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salida_pdf):
     """Genera en PDF cualquiera de los documentos de AppJX.xlsm listados
     en APPJX_DOCUMENTOS, llenando SOLO los datos del vehiculo (placa,
@@ -3914,20 +3128,6 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     if clave_documento not in APPJX_DOCUMENTOS:
         raise ValueError(f"Documento desconocido: {clave_documento}")
     _, nombre_hoja = APPJX_DOCUMENTOS[clave_documento]
-
-    # Si el propietario (vendedor) no tiene telefono/direccion/ciudad, se
-    # rellenan con datos de prueba (igual que el boton "Datos Falsos" de
-    # Preparacion) -- respeta cualquier dato que YA tenga puesto, solo
-    # llena lo que falte. Esto hace que los documentos generados desde
-    # Liquidacion (que no tiene ese boton) tambien salgan completos.
-    # NO se aplica al comprador -- esos datos se ponen a mano cuando se
-    # necesiten, a proposito.
-    _municipio_para_datos_falsos = datos_vehiculo.get("municipio", "")
-    for _rol_relleno in ("propietario", "otro_propietario"):
-        if datos_vehiculo.get(_rol_relleno):
-            datos_vehiculo[_rol_relleno] = _rellenar_datos_falsos_si_faltan(
-                datos_vehiculo[_rol_relleno], _municipio_para_datos_falsos
-            )
 
     wb = _openpyxl.load_workbook(FUN_PLANTILLA, data_only=False, keep_vba=True)
     hoja = wb[nombre_hoja]
@@ -3989,51 +3189,9 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         _hoy = datetime.now()
         hoja["F8"] = f"{_hoy.day}-{_meses_es[_hoy.month - 1]}-{_hoy.year}"
         hoja["F8"].alignment = Alignment(horizontal="center", vertical=hoja["F8"].alignment.vertical)
-
-    # Las 4 hojas de MANDATO tienen varias celdas sin alineacion vertical
-    # definida -- heredan la del tema de la plantilla, que en algunos
-    # casos las deja "pegadas al piso" de una fila mas alta de lo normal,
-    # dando la impresion de que el dato esta en la fila de abajo. Se
-    # centran verticalmente para que siempre se vean en su fila correcta
-    # sin importar la altura.
-    _celdas_alinear_mandato = {
-        "MANDATO": ["C1"],
-        "MANDATO NIT": ["D3"],
-        "MANDATO (2)": ["C1"],
-        "MANDATO (3)": ["C1", "F5"],
-    }.get(nombre_hoja, [])
-    for _celda_alinear in _celdas_alinear_mandato:
-        hoja[_celda_alinear].alignment = Alignment(
-            horizontal=hoja[_celda_alinear].alignment.horizontal,
-            vertical="center", wrap_text=False,
-        )
-
     exportar["D51"] = ""  # traslado_municipio -- vacio explicito, si no la formula '=EXPORTAR!D51' en FORMULARIO muestra "0" (una celda totalmente vacia, sin ni siquiera comillas vacias, se lee como cero en una referencia directa)
     exportar["D24"] = ""  # precio -- la plantilla trae un valor de prueba guardado (9.000.000); se deja vacio para que se llene a mano en el documento impreso
     exportar["D24"].number_format = "General"
-
-    # Tramites seleccionados en Preparacion, conectados con los 4
-    # contratos de MANDATO -- a diferencia de Formulario (que resalta
-    # casillas), aqui cada tramite elegido se escribe como texto, uno por
-    # linea, en EXPORTAR!D47/D48/D49 (la plantilla original ya tenia esta
-    # conexion prevista con esas 3 celdas -- "MANDATO (3)" solo muestra
-    # las primeras 2, las demas variantes muestran las 3). Los nombres
-    # que llegan aqui ya son los 14 nombres "canonicos" (los mismos que
-    # se eligen en Preparacion/Liquidacion), asi que se usan tal cual,
-    # sin necesidad de normalizarlos de nuevo.
-    _tramites_mandato = (datos_vehiculo.get("tramites_seleccionados") or [])[:3]
-    _lineas_mandato = list(_tramites_mandato)
-    exportar["D47"] = _lineas_mandato[0] if len(_lineas_mandato) > 0 else ""
-    exportar["D48"] = _lineas_mandato[1] if len(_lineas_mandato) > 1 else ""
-    exportar["D49"] = _lineas_mandato[2] if len(_lineas_mandato) > 2 else ""
-
-    # "MANDATO (3)" solo tenia 2 lineas conectadas (A14/A15, con formula
-    # a D47/D48) -- A13 estaba vacia y sin usar, pero hay espacio real
-    # ahi para una 3ra linea. Se escribe DIRECTO (no hay formula previa
-    # que reutilizar), copiando la fuente de A14 para que se vea igual.
-    if nombre_hoja == "MANDATO (3)":
-        hoja["A13"].value = _lineas_mandato[2] if len(_lineas_mandato) > 2 else ""
-        hoja["A13"].font = copy.copy(hoja["A14"].font)
 
     # Linea de datos de la empresa (nombre, telefono, correo, etc.) que
     # aparece al pie de cada documento -- se escribe en DATOS!W2 (por si
@@ -4092,34 +3250,6 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     _escribir_bloque_persona(8, con_direccion=True, persona=datos_vehiculo.get("otro_propietario"), columna=7)
     _escribir_bloque_persona(16, con_direccion=True, persona=datos_vehiculo.get("comprador"), columna=4)
     _escribir_bloque_persona(16, con_direccion=True, persona=datos_vehiculo.get("otro_comprador"), columna=7)
-
-    # Se escriben direccion/ciudad/telefono TAMBIEN directo en la celda
-    # del documento (ademas de en EXPORTAR) -- una formula que apunta a
-    # una celda vacia se evalua como 0 en Excel/LibreOffice sin importar
-    # el formato de la celda de destino, asi que la unica forma confiable
-    # de que un dato vacio se vea en blanco es no depender de la formula.
-    for _rol_doc, _campos_doc in APPJX_CELDAS_PERSONA_A_CORREGIR.get(clave_documento, {}).items():
-        _persona_rol_doc = datos_vehiculo.get(_rol_doc) or {}
-        for _campo_doc, _celda_doc in _campos_doc.items():
-            _celda_obj_doc = hoja[_celda_doc]
-            _celda_obj_doc.value = _persona_rol_doc.get(_campo_doc) or ""
-            _celda_obj_doc.number_format = "General"
-
-    # "COMPRA VENTA NIT" -- I9 traia una formula rota (hacia referencia a
-    # una celda de OTRA hoja, "FORMULARIO!P37", que no corresponde a nada
-    # en este documento -- error de copia en la plantilla original). Se
-    # escribe directo el nombre completo del comprador, e I10 (numero de
-    # documento) tambien se escribe directo por seguridad, aunque su
-    # formula original (=B11) si apuntaba al lugar correcto.
-    if clave_documento == "compraventa_persona_juridica":
-        _comprador_nit = datos_vehiculo.get("comprador") or {}
-        _nombre_completo_comprador = " ".join(filter(None, [
-            _comprador_nit.get("nombres"), _comprador_nit.get("apellido"), _comprador_nit.get("segundo_apellido"),
-        ]))
-        hoja["I9"] = _nombre_completo_comprador
-        hoja["I9"].number_format = "General"
-        hoja["I10"] = _comprador_nit.get("numero_documento") or ""
-        hoja["I10"].number_format = "General"
 
     # Las celdas DENTRO del documento (no en EXPORTAR) que muestran estos
     # datos de personas dependen de que LibreOffice recalcule su formula
@@ -4203,25 +3333,15 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     # se limpia CUALQUIER resaltado que pudiera haber (por si la plantilla
     # trae algo marcado de una prueba anterior), y despues se vuelve a
     # aplicar SOLO segun los datos reales de este vehiculo. El resaltado
-    # de TRAMITE (unico, campo "tramite") no aplica todavia (esta
-    # herramienta aun no deja elegir un tramite asi) -- si se agrega mas
-    # adelante, ya queda listo: basta con mandar datos_vehiculo["tramite"].
+    # de TRAMITE no aplica todavia (esta herramienta aun no deja elegir
+    # un tramite) -- si se agrega mas adelante, ya queda listo: basta con
+    # mandar datos_vehiculo["tramite"].
     if nombre_hoja in ("FORMULARIO", "FORMULARIO (2)", "FORMULARIO (3)"):
         sin_relleno = PatternFill(fill_type=None)
-        for mapa_celdas in (CELDAS_TRAMITE, CELDAS_CLASE, CELDAS_COMBUSTIBLE):
+        for mapa_celdas in (CELDAS_TRAMITE, CELDAS_CLASE, CELDAS_COMBUSTIBLE, CELDAS_SERVICIO):
             for celdas in mapa_celdas.values():
                 for celda in celdas:
                     hoja[celda].fill = sin_relleno
-        # El servicio SI cambia de celdas entre variantes -- se limpian
-        # las 3 posibles ubicaciones conocidas para curar cualquier
-        # resto, sin importar cual le corresponde a esta hoja en concreto.
-        for _mapa_serv in CELDAS_SERVICIO_POR_DOCUMENTO.values():
-            for _celdas_serv in _mapa_serv.values():
-                for _celda_serv in _celdas_serv:
-                    try:
-                        hoja[_celda_serv].fill = sin_relleno
-                    except Exception:
-                        pass
         for celda in CELDA_OTROS_TRAMITE:
             hoja[celda].fill = sin_relleno
         hoja["W38"].fill = sin_relleno  # bloque "ESPECIFIQUE LA PALABRA OTRO..." (combinado W38:AK40)
@@ -4237,86 +3357,42 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
                 pass
             hoja[celda_fija].fill = sin_relleno
 
-        # Datos del VEHICULO (placa, marca, VIN, capacidad, etc.) -- estas
-        # coordenadas SI son identicas en las 3 hojas (confirmado
-        # revisando la plantilla), asi que este bloque corre siempre,
-        # para las 3 variantes. Sin esto, un campo vacio (ej. sin VIN)
-        # aparecia como "0" en vez de blanco -- una formula que apunta a
-        # una celda vacia se evalua como 0 en Excel/LibreOffice, sin
-        # importar el formato de la celda que muestra el resultado.
-        for celda, clave in CELDAS_REFERENCIA_SIMPLE_VEHICULO.items():
-            try:
-                hoja[celda] = datos_vehiculo.get(clave) or ""
-            except Exception:
-                pass
+        # CELDAS_REFERENCIA_SIMPLE espera claves "planas" (ej.
+        # "propietario_nombres"), mientras que el resto de esta funcion
+        # recibe los datos de personas como diccionarios (ej.
+        # datos_vehiculo["propietario"] = {"nombres": ..., ...}) -- se
+        # traduce de un formato al otro aqui, solo para FORMULARIO.
+        for _rol, _prefijo in (("propietario", "propietario"), ("comprador", "comprador")):
+            _persona_rol = datos_vehiculo.get(_rol)
+            if _persona_rol:
+                datos_vehiculo[f"{_prefijo}_nombres"] = _persona_rol.get("nombres", "")
+                datos_vehiculo[f"{_prefijo}_primer_apellido"] = _persona_rol.get("apellido", "")
+                datos_vehiculo[f"{_prefijo}_segundo_apellido"] = _persona_rol.get("segundo_apellido", "")
+                datos_vehiculo[f"{_prefijo}_documento"] = _persona_rol.get("numero_documento", "")
+                datos_vehiculo[f"{_prefijo}_direccion"] = _persona_rol.get("direccion", "")
+                datos_vehiculo[f"{_prefijo}_ciudad"] = _persona_rol.get("ciudad", "")
+                datos_vehiculo[f"{_prefijo}_telefono"] = _persona_rol.get("telefono", "")
 
-        # CELDAS_REFERENCIA_SIMPLE_PERSONAS usa coordenadas de celda FIJAS
-        # que solo coinciden con el layout de la hoja BASE "FORMULARIO" --
-        # en "FORMULARIO (2)"/"(3)" esas mismas coordenadas caen en celdas
-        # distintas (por el layout de dos personas), asi que escribir ahi
-        # SOBREESCRIBIA datos de otro campo (esto causaba que el segundo
-        # comprador mostrara los mismos datos que el primero). Se
-        # restringe este bloque a que SOLO corra en la hoja base.
-        if nombre_hoja == "FORMULARIO":
-            # CELDAS_REFERENCIA_SIMPLE_PERSONAS espera claves "planas" (ej.
-            # "propietario_nombres"), mientras que el resto de esta funcion
-            # recibe los datos de personas como diccionarios (ej.
-            # datos_vehiculo["propietario"] = {"nombres": ..., ...}) -- se
-            # traduce de un formato al otro aqui, solo para FORMULARIO.
-            for _rol, _prefijo in (("propietario", "propietario"), ("comprador", "comprador")):
-                _persona_rol = datos_vehiculo.get(_rol)
-                if _persona_rol:
-                    datos_vehiculo[f"{_prefijo}_nombres"] = _persona_rol.get("nombres", "")
-                    datos_vehiculo[f"{_prefijo}_primer_apellido"] = _persona_rol.get("apellido", "")
-                    datos_vehiculo[f"{_prefijo}_segundo_apellido"] = _persona_rol.get("segundo_apellido", "")
-                    datos_vehiculo[f"{_prefijo}_documento"] = _persona_rol.get("numero_documento", "")
-                    datos_vehiculo[f"{_prefijo}_direccion"] = _persona_rol.get("direccion", "")
-                    datos_vehiculo[f"{_prefijo}_ciudad"] = _persona_rol.get("ciudad", "")
-                    datos_vehiculo[f"{_prefijo}_telefono"] = _persona_rol.get("telefono", "")
-
-            # Igual que generar_fun: las celdas de "referencia simple" (que
-            # no son formulas de EXPORTAR, sino texto/numero directo, como
-            # documento/telefono del propietario y comprador) tambien deben
-            # quedar en blanco cuando no hay ese dato -- si no, algunas
-            # aparecen como "0" en vez de vacio.
-            for celda, clave in CELDAS_REFERENCIA_SIMPLE_PERSONAS.items():
-                if datos_vehiculo.get(clave):
-                    try:
-                        hoja[celda] = datos_vehiculo[clave]
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        hoja[celda] = ""
-                    except Exception:
-                        pass
-
+        # Igual que generar_fun: las celdas de "referencia simple" (que
+        # no son formulas de EXPORTAR, sino texto/numero directo, como
+        # documento/telefono del propietario y comprador) tambien deben
+        # quedar en blanco cuando no hay ese dato -- si no, algunas
+        # aparecen como "0" en vez de vacio.
+        for celda, clave in CELDAS_REFERENCIA_SIMPLE.items():
+            if datos_vehiculo.get(clave):
+                try:
+                    hoja[celda] = datos_vehiculo[clave]
+                except Exception:
+                    pass
+            else:
+                try:
+                    hoja[celda] = ""
+                except Exception:
+                    pass
 
         _fun_marcar_checkboxes(hoja, CELDAS_CLASE, datos_vehiculo.get("clase", ""))
         _fun_marcar_checkboxes(hoja, CELDAS_COMBUSTIBLE, datos_vehiculo.get("combustible", ""))
-
-        # Servicio -- usa el mapeo especifico de ESTE documento (las
-        # celdas cambian de posicion entre variantes, a diferencia de
-        # clase/combustible que si son iguales en las 3).
-        _servicio_normalizado = _fun_normalizar(datos_vehiculo.get("servicio", ""))
-        _mapa_servicio_doc = CELDAS_SERVICIO_POR_DOCUMENTO.get(clave_documento, {})
-        for _etiqueta_serv, _celdas_serv in _mapa_servicio_doc.items():
-            if _fun_coincide(datos_vehiculo.get("servicio", ""), _etiqueta_serv):
-                for _celda_serv in _celdas_serv:
-                    hoja[_celda_serv].fill = VERDE_MARCA
-
-        # Tipo de documento (C.C / NIT) del propietario y del comprador --
-        # solo se resalta si es exactamente uno de esos dos tipos (los
-        # demas, como Pasaporte o T.I., no se marcan).
-        _mapa_tipodoc_doc = CELDAS_TIPO_DOC_FORMULARIO.get(clave_documento, {})
-        for _rol_td, _opciones_td in _mapa_tipodoc_doc.items():
-            _persona_td = datos_vehiculo.get(_rol_td) or {}
-            _tipo_doc_persona = (_persona_td.get("tipo_documento") or "").strip().upper()
-            _celdas_td = _opciones_td.get(_tipo_doc_persona)
-            if _celdas_td:
-                for _celda_td in _celdas_td:
-                    hoja[_celda_td].fill = VERDE_MARCA
-
+        _fun_marcar_checkboxes(hoja, CELDAS_SERVICIO, datos_vehiculo.get("servicio", ""))
         if datos_vehiculo.get("tramite"):
             _fun_marcar_checkboxes(hoja, CELDAS_TRAMITE, datos_vehiculo["tramite"])
             if "TRASLADO" in _fun_normalizar(datos_vehiculo["tramite"]):
@@ -4354,46 +3430,6 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     else:
         hoja.sheet_properties.pageSetUpPr.fitToPage = True
     wb.active = wb.sheetnames.index(nombre_hoja)
-
-    # Resaltado de tramites (solo aplica a las 3 variantes de
-    # Formulario -- son las unicas que tienen esta cuadricula de
-    # casillas). Se normaliza el texto (mayusculas, espacios multiples
-    # colapsados) para que coincida sin importar variaciones pequeñas de
-    # como se escribio en el modulo de tramites.
-    if clave_documento in APPJX_CELDA_TRASLADO_TEXTO:
-        tramites_elegidos = datos_vehiculo.get("tramites_seleccionados") or []
-        for tramite_texto in tramites_elegidos:
-            tramite_normalizado = re.sub(r"\s+", " ", (tramite_texto or "").strip().upper())
-            if tramite_normalizado == "OTROS":
-                celdas_marcar = [CELDA_OTROS_TRAMITE_FORMULARIO]
-            else:
-                # Se busca por coincidencia normalizada contra las claves
-                # del mapeo (tambien normalizadas), en vez de exigir un
-                # match exacto de texto.
-                celdas_marcar = []
-                for clave_mapa, celdas in CELDAS_TRAMITE_FORMULARIO.items():
-                    if re.sub(r"\s+", " ", clave_mapa.strip().upper()) == tramite_normalizado:
-                        celdas_marcar = [celdas]
-                        break
-            for celda_num, celda_etq in celdas_marcar:
-                hoja[celda_num].fill = VERDE_MARCA
-                hoja[celda_etq].fill = VERDE_MARCA
-
-            # Caso especial: "TRASLADO MATRICULA / REGISTRO" ademas
-            # escribe el texto DIRECTO (no por formula) en la celda de
-            # abajo del parrafo "ESPECIFIQUE LA PALABRA OTRO..." -- igual
-            # que con el telefono, una formula que depende de una celda
-            # vacia puede fallar al convertir a PDF, asi que se escribe
-            # el valor ya armado. Usa el MUNICIPIO DE DESTINO elegido a
-            # mano en el frontend (no el municipio del vehiculo -- ese es
-            # de donde SALE el tramite, no hacia donde se traslada).
-            if tramite_normalizado == "TRASLADO DE CUENTA":
-                celda_traslado = APPJX_CELDA_TRASLADO_TEXTO[clave_documento]
-                municipio_destino = (datos_vehiculo.get("traslado_municipio_destino") or "").strip()
-                celda_obj = hoja[celda_traslado]
-                celda_obj.value = f"Traslado de Cuenta hacia la secretaria de transito de {municipio_destino}".strip()
-                celda_obj.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-                celda_obj.fill = VERDE_MARCA
 
     id_temp = str(uuid.uuid4())[:8]
     ruta_xlsm_temp = f"/tmp/_appjxdoc_{id_temp}.xlsm"
@@ -4800,26 +3836,11 @@ def generar_estado_cuenta_pdf(datos, ruta_salida_pdf):
     # texto "El suscrito funcionario..." con el logo justo debajo -- se
     # revierte, la altura original ya tenia un espacio aceptable.
 
-    # "Avaluo para la vigencia" -- CORREGIDO: se usa el avaluo de la
-    # declaracion MAS RECIENTE (la de mayor vigencia dentro de la tabla
-    # de declaraciones), no estadoCuenta.avaluoComercial -- se confirmo
-    # con un caso real que ese campo general de la Gobernacion puede
-    # traer un valor distinto (de otra referencia) al que realmente
-    # aparece declarado para el año en curso en la propia tabla de este
-    # mismo documento.
-    avaluo_vigencia_actual = None
-    mejor_vigencia_pdf = -1
-    for d in declaraciones:
-        try:
-            vig_d = int(d.get("vigencia", 0) or 0)
-        except (TypeError, ValueError):
-            continue
-        if vig_d > mejor_vigencia_pdf:
-            mejor_vigencia_pdf = vig_d
-            avaluo_vigencia_actual = d.get("avaluoComercial", 0)
-    if not avaluo_vigencia_actual:
-        avaluo_vigencia_actual = estado_veh.get("avaluoComercial", 0)  # respaldo si no hay declaraciones
-    edc["AE76"] = _moneda_pys(avaluo_vigencia_actual)
+    # "Avaluo para la vigencia" -- se usa directamente el avaluo de la
+    # vigencia actual (viene ya calculado en estadoCuenta), en vez de
+    # depender de la formula original (que buscaba la ultima fila de la
+    # tabla y se rompe si borramos filas despues).
+    edc["AE76"] = _moneda_pys(estado_veh.get("avaluoComercial", 0))
 
     # Ocultar las filas vacias sobrantes de ambas tablas (no todas las
     # placas tienen 30 declaraciones ni observaciones). Se OCULTAN en vez
@@ -5708,41 +4729,6 @@ def _antioquia_descargar_pdf_liquidacion(session, formulario_liquidacion):
     return base64.b64decode(archivo_b64)
 
 
-def _extraer_nombre_apellidos_declaracion(pdf_bytes):
-    """Extrae el NOMBRE (C.1) y los APELLIDOS (C.3) directamente del texto
-    del PDF de la Declaracion Sugerida -- estos son los datos OFICIALES
-    que la Gobernacion tiene registrados para el propietario (confirmado
-    con la ficha de seguridad que responde el propio sistema de la
-    Gobernacion), asi que son mas confiables que cualquier nombre que el
-    usuario haya escrito a mano. Se usan para que la Declaracion Manual
-    quede con el mismo nombre exacto que la Declaracion Sugerida.
-
-    El orden de extraccion de pypdf para este PDF en particular pone el
-    valor de "C.1 NOMBRE..." ANTES de su propia etiqueta, y el valor de
-    "C.3 APELLIDOS" DESPUES de su etiqueta (confirmado con un PDF real) --
-    por eso se buscan con patrones distintos para cada uno.
-    Si no los encuentra (formato distinto), se devuelven vacios -- el
-    llamador debe usar como respaldo lo que el usuario haya escrito."""
-    try:
-        import io, re
-        from pypdf import PdfReader
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        texto = ""
-        for pagina in reader.pages:
-            texto += (pagina.extract_text() or "") + "\n"
-
-        match_nombres = re.search(r'^([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s]*)$\nC\.1\s+NOMBRE', texto, re.MULTILINE)
-        nombres = match_nombres.group(1).strip() if match_nombres else ""
-
-        match_apellidos = re.search(r'C\.3\s+APELLIDOS\s*\n?\s*([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s]*?)\s+\d', texto)
-        apellidos = match_apellidos.group(1).strip() if match_apellidos else ""
-
-        return {"nombres": nombres, "apellidos": apellidos}
-    except Exception as e:
-        print(f"No se pudo extraer nombre/apellidos del PDF de declaracion: {e}", flush=True)
-    return {"nombres": "", "apellidos": ""}
-
-
 def _extraer_caja_traccion_declaracion(pdf_bytes):
     """Extrae 'Caja' (transmision) y 'Traccion' directamente del texto del
     PDF de la Declaracion Sugerida -- la Gobernacion los incluye ahi
@@ -5994,7 +4980,7 @@ def antioquia_generar_todas_declaraciones(placa, identificacion, tipo_documento_
                 f.write(pdf_bytes)
 
             url = subir_a_r2(ruta, f"declaraciones/{placa}_{vigencia}_{id_unico}.pdf",
-                              nombre_descarga=f"Declaracion_Sugerida_{placa}_{vigencia}.pdf")
+                              nombre_descarga=f"Declaracion_{placa}_{vigencia}.pdf")
             os.remove(ruta)
 
             # Se extrae caja/traccion (y se guarda la liquidacion completa)
@@ -6059,12 +5045,7 @@ def consultar_antioquia(page, placa, identificacion, tipo_documento_abrev,
 
     estado_veh          = data3.get("estadoCuenta", {})
     vigencias_adeudadas = data3.get("listaVigenciasAdeudas", [])
-    # Se usa el avaluo de la DECLARACION MAS RECIENTE (ej. la de 2026),
-    # no el campo general estadoCuenta.avaluoComercial -- se confirmo con
-    # un caso real que ese campo general puede traer un valor distinto
-    # (mas viejo o de otra referencia) al avaluo que realmente aparece
-    # declarado para el año en curso.
-    avaluo              = _avaluo_declaracion_mas_reciente(data3)
+    avaluo              = estado_veh.get("avaluoComercial", 0) or 0
     print(f"  → Vigencias adeudadas encontradas: {len(vigencias_adeudadas)}")
     if job_id:
         if not vigencias_adeudadas:
@@ -6184,7 +5165,7 @@ def consultar_antioquia(page, placa, identificacion, tipo_documento_abrev,
                                     f_pdf.write(pdf_bytes_vig)
                                 url_pdf_vig = subir_a_r2(
                                     ruta_pdf_vig, f"declaraciones/{placa}_{anio}_{id_unico_vig}.pdf",
-                                    nombre_descarga=f"Declaracion_Sugerida_{placa}_{anio}.pdf"
+                                    nombre_descarga=f"Declaracion_{placa}_{anio}.pdf"
                                 )
                                 os.remove(ruta_pdf_vig)
 
@@ -6752,11 +5733,7 @@ def consultar_antioquia_vigencias():
             )
             estado_veh          = data3.get("estadoCuenta", {})
             vigencias_adeudadas = data3.get("listaVigenciasAdeudas", [])
-            # Se usa el avaluo de la DECLARACION MAS RECIENTE, no el campo
-            # general estadoCuenta.avaluoComercial (ver comentario en
-            # _avaluo_declaracion_mas_reciente para el detalle del caso
-            # real que confirmo esta discrepancia).
-            avaluo              = _avaluo_declaracion_mas_reciente(data3)
+            avaluo              = estado_veh.get("avaluoComercial", 0) or 0
             resultado['vigencias']  = vigencias_adeudadas
             resultado['avaluo']     = avaluo
             resultado['estado_veh'] = estado_veh
@@ -6884,18 +5861,14 @@ def consultar_runt_vehiculo_endpoint():
 
 def guardar_mi_consulta(user_id, placa, cedula):
     """Registra que este usuario en particular consulto esta placa (y
-    cedula), para el historial personal de 'Mis vehiculos consultados'.
-    La restriccion unica es solo (user_id, placa) -- si la cedula viene
-    distinta a una consulta anterior de esa misma placa (ej. por
-    diferencias de formato), se ACTUALIZA la fila existente en vez de
-    crear una copia nueva."""
+    cedula), para el historial personal de 'Mis vehiculos consultados'."""
     try:
         conn = get_db_conn()
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO mis_consultas (user_id, placa, cedula, actualizado_en)
             VALUES (%s, %s, %s, NOW())
-            ON CONFLICT (user_id, placa) DO UPDATE SET cedula = EXCLUDED.cedula, actualizado_en = NOW()
+            ON CONFLICT (user_id, placa, cedula) DO UPDATE SET actualizado_en = NOW()
         """, (user_id, placa, cedula))
         conn.commit()
         cur.close(); conn.close()
@@ -6984,13 +5957,6 @@ def combinar_pdfs_endpoint():
     datos = request.get_json(silent=True) or {}
     urls = datos.get("urls", [])
     placa = (datos.get("placa") or "declaraciones").upper().strip()
-    # El nombre de archivo es configurable -- este endpoint se reutiliza
-    # tanto para combinar Declaraciones Sugeridas (su uso original) como
-    # para los combos de documentos de Preparacion/Liquidacion (Combo
-    # Traspaso, Combo FUN-Mandato, etc.), que necesitan su propio nombre
-    # en vez de que todo diga "Declaracion".
-    nombre_archivo = (datos.get("nombre_archivo") or "Declaracion_Sugerida").strip()
-    nombre_archivo = re.sub(r"[^\w\s-]", "", nombre_archivo).replace(" ", "_")
 
     if not urls or len(urls) < 2:
         return jsonify({"error": "Se necesitan al menos 2 URLs para combinar"}), 400
@@ -7015,7 +5981,7 @@ def combinar_pdfs_endpoint():
         writer.close()
 
         url_final = subir_a_r2(ruta_combinado, f"declaraciones/combinado_{placa}_{id_unico}.pdf",
-                                nombre_descarga=f"{nombre_archivo}_{placa}_combinado.pdf")
+                                nombre_descarga=f"Declaracion_{placa}_combinado.pdf")
         os.remove(ruta_combinado)
         for ruta in rutas_temp:
             os.remove(ruta)
@@ -7177,7 +6143,6 @@ def generar_declaracion_manual_endpoint():
                                         datos_parciales=resultados)
                         data_vig = cache["datos"]
                         caja_traccion = {"caja": data_vig.get("caja", ""), "traccion": data_vig.get("traccion", "")}
-                        nombre_real = {"nombres": data_vig.get("nombres_reales", ""), "apellidos": data_vig.get("apellidos_reales", "")}
                     else:
                         job_actualizar(job_id, f"Vigencia {vigencia}: consultando en la Gobernación (puede tardar por el captcha)...",
                                         datos_parciales=resultados)
@@ -7189,13 +6154,6 @@ def generar_declaracion_manual_endpoint():
                             departamento_cod=departamento_cod
                         )
                         caja_traccion = _extraer_caja_traccion_declaracion(pdf_sugerida_bytes)
-                        # Nombre y apellidos OFICIALES, tal como los tiene
-                        # registrados la Gobernacion (leidos del mismo PDF
-                        # de la Declaracion Sugerida) -- para que la
-                        # Declaracion Manual quede con el mismo nombre
-                        # exacto, sin depender de lo que se haya escrito
-                        # a mano en Tramy.
-                        nombre_real = _extraer_nombre_apellidos_declaracion(pdf_sugerida_bytes)
 
                         # Se guarda en cache SOLO si ya existia una entrada
                         # con PDF real generado antes (para no crear una
@@ -7206,21 +6164,12 @@ def generar_declaracion_manual_endpoint():
                             datos_extra = dict(data_vig or {})
                             datos_extra["caja"] = caja_traccion.get("caja", "")
                             datos_extra["traccion"] = caja_traccion.get("traccion", "")
-                            datos_extra["nombres_reales"] = nombre_real.get("nombres", "")
-                            datos_extra["apellidos_reales"] = nombre_real.get("apellidos", "")
                             _cache_declaracion_guardar(placa, vigencia, cache["url"], datos_extra=datos_extra)
-
-                    # Si la extraccion del PDF no encontro nada (formato
-                    # distinto, PDF fallo, etc.), se usa como respaldo lo
-                    # que el usuario haya escrito a mano -- para no dejar
-                    # el documento sin nombre en ese caso.
-                    nombres_para_pdf = nombre_real.get("nombres") or nombres_propietario
-                    apellidos_para_pdf = nombre_real.get("apellidos") or apellidos_propietario
 
                     datos = {
                         "vigencia": vigencia,
-                        "nombre_completo": nombres_para_pdf,
-                        "apellidos": apellidos_para_pdf,
+                        "nombre_completo": nombres_propietario,
+                        "apellidos": apellidos_propietario,
                         "celular": celular,
                         "telefono": telefono_fijo,
                         "email": email,
@@ -7379,13 +6328,9 @@ def personas_guardar_endpoint():
             ON CONFLICT (numero_documento) DO UPDATE SET
                 nombres = EXCLUDED.nombres, apellido = EXCLUDED.apellido,
                 segundo_apellido = EXCLUDED.segundo_apellido, tipo_documento = EXCLUDED.tipo_documento,
-                telefono = CASE WHEN EXCLUDED.telefono <> '' THEN EXCLUDED.telefono ELSE personas.telefono END,
-                direccion = CASE WHEN EXCLUDED.direccion <> '' THEN EXCLUDED.direccion ELSE personas.direccion END,
-                barrio_info = CASE WHEN EXCLUDED.barrio_info <> '' THEN EXCLUDED.barrio_info ELSE personas.barrio_info END,
-                ciudad = CASE WHEN EXCLUDED.ciudad <> '' THEN EXCLUDED.ciudad ELSE personas.ciudad END,
-                email = CASE WHEN EXCLUDED.email <> '' THEN EXCLUDED.email ELSE personas.email END,
-                notas = CASE WHEN EXCLUDED.notas <> '' THEN EXCLUDED.notas ELSE personas.notas END,
-                actualizado_en = NOW()
+                telefono = EXCLUDED.telefono, direccion = EXCLUDED.direccion,
+                barrio_info = EXCLUDED.barrio_info, ciudad = EXCLUDED.ciudad,
+                email = EXCLUDED.email, notas = EXCLUDED.notas, actualizado_en = NOW()
             RETURNING id
         """, (
             nombres.upper(), (datos.get("apellido") or "").strip().upper(),
@@ -7399,148 +6344,6 @@ def personas_guardar_endpoint():
         conn.commit()
         cur.close(); conn.close()
         return jsonify({"ok": True, "id": persona_id})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/personas-listar", methods=["GET"])
-def personas_listar_endpoint():
-    """Lista personas paginadas, con busqueda opcional -- para la tabla
-    de gestion (ver/eliminar) en el panel de configuracion."""
-    consulta = request.args.get("q", "").strip()
-    pagina = max(int(request.args.get("pagina", 1) or 1), 1)
-    por_pagina = 30
-    offset = (pagina - 1) * por_pagina
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        if consulta:
-            patron = f"%{consulta}%"
-            cur.execute("""
-                SELECT id, nombres, apellido, segundo_apellido, tipo_documento, numero_documento,
-                       telefono, direccion, barrio_info, ciudad, email
-                FROM personas
-                WHERE numero_documento ILIKE %s OR nombres ILIKE %s OR apellido ILIKE %s
-                ORDER BY nombres ASC LIMIT %s OFFSET %s
-            """, (patron, patron, patron, por_pagina, offset))
-            filas = cur.fetchall()
-            cur.execute("""
-                SELECT COUNT(*) FROM personas
-                WHERE numero_documento ILIKE %s OR nombres ILIKE %s OR apellido ILIKE %s
-            """, (patron, patron, patron))
-            total = cur.fetchone()[0]
-        else:
-            cur.execute("""
-                SELECT id, nombres, apellido, segundo_apellido, tipo_documento, numero_documento,
-                       telefono, direccion, barrio_info, ciudad, email
-                FROM personas ORDER BY nombres ASC LIMIT %s OFFSET %s
-            """, (por_pagina, offset))
-            filas = cur.fetchall()
-            cur.execute("SELECT COUNT(*) FROM personas")
-            total = cur.fetchone()[0]
-        cur.close(); conn.close()
-        personas = [{
-            "id": f[0], "nombres": f[1], "apellido": f[2], "segundo_apellido": f[3],
-            "tipo_documento": f[4], "numero_documento": f[5], "telefono": f[6],
-            "direccion": f[7], "barrio_info": f[8], "ciudad": f[9], "email": f[10],
-        } for f in filas]
-        return jsonify({"ok": True, "personas": personas, "total": total, "pagina": pagina, "por_pagina": por_pagina})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/personas-eliminar", methods=["POST"])
-def personas_eliminar_endpoint():
-    """Elimina una persona por su id."""
-    datos = request.get_json(silent=True) or {}
-    persona_id = datos.get("id")
-    if not persona_id:
-        return jsonify({"ok": False, "error": "Falta el id de la persona."}), 400
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM personas WHERE id = %s", (persona_id,))
-        eliminada = cur.rowcount > 0
-        conn.commit()
-        cur.close(); conn.close()
-        if not eliminada:
-            return jsonify({"ok": False, "error": "No se encontró esa persona."}), 404
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/liquidaciones-guardar", methods=["POST"])
-def liquidaciones_guardar_endpoint():
-    """Guarda una liquidacion en el historial -- se llama justo cuando el
-    usuario da clic en 'Enviar por WhatsApp', con fecha/hora automatica."""
-    datos = request.get_json(silent=True) or {}
-    placa = (datos.get("placa") or "").strip().upper()
-    texto_whatsapp = datos.get("texto_whatsapp") or ""
-    if not placa or not texto_whatsapp:
-        return jsonify({"ok": False, "error": "Faltan placa o texto_whatsapp."}), 400
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO liquidaciones_historial
-                (placa, municipio, marca, linea, tipo_cliente, tramites, total, texto_whatsapp)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id
-        """, (
-            placa, (datos.get("municipio") or "").strip(),
-            (datos.get("marca") or "").strip(), (datos.get("linea") or "").strip(),
-            (datos.get("tipo_cliente") or "").strip(), (datos.get("tramites") or "").strip(),
-            datos.get("total") or 0, texto_whatsapp,
-        ))
-        liquidacion_id = cur.fetchone()[0]
-        conn.commit()
-        cur.close(); conn.close()
-        return jsonify({"ok": True, "id": liquidacion_id})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/liquidaciones-buscar", methods=["GET"])
-def liquidaciones_buscar_endpoint():
-    """Busca liquidaciones guardadas, principalmente por placa (tambien
-    acepta buscar por municipio o tramite). Paginado de 20 en 20."""
-    consulta = request.args.get("q", "").strip()
-    pagina = max(int(request.args.get("pagina", 1) or 1), 1)
-    por_pagina = 20
-    offset = (pagina - 1) * por_pagina
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        if consulta:
-            patron = f"%{consulta}%"
-            cur.execute("""
-                SELECT id, placa, municipio, marca, linea, tipo_cliente, tramites, total, texto_whatsapp, creado_en
-                FROM liquidaciones_historial
-                WHERE placa ILIKE %s OR municipio ILIKE %s OR tramites ILIKE %s
-                ORDER BY creado_en DESC LIMIT %s OFFSET %s
-            """, (patron, patron, patron, por_pagina, offset))
-            filas = cur.fetchall()
-            cur.execute("""
-                SELECT COUNT(*) FROM liquidaciones_historial
-                WHERE placa ILIKE %s OR municipio ILIKE %s OR tramites ILIKE %s
-            """, (patron, patron, patron))
-            total_filas = cur.fetchone()[0]
-        else:
-            cur.execute("""
-                SELECT id, placa, municipio, marca, linea, tipo_cliente, tramites, total, texto_whatsapp, creado_en
-                FROM liquidaciones_historial ORDER BY creado_en DESC LIMIT %s OFFSET %s
-            """, (por_pagina, offset))
-            filas = cur.fetchall()
-            cur.execute("SELECT COUNT(*) FROM liquidaciones_historial")
-            total_filas = cur.fetchone()[0]
-        cur.close(); conn.close()
-        liquidaciones = [{
-            "id": f[0], "placa": f[1], "municipio": f[2], "marca": f[3], "linea": f[4],
-            "tipo_cliente": f[5], "tramites": f[6], "total": float(f[7]) if f[7] is not None else 0,
-            "texto_whatsapp": f[8], "creado_en": f[9].isoformat() + "Z",
-        } for f in filas]
-        return jsonify({"ok": True, "liquidaciones": liquidaciones, "total": total_filas, "pagina": pagina, "por_pagina": por_pagina})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -7727,21 +6530,6 @@ def envigado_citas_solicitud_probar_ahora_endpoint():
     return jsonify({"job_id": job_id})
 
 
-@app.route("/envigado-captura", methods=["GET"])
-def envigado_captura_endpoint():
-    """Sirve una captura de pantalla guardada por el flujo de reserva de
-    citas de Envigado (para descargar o ver en el navegador)."""
-    nombre_archivo = request.args.get("nombre", "")
-    # Se valida que sea solo un nombre de archivo simple (sin rutas), para
-    # que no se pueda pedir ningun otro archivo del servidor con esto.
-    if not nombre_archivo or "/" in nombre_archivo or ".." in nombre_archivo:
-        return jsonify({"ok": False, "error": "Nombre de archivo inválido."}), 400
-    ruta_completa = os.path.join(CAPTURAS_ENVIGADO_DIR, nombre_archivo)
-    if not os.path.isfile(ruta_completa):
-        return jsonify({"ok": False, "error": "No se encontró esa captura (puede que el servidor se haya reiniciado desde entonces)."}), 404
-    return send_file(ruta_completa, mimetype="image/png")
-
-
 @app.route("/envigado-citas-disponibles", methods=["GET"])
 def envigado_citas_disponibles_endpoint():
     """Revisa en vivo las dos sedes de Envigado (Vegas y City Plaza) para
@@ -7923,35 +6711,6 @@ def diagnostico_proxy_iproyal_endpoint():
         resultado = subprocess.run(
             ["curl", "-v", "--proxy", proxy_url, "--max-time", "30",
              "https://www.medellin.gov.co/portal-movilidad/index.html"],
-            capture_output=True, text=True, timeout=35
-        )
-        return jsonify({
-            "ok": True,
-            "codigo_salida": resultado.returncode,
-            "salida_estandar": resultado.stdout[-2000:],
-            "salida_error_detallada": resultado.stderr[-4000:],
-        })
-    except subprocess.TimeoutExpired:
-        return jsonify({"ok": False, "error": "Timeout -- el comando tardo mas de 35 segundos sin responder."}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/diagnostico-proxy-dataimpulse", methods=["GET"])
-def diagnostico_proxy_dataimpulse_endpoint():
-    """Endpoint de diagnostico -- prueba la conexion real del proxy de
-    DataImpulse contra el sitio de citas de Envigado, directo desde el
-    servidor de Railway (sin pasar por Playwright), para confirmar que
-    las credenciales funcionan y que el sitio .gov no esta bloqueado
-    antes de depender del proxy en el flujo completo de citas."""
-    if not (DATAIMPULSE_USER and DATAIMPULSE_PASS):
-        return jsonify({"error": "Faltan las credenciales de DataImpulse en las variables de entorno (DATAIMPULSE_USER/DATAIMPULSE_PASS)."}), 400
-
-    proxy_url = f"http://{DATAIMPULSE_USER}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{DATAIMPULSE_PORT}"
-    try:
-        resultado = subprocess.run(
-            ["curl", "-v", "--proxy", proxy_url, "--max-time", "30",
-             "https://movilidad.envigado.gov.co/portal-servicios/#/agendar-cita-publica"],
             capture_output=True, text=True, timeout=35
         )
         return jsonify({
@@ -8262,25 +7021,10 @@ def envigado_citas_ultimo_resultado_endpoint():
         """)
         filas = cur.fetchall()
         cur.close(); conn.close()
-        # Se descartan aqui los registros cuya fecha de cita YA PASO --
-        # antes se mostraban indefinidamente porque la limpieza automatica
-        # solo borra los resultados vacios del DIA EN QUE SE CONSULTO, no
-        # los positivos de dias anteriores que quedaron sin revisar de
-        # nuevo (ej. si el monitoreo se detuvo antes de volver a
-        # consultar esa fecha).
-        hoy = datetime.now().date()
-        disponibles = []
-        for sede, fecha_dia, cantidad_horarios, verificado_en in filas:
-            try:
-                fecha_cita = datetime.strptime(fecha_dia, "%d/%m/%Y").date()
-                if fecha_cita < hoy:
-                    continue  # la fecha de la cita ya paso -- se ignora
-            except (ValueError, TypeError):
-                pass  # si no se puede interpretar la fecha, se muestra igual (mejor prevenir que ocultar por error)
-            disponibles.append({
-                "sede": sede, "fecha": fecha_dia, "cantidad_horarios": cantidad_horarios,
-                "verificado_en": verificado_en.isoformat() + "Z"
-            })
+        disponibles = [
+            {"sede": f[0], "fecha": f[1], "cantidad_horarios": f[2], "verificado_en": f[3].isoformat() + "Z"}
+            for f in filas
+        ]
         return jsonify({"ok": True, "hay_citas": len(disponibles) > 0, "disponibles": disponibles})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -8288,21 +7032,14 @@ def envigado_citas_ultimo_resultado_endpoint():
 
 @app.route("/envigado-turnos-iniciar-monitoreo", methods=["GET"])
 def envigado_turnos_iniciar_monitoreo_endpoint():
-    """Arranca (o programa) una sesion de monitoreo de maximo 2 horas
-    (configurable), que revisa el monitor de turnos de Envigado cada
-    pocos segundos y va guardando cada llamado nuevo que aparezca -- se
-    puede detener antes manualmente. Los DATOS que va capturando (toda
-    la lista, y los que coincidan con los numeros vigilados) quedan
-    guardados en la base de datos todo el dia, sin importar si la sesion
-    de vigilancia ya termino o si se inicia una sesion nueva despues --
-    solo se renuevan al dia siguiente. Se puede vigilar hasta 20 numeros
-    de cita a la vez.
-    Recibe 'citas' como JSON: [{"numero": "C-89", "placa": "ABC123",
-    "hora": "14:30", "fecha": "2026-08-25"}, ...] -- placa/hora/fecha son
-    opcionales. Si ALGUNA cita trae hora+fecha, el monitoreo se PROGRAMA
-    para arrancar 5 minutos antes de la hora mas temprana, y terminar 1
-    hora despues de la hora mas tardia (en vez de arrancar de inmediato
-    con la duracion fija de 'minutos')."""
+    """Arranca una sesion de monitoreo de maximo 2 horas (configurable),
+    que revisa el monitor de turnos de Envigado cada pocos segundos y va
+    guardando cada llamado nuevo que aparezca -- se puede detener antes
+    manualmente. Los DATOS que va capturando (toda la lista, y los que
+    coincidan con los numeros vigilados) quedan guardados en la base de
+    datos todo el dia, sin importar si la sesion de vigilancia ya termino
+    o si se inicia una sesion nueva despues -- solo se renuevan al dia
+    siguiente. Se puede vigilar hasta 10 numeros de cita a la vez."""
     if _envigado_monitoreo_estado["activo"]:
         return jsonify({
             "ok": False,
@@ -8310,107 +7047,29 @@ def envigado_turnos_iniciar_monitoreo_endpoint():
             "fin_esperado": _envigado_monitoreo_estado["fin_esperado"]
         }), 409
 
-    try:
-        citas = json.loads(request.args.get("citas", "[]"))
-    except Exception:
-        citas = []
-    citas = citas[:20]
+    duracion_minutos = request.args.get("minutos", "120")
+    duracion_minutos = int(duracion_minutos) if duracion_minutos.isdigit() else 120
+    duracion_minutos = min(duracion_minutos, 120)  # tope maximo de 2 horas
+    duracion_segundos = duracion_minutos * 60
 
-    numeros_vigilados = [c["numero"].strip().upper() for c in citas if c.get("numero")]
-    placas_por_numero = {
-        c["numero"].strip().upper(): c["placa"].strip().upper()
-        for c in citas if c.get("numero") and c.get("placa")
-    }
-
-    # Se guarda cada cita ingresada en el historial -- independiente de
-    # si se llega a detectar o no, para poder revisar despues que se
-    # dejo vigilando cada dia (no todos los turnos que paso el monitor,
-    # solo lo que el usuario pidio vigilar).
-    if citas:
-        try:
-            conn_hist = get_db_conn()
-            cur_hist = conn_hist.cursor()
-            for c in citas:
-                if not c.get("numero"):
-                    continue
-                cur_hist.execute("""
-                    INSERT INTO envigado_citas_vigiladas_historial (numero, placa, hora_cita, fecha_cita)
-                    VALUES (%s, %s, %s, %s)
-                """, (
-                    c["numero"].strip().upper(),
-                    (c.get("placa") or "").strip().upper() or None,
-                    (c.get("hora") or "").strip() or None,
-                    c.get("fecha") or datetime.now(TZ_COLOMBIA).date().isoformat(),
-                ))
-            conn_hist.commit()
-            cur_hist.close(); conn_hist.close()
-        except Exception as e:
-            print(f"Error guardando historial de citas vigiladas: {e}", flush=True)
-
-    # Si alguna cita trae hora+fecha, se programa el inicio/fin segun eso
-    # -- si no, se usa el comportamiento de siempre (duracion fija,
-    # arranca de inmediato). Las horas que escribe el usuario son SIEMPRE
-    # hora de Colombia (asi se les asigna explicitamente esa zona), sin
-    # importar en que zona horaria corra el servidor.
-    horas_programadas = []
-    for c in citas:
-        if c.get("hora") and c.get("fecha"):
-            try:
-                dt_naive = datetime.strptime(f"{c['fecha']} {c['hora']}", "%Y-%m-%d %H:%M")
-                # La oficina solo atiende de 7am a 5pm -- se ignora
-                # cualquier hora fuera de ese rango (el frontend ya lo
-                # restringe con min/max, pero se valida aqui tambien por
-                # si la peticion viene de otro lado).
-                hora_valida = 7 <= dt_naive.hour <= 17 and not (dt_naive.hour == 17 and dt_naive.minute > 0)
-                if hora_valida:
-                    horas_programadas.append(dt_naive.replace(tzinfo=TZ_COLOMBIA))
-            except Exception:
-                pass
-
-    ahora = datetime.now(TZ_COLOMBIA)
-    if horas_programadas:
-        inicio_deseado = min(horas_programadas) - timedelta(minutes=5)
-        fin_deseado = max(horas_programadas) + timedelta(hours=1)
-        espera_segundos = max(0, (inicio_deseado - ahora).total_seconds())
-        duracion_segundos = max(60, (fin_deseado - max(ahora, inicio_deseado)).total_seconds())
-        duracion_segundos = min(duracion_segundos, 6 * 3600)  # tope de seguridad: 6 horas totales de monitoreo
-        inicio_real = max(ahora, inicio_deseado)
-        fin_esperado_dt = inicio_real + timedelta(seconds=duracion_segundos)
-        mensaje = (
-            f"Monitoreo programado para iniciar a las {inicio_deseado.strftime('%H:%M')} "
-            f"y terminar a las {fin_esperado_dt.strftime('%H:%M')} (hora Colombia)."
-            if espera_segundos > 0 else
-            f"Monitoreo iniciado -- corriendo hasta las {fin_esperado_dt.strftime('%H:%M')} (hora Colombia)."
-        )
-    else:
-        duracion_minutos = request.args.get("minutos", "120")
-        duracion_minutos = int(duracion_minutos) if duracion_minutos.isdigit() else 120
-        duracion_minutos = min(duracion_minutos, 120)  # tope maximo de 2 horas
-        duracion_segundos = duracion_minutos * 60
-        espera_segundos = 0
-        fin_esperado_dt = ahora + timedelta(seconds=duracion_segundos)
-        mensaje = f"Monitoreo iniciado por {duracion_minutos} minutos (o hasta que lo detengas)."
+    numeros_raw = request.args.get("numeros", "").strip()
+    numeros_vigilados = [n.strip() for n in numeros_raw.split(",") if n.strip()][:10]
 
     _envigado_monitoreo_estado["activo"] = True
-    _envigado_monitoreo_estado["inicio"] = (ahora + timedelta(seconds=espera_segundos)).astimezone(timezone.utc).isoformat()
-    _envigado_monitoreo_estado["fin_esperado"] = fin_esperado_dt.astimezone(timezone.utc).isoformat()
+    _envigado_monitoreo_estado["inicio"] = datetime.now().isoformat() + "Z"  # UTC
+    _envigado_monitoreo_estado["fin_esperado"] = (datetime.now() + timedelta(seconds=duracion_segundos)).isoformat() + "Z"  # UTC
     _envigado_monitoreo_estado["numeros_vigilados"] = numeros_vigilados
     _envigado_monitoreo_estado["detener"] = False
 
     threading.Thread(
-        target=_envigado_polling_turnos_con_espera,
-        kwargs={
-            "espera_segundos": espera_segundos, "duracion_segundos": duracion_segundos,
-            "numeros_vigilados": numeros_vigilados, "placas_por_numero": placas_por_numero,
-        },
+        target=_envigado_polling_turnos,
+        kwargs={"duracion_segundos": duracion_segundos, "numeros_vigilados": numeros_vigilados},
         daemon=True
     ).start()
 
     return jsonify({
         "ok": True,
-        "mensaje": mensaje,
-        "programado": espera_segundos > 0,
-        "inicio_esperado": _envigado_monitoreo_estado["inicio"],
+        "mensaje": f"Monitoreo iniciado por {duracion_minutos} minutos (o hasta que lo detengas).",
         "fin_esperado": _envigado_monitoreo_estado["fin_esperado"]
     })
 
@@ -8440,92 +7099,28 @@ def envigado_turnos_estado_monitoreo_endpoint():
 
 @app.route("/envigado-turnos-capturados", methods=["GET"])
 def envigado_turnos_capturados_endpoint():
-    """Devuelve los turnos capturados de un dia en particular, mas
-    recientes primero. Por defecto (sin 'fecha') muestra los de hoy --
-    'fecha' se recibe en formato YYYY-MM-DD, para poder revisar el
-    historial de dias anteriores."""
+    """Devuelve los turnos capturados, mas recientes primero. Por defecto
+    solo los de hoy."""
     limite = request.args.get("limite", "100")
     limite = int(limite) if limite.isdigit() else 100
-    fecha = request.args.get("fecha", "").strip()
     try:
         conn = get_db_conn()
         cur = conn.cursor()
-        if fecha:
-            cur.execute("""
-                SELECT nro_atencion, nombre_usuario, nombre_taquilla, nombre_servicio, detectado_en, placa
-                FROM envigado_turnos_llamados
-                WHERE detectado_en::date = %s
-                ORDER BY detectado_en DESC
-                LIMIT %s
-            """, (fecha, limite))
-        else:
-            cur.execute("""
-                SELECT nro_atencion, nombre_usuario, nombre_taquilla, nombre_servicio, detectado_en, placa
-                FROM envigado_turnos_llamados
-                WHERE detectado_en::date = CURRENT_DATE
-                ORDER BY detectado_en DESC
-                LIMIT %s
-            """, (limite,))
+        cur.execute("""
+            SELECT nro_atencion, nombre_usuario, nombre_taquilla, nombre_servicio, detectado_en
+            FROM envigado_turnos_llamados
+            WHERE detectado_en::date = CURRENT_DATE
+            ORDER BY detectado_en DESC
+            LIMIT %s
+        """, (limite,))
         filas = cur.fetchall()
         cur.close(); conn.close()
         turnos = [
             {"nro_atencion": f[0], "nombre_usuario": f[1], "taquilla": f[2],
-             "servicio": f[3], "detectado_en": f[4].isoformat() + "Z", "placa": f[5] or ""}
+             "servicio": f[3], "detectado_en": f[4].isoformat() + "Z"}
             for f in filas
         ]
         return jsonify({"ok": True, "turnos": turnos})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/envigado-citas-vigiladas-fechas", methods=["GET"])
-def envigado_citas_vigiladas_fechas_endpoint():
-    """Devuelve la lista de dias (mas reciente primero) en los que se
-    dejaron citas vigilando -- para poblar el selector del historial."""
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT fecha_cita AS dia, COUNT(*) AS total
-            FROM envigado_citas_vigiladas_historial
-            GROUP BY dia
-            ORDER BY dia DESC
-            LIMIT 90
-        """)
-        filas = cur.fetchall()
-        cur.close(); conn.close()
-        fechas = [{"fecha": f[0].isoformat(), "total": f[1]} for f in filas]
-        return jsonify({"ok": True, "fechas": fechas})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/envigado-citas-vigiladas-historial", methods=["GET"])
-def envigado_citas_vigiladas_historial_endpoint():
-    """Devuelve las citas que se dejaron vigilando en un dia en
-    particular (numero, placa, hora programada), junto con si se llego a
-    detectar el llamado y con que datos (taquilla, nombre, hora real)."""
-    fecha = request.args.get("fecha", "").strip()
-    if not fecha:
-        fecha = datetime.now(TZ_COLOMBIA).date().isoformat()
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT numero, placa, hora_cita, encontrado, taquilla, nombre_usuario, detectado_en, creado_en
-            FROM envigado_citas_vigiladas_historial
-            WHERE fecha_cita = %s
-            ORDER BY creado_en ASC
-        """, (fecha,))
-        filas = cur.fetchall()
-        cur.close(); conn.close()
-        citas = [{
-            "numero": f[0], "placa": f[1] or "", "hora_cita": f[2] or "",
-            "encontrado": f[3], "taquilla": f[4] or "", "nombre_usuario": f[5] or "",
-            "detectado_en": (f[6].isoformat() + "Z") if f[6] else None,
-            "creado_en": f[7].isoformat() + "Z",
-        } for f in filas]
-        return jsonify({"ok": True, "citas": citas})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -8541,7 +7136,7 @@ def envigado_turnos_vigilados_hoy_endpoint():
         conn = get_db_conn()
         cur = conn.cursor()
         cur.execute("""
-            SELECT nro_atencion, nombre_usuario, nombre_taquilla, nombre_servicio, detectado_en, placa
+            SELECT nro_atencion, nombre_usuario, nombre_taquilla, nombre_servicio, detectado_en
             FROM envigado_turnos_llamados
             WHERE fue_vigilado = TRUE AND detectado_en::date = CURRENT_DATE
             ORDER BY detectado_en DESC
@@ -8550,7 +7145,7 @@ def envigado_turnos_vigilados_hoy_endpoint():
         cur.close(); conn.close()
         encontrados = [
             {"nro_atencion": f[0], "nombre_usuario": f[1], "taquilla": f[2],
-             "servicio": f[3], "detectado_en": f[4].isoformat() + "Z", "placa": f[5] or ""}
+             "servicio": f[3], "detectado_en": f[4].isoformat() + "Z"}
             for f in filas
         ]
         return jsonify({"ok": True, "encontrados": encontrados})
@@ -8665,32 +7260,6 @@ def mis_vehiculos_runt():
         return jsonify(filas)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
-@app.route("/mis-vehiculos-eliminar", methods=["POST"])
-def mis_vehiculos_eliminar_endpoint():
-    """Elimina una placa del historial personal del usuario (tabla
-    mis_consultas) -- NO borra el vehiculo de la tabla global 'vehiculos'
-    (otros usuarios que tambien la hayan consultado siguen viendola en su
-    propio historial, y la placa se puede volver a consultar despues sin
-    problema)."""
-    datos = request.get_json(silent=True) or {}
-    user_id = (datos.get("user_id") or "").strip()
-    placa = (datos.get("placa") or "").strip().upper()
-    if not user_id or not placa:
-        return jsonify({"ok": False, "error": "Faltan user_id o placa."}), 400
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM mis_consultas WHERE user_id = %s AND placa = %s", (user_id, placa))
-        eliminada = cur.rowcount > 0
-        conn.commit()
-        cur.close(); conn.close()
-        if not eliminada:
-            return jsonify({"ok": False, "error": "No se encontró esa placa en tu historial."}), 404
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/vehiculos-buscar", methods=["GET"])
