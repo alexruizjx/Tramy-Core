@@ -4387,19 +4387,11 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     linea_empresa = datos_vehiculo.get("linea_empresa", "")
     if "DATOS" in wb.sheetnames:
         wb["DATOS"]["W2"] = linea_empresa
-
-    # La firma real del documento (la que ya trae la plantilla, con una
-    # formula tipo "=DATOS!W2") se deja intacta -- no se sobreescribe.
-    # El unico arreglo necesario es que, cuando el panel no tiene nada
-    # puesto (celda W2 vacia), Excel/LibreOffice muestra un "0" en la
-    # celda que tiene la formula (asi funciona una referencia a una
-    # celda vacia). Se busca esa celda automaticamente (sin necesitar
-    # su coordenada exacta) y se le pone un formato que oculta el cero.
-    for _fila_firma in hoja.iter_rows():
-        for _celda_firma_formula in _fila_firma:
-            _valor_formula = _celda_firma_formula.value
-            if isinstance(_valor_formula, str) and _valor_formula.startswith("=") and "DATOS" in _valor_formula.upper() and "W2" in _valor_formula.upper():
-                _celda_firma_formula.number_format = 'General;General;;@'
+    celda_linea_empresa = APPJX_CELDA_LINEA_EMPRESA.get(clave_documento)
+    if celda_linea_empresa:
+        celda_firma = _escribir_celda_segura(hoja, celda_linea_empresa, linea_empresa)
+        celda_firma.number_format = "General"
+        celda_firma.font = Font(name="Century Gothic", size=14, bold=True, color="FF000000")
 
     # En los 4 documentos de MANDATO, algunas filas tienen texto con
     # salto de linea interno pero se quedaron con altura de una sola
