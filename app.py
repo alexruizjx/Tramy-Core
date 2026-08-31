@@ -4692,12 +4692,16 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         for celda in CELDA_OTROS_TRAMITE:
             hoja[celda].fill = sin_relleno
         hoja["W39"].fill = sin_relleno  # bloque "ESPECIFIQUE LA PALABRA OTRO..." (combinado W39:AK41)
-        # W41/AG41 muestran el texto de "traslado de cuenta" via formula
+        # El texto de "traslado de cuenta" se muestra via formula
         # (=EXPORTAR!D51) -- LibreOffice no siempre recalcula esa formula
         # en la conversion a PDF, asi que se escribe vacio DIRECTAMENTE en
-        # la celda visible en vez de depender de la formula. Protegido por
-        # si acaso en "(2)"/"(3)" esa celda resulta combinada distinto.
-        for celda_fija in ("W42", "AG42"):
+        # la celda visible en vez de depender de la formula. Esta celda
+        # es DISTINTA para cada variante de Formulario (W42 en la (1) y
+        # (3), pero W44 en la (2)) -- antes estaba fija en "W42" para
+        # las 3, por lo que Formulario (2) nunca se limpiaba y se
+        # quedaba mostrando el ultimo resultado guardado de la formula.
+        _celda_traslado_limpiar = APPJX_CELDA_TRASLADO_TEXTO.get(clave_documento, "W42")
+        for celda_fija in (_celda_traslado_limpiar, "AG42"):
             try:
                 hoja[celda_fija].value = ""
             except AttributeError:
