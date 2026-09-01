@@ -4355,16 +4355,16 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         )
 
     # Filas de las etiquetas "NOMBRES Y APELLIDOS.../No. DOCUMENTO" en
-    # algunas variantes de Mandato -- se dejan mas bajas (0.15) para que
-    # el bloque de nombre/documento se vea mas compacto.
+    # algunas variantes de Mandato -- se iguala su altura a la misma
+    # altura que ya tienen esas filas en "MANDATO (4)" (10.5), que es la
+    # que se ve bien.
     _filas_bajas_mandato = {
         "MANDATO NIT": [5, 8, 11],
         "MANDATO (2)": [5, 8, 12],
         "MANDATO (3)": [5, 8, 12],
     }.get(nombre_hoja, [])
     for _fila_baja in _filas_bajas_mandato:
-        hoja.row_dimensions[_fila_baja].height = 0.15
-        hoja.row_dimensions[_fila_baja].customHeight = True
+        hoja.row_dimensions[_fila_baja].height = 10.5
 
     exportar["D51"] = ""  # traslado_municipio -- vacio explicito, si no la formula '=EXPORTAR!D51' en FORMULARIO muestra "0" (una celda totalmente vacia, sin ni siquiera comillas vacias, se lee como cero en una referencia directa)
     exportar["D24"] = datos_vehiculo.get("precio_venta") or ""  # precio -- viene del campo "Precio de venta" en Tramites (Preparacion/Liquidacion); si no se indica, queda vacio para llenarlo a mano en el documento impreso
