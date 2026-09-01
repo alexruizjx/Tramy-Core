@@ -4439,6 +4439,7 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     # calculadas y apuntaban a una celda distinta a la de la formula,
     # lo cual causaba una firma duplicada en el lugar equivocado.
     linea_empresa = datos_vehiculo.get("linea_empresa", "")
+    linea_empresa = linea_empresa[:88]  # limite de caracteres para evitar que la firma "achique" el documento
     if "DATOS" in wb.sheetnames:
         wb["DATOS"]["W2"] = linea_empresa
 
