@@ -4006,9 +4006,9 @@ APPJX_CELDA_LINEA_EMPRESA = {
 # alto para que las 2 lineas quepan bien.
 APPJX_FILAS_ALTURA_EXTRA = {
     "MANDATO": [3, 7, 21],
-    "MANDATO NIT": [3, 8, 22],
-    "MANDATO (2)": [3, 5, 21],
-    "MANDATO (3)": [5, 6],
+    "MANDATO NIT": [3, 22],  # se quito la fila 8 -- ahora se deja compacta (10.5), ver mas abajo
+    "MANDATO (2)": [3, 21],  # se quito la fila 5 -- ahora se deja compacta (10.5), ver mas abajo
+    "MANDATO (3)": [6],  # se quito la fila 5 -- ahora se deja compacta (10.5), ver mas abajo
 }
 
 # Celda dentro de cada documento que muestra la capacidad de pasajeros
