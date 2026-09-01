@@ -4336,6 +4336,36 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         hoja["F8"] = f"{_hoy.day}-{_meses_es[_hoy.month - 1]}-{_hoy.year}"
         hoja["F8"].alignment = Alignment(horizontal="center", vertical=hoja["F8"].alignment.vertical)
 
+    # Igual que con AFIRMACION -- "REVOCATORIA" e "INDETERMINADO" tienen
+    # una celda de fecha (calculada, no la de hoy) que tambien sale en
+    # ingles por el mismo motivo. Se recalcula la misma formula en
+    # Python y se escribe ya en español.
+    if nombre_hoja in ("REVOCATORIA", "INDETERMINADO"):
+        _meses_es_2 = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
+                       "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+        if nombre_hoja == "REVOCATORIA":
+            # EXPORTAR!D55 = "=EDATE(TODAY(),-37)" -- hoy menos 37 meses
+            # (3 años y 1 mes atras).
+            _hoy2 = datetime.now()
+            _mes_total = (_hoy2.year * 12 + (_hoy2.month - 1)) - 37
+            _anio_calc, _mes_calc = divmod(_mes_total, 12)
+            _mes_calc += 1
+            import calendar as _calendar_tmp
+            _ultimo_dia_mes = _calendar_tmp.monthrange(_anio_calc, _mes_calc)[1]
+            _dia_calc = min(_hoy2.day, _ultimo_dia_mes)
+            _fecha_calc = datetime(_anio_calc, _mes_calc, _dia_calc)
+        else:
+            # EXPORTAR!D53 = "=TODAY() - 1100"
+            _fecha_calc = datetime.now() - timedelta(days=1100)
+        _dia_semana_es = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"][_fecha_calc.weekday()]
+        if nombre_hoja == "REVOCATORIA":
+            # Formato original: "lunes, enero 01, 2026" (con dia de la semana)
+            hoja["C19"] = f"{_dia_semana_es}, {_meses_es_2[_fecha_calc.month - 1]} {_fecha_calc.day}, {_fecha_calc.year}"
+        else:
+            # Formato original: "enero 01, 2026" (sin dia de la semana)
+            hoja["C19"] = f"{_meses_es_2[_fecha_calc.month - 1]} {_fecha_calc.day}, {_fecha_calc.year}"
+        hoja["C19"].alignment = Alignment(horizontal=hoja["C19"].alignment.horizontal, vertical=hoja["C19"].alignment.vertical)
+
     # Las 4 hojas de MANDATO tienen varias celdas sin alineacion vertical
     # definida -- heredan la del tema de la plantilla, que en algunos
     # casos las deja "pegadas al piso" de una fila mas alta de lo normal,
@@ -4503,7 +4533,7 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         "revocatoria_indeterminado": {"nombre": "A9", "documento": "I9"},
         "levantamiento_prenda": {"nombre": "B10", "documento": "K10"},
         "inscripcion_prenda": {"nombre": "B6", "documento": "J6"},
-        "acta_responsabilidad": {"nombre": "D3", "documento": "I5"},
+        "acta_responsabilidad": {"nombre": "A5", "documento": "I5"},
     }
     if clave_documento in _CELDAS_ROL_OTRO:
         _otro_persona = datos_vehiculo.get("otro") or {}
