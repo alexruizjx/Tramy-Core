@@ -4008,7 +4008,7 @@ APPJX_FILAS_ALTURA_EXTRA = {
     "MANDATO": [3, 7, 21],
     "MANDATO NIT": [3, 22],  # se quito la fila 8 -- ahora se deja compacta (10.5), ver mas abajo
     "MANDATO (2)": [3, 21],  # se quito la fila 5 -- ahora se deja compacta (10.5), ver mas abajo
-    "MANDATO (3)": [6],  # se quito la fila 5 -- ahora se deja compacta (10.5), ver mas abajo
+    "MANDATO (3)": [],  # se quitaron las filas 5 y 6 -- altura natural, igual que Mandato NIT y Mandato (2)
 }
 
 # Celda dentro de cada documento que muestra la capacidad de pasajeros
