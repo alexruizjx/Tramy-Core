@@ -4487,7 +4487,7 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     # para que tambien funcione bien si "otro" queda vacio.
     _CELDAS_ROL_OTRO = {
         "compraventa_persona_juridica": {"nombre": "H7", "documento": "J8"},
-        "mandato_persona_juridica": {"nombre": "A5", "documento": "F5"},
+        "mandato_persona_juridica": {"nombre": "A6", "documento": "F6"},
         "revocatoria_indeterminado": {"nombre": "B7", "documento": "C8"},
         "levantamiento_prenda": {"nombre": "A8", "documento": "C9"},
         "inscripcion_prenda": {"nombre": "D3", "documento": "C4"},
@@ -4513,11 +4513,11 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     # combinada en alguna variante (esto paso, por ejemplo, cuando se
     # copiaron/renombraron hojas de Mandato a mano).
     _CELDAS_ROL_MANDATARIO = {
-        "mandato": {"nombre": "A9", "documento": "F9"},
-        "mandato_dos_vendedores": {"nombre": "A12", "documento": "F12"},
-        "mandato_comprador_vendedor": {"nombre": "A12", "documento": "F12"},
-        "mandato_persona_juridica": {"nombre": "A11", "documento": "F11"},
-        "mandato_4": {"nombre": "A8", "documento": "F8"},  # 1er mandatario
+        "mandato": {"nombre": "A10", "documento": "F10"},
+        "mandato_dos_vendedores": {"nombre": "A13", "documento": "F13"},
+        "mandato_comprador_vendedor": {"nombre": "A13", "documento": "F13"},
+        "mandato_persona_juridica": {"nombre": "A12", "documento": "G12"},
+        "mandato_4": {"nombre": "A9", "documento": "F9"},  # 1er mandatario
     }
     if clave_documento in _CELDAS_ROL_MANDATARIO:
         _mandatario_persona = datos_vehiculo.get("mandatario") or {}
@@ -4534,8 +4534,8 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         _nombre_completo_otro_mandatario = " ".join(filter(None, [
             _otro_mandatario_persona.get("nombres"), _otro_mandatario_persona.get("apellido"), _otro_mandatario_persona.get("segundo_apellido"),
         ]))
-        _escribir_celda_segura(hoja, "A12", _nombre_completo_otro_mandatario).number_format = "General"
-        _escribir_celda_segura(hoja, "F12", _otro_mandatario_persona.get("numero_documento") or "").number_format = "General"
+        _escribir_celda_segura(hoja, "A13", _nombre_completo_otro_mandatario).number_format = "General"
+        _escribir_celda_segura(hoja, "F13", _otro_mandatario_persona.get("numero_documento") or "").number_format = "General"
 
         # A49 trae una formula que no se necesita -- se elimina dejando
         # la celda vacia.
