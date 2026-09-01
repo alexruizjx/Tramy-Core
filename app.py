@@ -33,6 +33,45 @@ from flask_cors import CORS
 app = Flask(__name__)  # v54.1
 CORS(app, resources={r"/*": {"origins": "*"}})
 
+# --- SEGURIDAD: verificacion de sesion (Fase 1 -- "solo avisar") -------
+# Objetivo final: que el backend rechace peticiones sin sesion valida,
+# en vez de confiar solo en que el frontend ya reviso el rol antes de
+# mostrar cada boton (eso es facil de saltarse llamando a los endpoints
+# directo). Por ahora, esta primera fase NO BLOQUEA nada -- solo revisa
+# si cada peticion trae un token de sesion de Supabase valido, y lo deja
+# anotado en los logs de Railway. Sirve para confirmar, sin ningun
+# riesgo de romper nada, que tan lista esta cada parte del frontend
+# antes de pasar a la fase donde si se empieza a exigir el token.
+SUPABASE_URL_AUTH = "https://ddndoxtmffoaklhwbmkq.supabase.co"
+SUPABASE_ANON_KEY_AUTH = "sb_publishable_x3cjuv1b2Uxq_-55-PsBqw_gCTto337"
+
+
+@app.before_request
+def _tramy_registrar_token_fase1():
+    if request.method == "OPTIONS":
+        return  # peticiones de "pre-vuelo" CORS, nunca llevan token -- se ignoran
+    auth_header = request.headers.get("Authorization", "")
+    ruta = request.path
+    if not auth_header or not auth_header.startswith("Bearer "):
+        print(f"[AUTH-FASE1] SIN TOKEN -- {request.method} {ruta}")
+        return
+    token = auth_header[len("Bearer "):]
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL_AUTH}/auth/v1/user",
+            headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_ANON_KEY_AUTH},
+            timeout=3,
+        )
+        if resp.status_code == 200:
+            usuario = resp.json()
+            print(f"[AUTH-FASE1] TOKEN VALIDO ({usuario.get('email', '?')}) -- {request.method} {ruta}")
+        else:
+            print(f"[AUTH-FASE1] TOKEN INVALIDO (status {resp.status_code}) -- {request.method} {ruta}")
+    except Exception as _e:
+        print(f"[AUTH-FASE1] ERROR VERIFICANDO TOKEN ({_e}) -- {request.method} {ruta}")
+    # IMPORTANTE: no se hace "return" con error ni codigo de rechazo --
+    # la peticion sigue su curso normal, pase lo que pase con el token.
+
 TIMEOUT = 10000
 MSG_NO_MATRICULADO = "El vehiculo no se encuentra matriculado en la Secretaria de Movilidad"
 AÑO_ACTUAL = str(datetime.now().year)
