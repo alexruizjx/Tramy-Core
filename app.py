@@ -4531,8 +4531,8 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         "compraventa_persona_juridica": {"nombre": "H7", "documento": "J8"},
         "mandato_persona_juridica": {"nombre": "A6", "documento": "F6"},
         "revocatoria_indeterminado": {"nombre": "A9", "documento": "I9"},
-        "levantamiento_prenda": {"nombre": "B10", "documento": "K10"},
-        "inscripcion_prenda": {"nombre": "B6", "documento": "J6"},
+        "levantamiento_prenda": {"nombre": "A10", "documento": "J10"},
+        "inscripcion_prenda": {"nombre": "A6", "documento": "I6"},
         "acta_responsabilidad": {"nombre": "A5", "documento": "I5"},
     }
     if clave_documento in _CELDAS_ROL_OTRO:
@@ -4552,8 +4552,8 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         _nombre_completo_deudor = " ".join(filter(None, [
             _propietario_deudor.get("nombres"), _propietario_deudor.get("apellido"), _propietario_deudor.get("segundo_apellido"),
         ]))
-        _escribir_celda_segura(hoja, "B9", _nombre_completo_deudor).number_format = "General"
-        _escribir_celda_segura(hoja, "J9", _propietario_deudor.get("numero_documento") or "").number_format = "General"
+        _escribir_celda_segura(hoja, "A9", _nombre_completo_deudor).number_format = "General"
+        _escribir_celda_segura(hoja, "I9", _propietario_deudor.get("numero_documento") or "").number_format = "General"
 
     # Rol "MANDATARIO" -- se conecta con las 5 hojas de Mandato. Estas
     # celdas ya tenian una formula que apuntaba a EXPORTAR!D3-D6 (el rol
