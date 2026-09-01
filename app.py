@@ -4487,7 +4487,7 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     # para que tambien funcione bien si "otro" queda vacio.
     _CELDAS_ROL_OTRO = {
         "compraventa_persona_juridica": {"nombre": "H7", "documento": "J8"},
-        "mandato_persona_juridica": {"nombre": "C1", "documento": "G2"},
+        "mandato_persona_juridica": {"nombre": "A5", "documento": "F5"},
         "revocatoria_indeterminado": {"nombre": "B7", "documento": "C8"},
         "levantamiento_prenda": {"nombre": "A8", "documento": "C9"},
         "inscripcion_prenda": {"nombre": "D3", "documento": "C4"},
@@ -4514,10 +4514,10 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     # copiaron/renombraron hojas de Mandato a mano).
     _CELDAS_ROL_MANDATARIO = {
         "mandato": {"nombre": "A9", "documento": "F9"},
-        "mandato_dos_vendedores": {"nombre": "B7", "documento": "F8"},
-        "mandato_comprador_vendedor": {"nombre": "A7", "documento": "G8"},
-        "mandato_persona_juridica": {"nombre": "D5", "documento": "F6"},
-        "mandato_4": {"nombre": "C4", "documento": "A6"},
+        "mandato_dos_vendedores": {"nombre": "A12", "documento": "F12"},
+        "mandato_comprador_vendedor": {"nombre": "A12", "documento": "F12"},
+        "mandato_persona_juridica": {"nombre": "A11", "documento": "F11"},
+        "mandato_4": {"nombre": "A8", "documento": "F8"},  # 1er mandatario
     }
     if clave_documento in _CELDAS_ROL_MANDATARIO:
         _mandatario_persona = datos_vehiculo.get("mandatario") or {}
@@ -4534,34 +4534,8 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         _nombre_completo_otro_mandatario = " ".join(filter(None, [
             _otro_mandatario_persona.get("nombres"), _otro_mandatario_persona.get("apellido"), _otro_mandatario_persona.get("segundo_apellido"),
         ]))
-        _escribir_celda_segura(hoja, "B7", _nombre_completo_otro_mandatario).number_format = "General"
-        _escribir_celda_segura(hoja, "F8", _otro_mandatario_persona.get("numero_documento") or "").number_format = "General"
-
-        # A3 y A5 se ven con las lineas montadas (superpuestas con el
-        # texto justo encima) al convertir a PDF. El intento anterior de
-        # arreglar esto (agregando saltos de linea AL INICIO del texto)
-        # termino "recortando" el texto -- la fila no tenia suficiente
-        # altura para mostrar los saltos de linea Y el texto real, asi
-        # que el texto quedaba fuera del area visible (invisible, pero
-        # seguia estando ahi). Se corrige de otra forma: el texto se
-        # deja intacto, y en vez de eso se agranda la altura de esas 2
-        # filas especificas, para separar visualmente sin arriesgar
-        # que el texto real se pierda de vista.
-        # La columna A sola es muy angosta (ancho ~15) -- con wrap_text
-        # activado, el texto se ajustaba en lineas de 2-3 palabras, lo
-        # cual se veia mal. Se combinan las celdas A hasta G (que estan
-        # vacias en estas 2 filas) para darle al texto mucho mas espacio
-        # horizontal, igual que ya se hace en otras partes de esta misma
-        # hoja (ej. A9:G11) para bloques de texto largo.
-        hoja.merge_cells("A3:G3")
-        hoja["A3"] = "quien para efectos del presente contrato se denominará el MANDANTE VENDEDOR."
-        hoja["A3"].alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
-        hoja.row_dimensions[3].height = 30
-
-        hoja.merge_cells("A5:G5")
-        hoja["A5"] = "también mayor de edad, vecino(a) de ésta  ciudad Identificado(a) con Documento de identidad Numero:"
-        hoja["A5"].alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
-        hoja.row_dimensions[5].height = 30
+        _escribir_celda_segura(hoja, "A12", _nombre_completo_otro_mandatario).number_format = "General"
+        _escribir_celda_segura(hoja, "F12", _otro_mandatario_persona.get("numero_documento") or "").number_format = "General"
 
         # A49 trae una formula que no se necesita -- se elimina dejando
         # la celda vacia.
