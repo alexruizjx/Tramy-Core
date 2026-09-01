@@ -5693,7 +5693,13 @@ def consultar_sabaneta(page, placa):
     url = "https://transitosabaneta.utsetsa.com/#/impuesto-local"
     page.goto(url, wait_until="domcontentloaded", timeout=30000)
     page.locator("#placa").wait_for(state="visible", timeout=15000)
-    page.locator("#placa").fill(placa)
+    # Se usa clic + escritura letra por letra en vez de fill() -- en
+    # sitios hechos con Angular (como este), fill() a veces pone el
+    # valor en el campo sin que el framework "se entere" del cambio,
+    # dejando el boton Buscar visualmente normal para Playwright pero
+    # sin responder de verdad al hacerle clic (timeout al clickear).
+    page.locator("#placa").click()
+    page.keyboard.type(placa, delay=60)
     page.get_by_role("button", name="Buscar").click()
     page.wait_for_timeout(20000)
     texto_pagina = page.inner_text("body")
