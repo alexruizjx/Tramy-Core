@@ -7487,6 +7487,12 @@ def combinar_pdfs_endpoint():
     # en vez de que todo diga "Declaracion".
     nombre_archivo = (datos.get("nombre_archivo") or "Declaracion_Sugerida").strip()
     nombre_archivo = re.sub(r"[^\w\s-]", "", nombre_archivo).replace(" ", "_")
+    # Carpeta de destino en R2 -- por defecto "declaraciones" (uso
+    # original de este endpoint), pero los combos de documentos de
+    # Preparacion/Liquidacion mandan "documentos" para no confundirse
+    # con las Declaraciones Sugeridas.
+    carpeta_r2 = (datos.get("carpeta") or "declaraciones").strip()
+    carpeta_r2 = re.sub(r"[^\w-]", "", carpeta_r2) or "declaraciones"
 
     if not urls or len(urls) < 2:
         return jsonify({"error": "Se necesitan al menos 2 URLs para combinar"}), 400
@@ -7510,7 +7516,7 @@ def combinar_pdfs_endpoint():
             writer.write(f)
         writer.close()
 
-        url_final = subir_a_r2(ruta_combinado, f"declaraciones/combinado_{placa}_{id_unico}.pdf",
+        url_final = subir_a_r2(ruta_combinado, f"{carpeta_r2}/combinado_{placa}_{id_unico}.pdf",
                                 nombre_descarga=f"{nombre_archivo}_{placa}_combinado.pdf")
         os.remove(ruta_combinado)
         for ruta in rutas_temp:
