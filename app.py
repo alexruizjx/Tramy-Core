@@ -7670,9 +7670,15 @@ def consultar_runt_persona_endpoint():
                     "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
                     "--single-process", "--no-zygote", "--disable-setuid-sandbox"
                 ])
+                # NOTA: a diferencia de la consulta de vehiculos (que usa
+                # movil), esta se hace en modo ESCRITORIO -- se detecto
+                # que el panel de "Multas e infracciones" muestra un
+                # componente mas simple e incompleto (sin el dato real
+                # "TIENE MULTAS O INFRACCIONES") cuando el sitio detecta
+                # una pantalla angosta de celular.
                 context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-                    viewport={"width": 390, "height": 844},
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    viewport={"width": 1366, "height": 900},
                 )
                 page = context.new_page()
                 datos = consultar_runt_persona(page, cedula, tipo_documento, primer_apellido, job_id=job_id)
