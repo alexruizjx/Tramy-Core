@@ -3654,8 +3654,33 @@ def _parsear_resultado_runt_persona(page):
     except Exception:
         texto_multas = None
 
+    # Respaldo: si la busqueda estructurada (arriba) no encontro nada --
+    # por ejemplo si la estructura exacta del componente cambio, o si por
+    # algun motivo el panel no termino de desplegarse como se esperaba --
+    # se busca el mismo texto directo en TODO lo que se ve en la pagina,
+    # sin depender de la estructura HTML especifica.
+    if not texto_multas:
+        try:
+            texto_pagina = page.inner_text("body")
+            m = re.search(r"TIENE MULTAS O INFRACCIONES\s*:?\s*\n?\s*(SI|NO)\b", texto_pagina, re.IGNORECASE)
+            if m:
+                texto_multas = m.group(1).upper()
+        except Exception:
+            pass
+
     resultado["texto_multas"] = texto_multas or ""
     resultado["tiene_multas"] = (texto_multas or "").strip().upper() == "SI"
+
+    if not texto_multas:
+        # Diagnostico -- si esto sigue sin funcionar, este log muestra
+        # exactamente que hay en la pagina en el momento de leerla.
+        print("=== DIAGNOSTICO MULTAS RUNT PERSONA: no se encontro el dato ===", flush=True)
+        try:
+            print("Texto visible de la pagina (primeros 2500 caracteres):", flush=True)
+            print(page.inner_text("body")[:2500], flush=True)
+        except Exception:
+            pass
+        print("=== FIN DIAGNOSTICO MULTAS ===", flush=True)
 
     return resultado
 
@@ -3742,16 +3767,16 @@ def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido=""
     # la pagina -- lo unico que falta es DESPLEGAR el segundo desplegable
     # ("Multas e infracciones") para poder leerlo, ya que el acordeon usa
     # multi="false" (Angular Material): solo un panel puede estar abierto
-    # a la vez. Se usa un locator directo (mas confiable que
-    # evaluate_handle) apuntando al encabezado que CONTIENE ese titulo.
+    # a la vez.
     if job_id:
         job_actualizar(job_id, "Desplegando información de multas...", "procesando")
     try:
-        header_multas = page.locator('mat-expansion-panel-header:has(mat-panel-title:has-text("Multas e infracciones"))')
+        header_multas = page.locator('mat-expansion-panel-header:has(mat-panel-title:has-text("Multas e infracciones"))').first
         if header_multas.count() > 0:
-            if header_multas.first.get_attribute("aria-expanded") != "true":
-                header_multas.first.click()
-                page.wait_for_timeout(600)
+            header_multas.scroll_into_view_if_needed()
+            if header_multas.get_attribute("aria-expanded") != "true":
+                header_multas.click(force=True)
+            page.wait_for_timeout(1200)
     except Exception:
         pass
 
