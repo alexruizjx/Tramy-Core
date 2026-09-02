@@ -3608,14 +3608,14 @@ def _runt_persona_expandir_panel(page, indice_0based, job_id=None, etiqueta_log=
         header.click()
     selector_spinner = 'mat-spinner, mat-progress-spinner, .mat-spinner, .mat-progress-spinner'
     try:
-        page.wait_for_selector(selector_spinner, state="visible", timeout=2500)
+        page.wait_for_selector(selector_spinner, state="visible", timeout=1000)
     except Exception:
         pass  # no llego a aparecer -- puede que el dato ya estuviera listo, no es un error
     try:
         page.wait_for_selector(selector_spinner, state="hidden", timeout=20000)
     except Exception:
         pass
-    page.wait_for_timeout(400)  # pequeno colchon extra despues de que el spinner se va
+    page.wait_for_timeout(150)  # pequeno colchon extra despues de que el spinner se va
 
 
 def _runt_persona_extraer_tabla_panel(page, indice_0based):
@@ -3740,11 +3740,10 @@ def _parsear_resultado_runt_persona(page):
 def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido="", job_id=None):
     """Consulta 'Ciudadano por Documento' en el RUNT -- a diferencia de
     consultar_runt_vehiculo (que busca por placa), esta busca directo por
-    documento de la persona. Devuelve si esta registrada en el RUNT, si
-    tiene multas (desplegable #2, "Multas e infracciones"), y las filas
-    de "Información solicitudes" (desplegable #7). Reutiliza la misma
-    infraestructura de captcha e interaccion con mat-select que ya se
-    uso para el RUNT de vehiculos."""
+    documento de la persona. Devuelve si esta registrada en el RUNT, y si
+    tiene multas (desplegable #2, "Multas e infracciones"). Reutiliza la
+    misma infraestructura de captcha e interaccion con mat-select que ya
+    se uso para el RUNT de vehiculos."""
     if job_id:
         job_actualizar(job_id, "Abriendo el RUNT...", "procesando")
 
@@ -3819,19 +3818,16 @@ def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido=""
 
     # Desplegable #2 (posicion 1, contando desde 0) = "Multas e
     # infracciones" -- se despliega (si no lo estaba ya) y se espera el
-    # spinner de carga antes de seguir.
+    # spinner de carga antes de seguir. Es el UNICO desplegable que se
+    # toca -- el #7 ("Información solicitudes") solo se uso antes como
+    # prueba, para confirmar si el problema era especifico de este
+    # desplegable o algo mas general; ya no hace falta desplegarlo.
     _runt_persona_expandir_panel(page, 1, job_id=job_id, etiqueta_log="información de multas")
-
-    # Desplegable #7 (posicion 6) = "Información solicitudes" -- mismo
-    # trato, para poder leer sus filas mas abajo.
-    _runt_persona_expandir_panel(page, 6, job_id=job_id, etiqueta_log="información de solicitudes")
 
     if job_id:
         job_actualizar(job_id, "Extrayendo datos...", "procesando")
 
-    resultado = _parsear_resultado_runt_persona(page)
-    resultado["solicitudes"] = _runt_persona_extraer_tabla_panel(page, 6)
-    return resultado
+    return _parsear_resultado_runt_persona(page)
 
 
 def _parsear_resultado_runt_vehiculo(page):
