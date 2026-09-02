@@ -3587,14 +3587,26 @@ RUNT_PERSONA_URL = "https://portalpublico.runt.gov.co/#/consulta-ciudadano-docum
 
 
 def _parsear_resultado_runt_persona(page):
-    """Extrae si la persona esta ACTIVA en el RUNT (unico dato que Tramy
-    necesita de esta consulta -- ya no se revisan multas, ese dato resulto
-    inconsistente)."""
-    resultado = {"activa": False, "estado_persona": "", "nombre_completo": ""}
+    """Extrae 2 datos de la pagina de resultado de 'Consulta Ciudadano por
+    Documento': si la persona esta ACTIVA en el RUNT, y si TIENE MULTAS O
+    INFRACCIONES (SI/NO). Este segundo dato carga de forma asincrona
+    dentro del panel "Multas e infracciones" -- por eso consultar_runt_persona
+    espera a que la red quede en reposo antes de llamar a esta funcion.
 
-    # Seccion superior (NOMBRE COMPLETO / DOCUMENTO / ESTADO DE LA PERSONA /
-    # etc.) -- son filas ".row" dentro de un <form class="panel-content">,
-    # cada una con pares de <label>Etiqueta:</label> + <div>Valor</div>.
+    Ambos datos usan EXACTAMENTE el mismo patron HTML (confirmado
+    revisando la pagina real): un <form class="panel-content"> con filas
+    ".row", cada una con pares <label>Etiqueta:</label> + <b>Valor</b> --
+    el de "Multas e infracciones" es solo OTRO <form class="panel-content">
+    mas abajo en la pagina (dentro de <cyrpublico-mr-multas-infracciones>),
+    asi que basta con UNA sola busqueda que recorra TODOS esos formularios
+    de la pagina, sin importar en que seccion esten."""
+    resultado = {"activa": False, "estado_persona": "", "nombre_completo": "",
+                 "tiene_multas": False, "texto_multas": ""}
+
+    # Recorre TODOS los <form class="panel-content"> de la pagina (tanto
+    # el de arriba con NOMBRE COMPLETO/ESTADO DE LA PERSONA, como el de
+    # "Multas e infracciones" mas abajo) -- son filas ".row", cada una
+    # con pares de <label>Etiqueta:</label> + <div><b>Valor</b></div>.
     try:
         datos_generales = page.evaluate("""
             () => {
@@ -3618,6 +3630,9 @@ def _parsear_resultado_runt_persona(page):
     resultado["nombre_completo"] = datos_generales.get("NOMBRE COMPLETO", "")
     resultado["estado_persona"] = datos_generales.get("ESTADO DE LA PERSONA", "")
     resultado["activa"] = resultado["estado_persona"].strip().upper() == "ACTIVA"
+
+    resultado["texto_multas"] = datos_generales.get("TIENE MULTAS O INFRACCIONES", "")
+    resultado["tiene_multas"] = resultado["texto_multas"].strip().upper() == "SI"
 
     return resultado
 
@@ -3694,10 +3709,32 @@ def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido=""
             if page.query_selector('.swal2-confirm'):
                 page.click('.swal2-confirm')
             if "NO ACTIVA" in texto_error.upper():
-                return {"activa": False, "estado_persona": "NO ACTIVA", "nombre_completo": ""}
+                return {"activa": False, "estado_persona": "NO ACTIVA", "nombre_completo": "",
+                        "tiene_multas": False, "texto_multas": ""}
             # Cualquier OTRO error del RUNT (documento no encontrado,
             # apellido no coincide, etc.) si se propaga como error real.
             raise Exception(texto_error)
+
+    # El panel de "Multas e infracciones" trae su dato con una peticion
+    # aparte, despues de que aparece el bloque principal -- si se lee el
+    # texto antes de que esa peticion termine, ese campo sale vacio aunque
+    # el panel ya este expandido. Se espera a que la red quede en reposo,
+    # y se despliegan tambien los paneles que sigan colapsados.
+    if job_id:
+        job_actualizar(job_id, "Esperando a que cargue la información...", "procesando")
+    try:
+        page.wait_for_load_state("networkidle", timeout=20000)
+    except Exception:
+        pass
+    for _ in range(3):
+        headers_colapsados = page.query_selector_all('mat-expansion-panel-header[aria-expanded="false"]')
+        for header in headers_colapsados:
+            try:
+                header.click()
+                page.wait_for_timeout(300)
+            except Exception:
+                pass
+        page.wait_for_timeout(400)
 
     if job_id:
         job_actualizar(job_id, "Extrayendo datos...", "procesando")
