@@ -3676,8 +3676,8 @@ def _parsear_resultado_runt_persona(page):
         # exactamente que hay en la pagina en el momento de leerla.
         print("=== DIAGNOSTICO MULTAS RUNT PERSONA: no se encontro el dato ===", flush=True)
         try:
-            print("Texto visible de la pagina (primeros 2500 caracteres):", flush=True)
-            print(page.inner_text("body")[:2500], flush=True)
+            print("Texto visible de la pagina (primeros 4000 caracteres):", flush=True)
+            print(page.inner_text("body")[:4000], flush=True)
         except Exception:
             pass
         print("=== FIN DIAGNOSTICO MULTAS ===", flush=True)
@@ -3763,20 +3763,30 @@ def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido=""
             # apellido no coincide, etc.) si se propaga como error real.
             raise Exception(texto_error)
 
-    # El dato de "TIENE MULTAS O INFRACCIONES" ya esta listo apenas carga
-    # la pagina -- lo unico que falta es DESPLEGAR el segundo desplegable
-    # ("Multas e infracciones") para poder leerlo, ya que el acordeon usa
-    # multi="false" (Angular Material): solo un panel puede estar abierto
-    # a la vez.
+    # El dato de "TIENE MULTAS O INFRACCIONES" carga con una peticion
+    # propia que Angular solo dispara con un evento de expansion REAL --
+    # si el panel ya aparecia "abierto" desde que cargo la pagina, ese
+    # evento nunca se disparo, y se queda pegado en su version "de
+    # carga" (la tarjeta "Informacion de multas" con el campo vacio, en
+    # vez de la tabla con "TIENE MULTAS O INFRACCIONES"). Por eso aqui se
+    # fuerza un cierre + reapertura genuina, sin importar como estaba, y
+    # se espera a que aparezca el texto real (hasta 12 segundos).
     if job_id:
         job_actualizar(job_id, "Desplegando información de multas...", "procesando")
     try:
         header_multas = page.locator('mat-expansion-panel-header:has(mat-panel-title:has-text("Multas e infracciones"))').first
         if header_multas.count() > 0:
             header_multas.scroll_into_view_if_needed()
-            if header_multas.get_attribute("aria-expanded") != "true":
-                header_multas.click(force=True)
-            page.wait_for_timeout(1200)
+            if header_multas.get_attribute("aria-expanded") == "true":
+                header_multas.click(force=True)  # cerrar
+                page.wait_for_timeout(500)
+            header_multas.click(force=True)  # abrir "de verdad" -- dispara el evento de expansion
+            try:
+                page.wait_for_function("""
+                    () => document.body.innerText.toUpperCase().includes('TIENE MULTAS')
+                """, timeout=12000)
+            except Exception:
+                pass  # si no aparece a tiempo, se sigue igual -- el respaldo por texto se encarga despues
     except Exception:
         pass
 
