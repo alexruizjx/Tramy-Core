@@ -3809,11 +3809,18 @@ def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido=""
         if texto_error:
             if page.query_selector('.swal2-confirm'):
                 page.click('.swal2-confirm')
-            if "NO ACTIVA" in texto_error.upper():
+            texto_error_mayus = texto_error.upper()
+            if ("NO ACTIVA" in texto_error_mayus or "NO REGISTRAD" in texto_error_mayus
+                    or "NO SE ENCUENTRA" in texto_error_mayus or "NO ESTA REGISTRAD" in texto_error_mayus
+                    or "NO ESTÁ REGISTRAD" in texto_error_mayus):
                 return {"activa": False, "estado_persona": "NO ACTIVA", "nombre_completo": "",
                         "tiene_multas": False, "texto_multas": "", "solicitudes": []}
             # Cualquier OTRO error del RUNT (documento no encontrado,
-            # apellido no coincide, etc.) si se propaga como error real.
+            # apellido no coincide, etc.) si se propaga como error real --
+            # se deja registrado el texto exacto, por si hace falta
+            # agregar otra variante de "persona no activa" a la lista de
+            # arriba.
+            print(f"=== RUNT PERSONA: popup de error con texto no reconocido como 'no activa' -- '{texto_error}' ===", flush=True)
             raise Exception(texto_error)
 
     # Desplegable #2 (posicion 1, contando desde 0) = "Multas e
