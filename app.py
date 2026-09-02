@@ -3583,6 +3583,128 @@ def _extraer_resumen_runt(page):
     """) or {}
 
 
+RUNT_PERSONA_URL = "https://portalpublico.runt.gov.co/#/consulta-ciudadano-documento/consulta/consulta-ciudadano-documento"
+
+
+def _parsear_resultado_runt_persona(page):
+    """Extrae si la persona esta ACTIVA en el RUNT (unico dato que Tramy
+    necesita de esta consulta -- ya no se revisan multas, ese dato resulto
+    inconsistente)."""
+    resultado = {"activa": False, "estado_persona": "", "nombre_completo": ""}
+
+    # Seccion superior (NOMBRE COMPLETO / DOCUMENTO / ESTADO DE LA PERSONA /
+    # etc.) -- son filas ".row" dentro de un <form class="panel-content">,
+    # cada una con pares de <label>Etiqueta:</label> + <div>Valor</div>.
+    try:
+        datos_generales = page.evaluate("""
+            () => {
+                const filas = {};
+                document.querySelectorAll('form.panel-content .row').forEach(row => {
+                    const cols = row.querySelectorAll(':scope > div');
+                    for (let i = 0; i < cols.length - 1; i += 2) {
+                        const labelEl = cols[i].querySelector('label');
+                        if (!labelEl) continue;
+                        const label = labelEl.innerText.replace(/:\\s*$/, '').trim();
+                        const value = (cols[i+1].innerText || '').trim();
+                        filas[label] = value;
+                    }
+                });
+                return filas;
+            }
+        """) or {}
+    except Exception:
+        datos_generales = {}
+
+    resultado["nombre_completo"] = datos_generales.get("NOMBRE COMPLETO", "")
+    resultado["estado_persona"] = datos_generales.get("ESTADO DE LA PERSONA", "")
+    resultado["activa"] = resultado["estado_persona"].strip().upper() == "ACTIVA"
+
+    return resultado
+
+
+def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido="", job_id=None):
+    """Consulta 'Ciudadano por Documento' en el RUNT -- a diferencia de
+    consultar_runt_vehiculo (que busca por placa), esta busca directo por
+    documento de la persona. Devuelve si esta registrada en el RUNT y si
+    tiene multas. Reutiliza la misma infraestructura de captcha e
+    interaccion con mat-select que ya se uso para el RUNT de vehiculos."""
+    if job_id:
+        job_actualizar(job_id, "Abriendo el RUNT...", "procesando")
+
+    page.goto(RUNT_PERSONA_URL, wait_until="load", timeout=60000)
+    try:
+        page.wait_for_selector('input[formcontrolname="documento"]', timeout=45000)
+    except Exception as e_primer_intento:
+        print(f"Timeout esperando el formulario de personas del RUNT, reintentando con recarga completa: {e_primer_intento}", flush=True)
+        if job_id:
+            job_actualizar(job_id, "El RUNT tardó más de lo normal, reintentando...", "procesando")
+        page.goto(RUNT_PERSONA_URL, wait_until="load", timeout=60000)
+        page.wait_for_selector('input[formcontrolname="documento"]', timeout=45000)
+
+    if tipo_documento != "CC":
+        # "Cedula Ciudadania" es el default, solo se cambia si es otro tipo
+        texto = RUNT_TIPO_DOC_MAP.get(tipo_documento, "Cédula Ciudadanía")
+        _runt_seleccionar_mat_select(page, "tipoDocumento", texto)
+
+    page.fill('input[formcontrolname="documento"]', cedula)
+    # "Primer apellido" es obligatorio en este formulario (no lo pide el de
+    # vehiculos) -- el RUNT lo compara tal cual esta registrado, sin
+    # caracteres especiales (ver la nota que trae la propia pagina).
+    page.fill('input[formcontrolname="primerApellido"]', (primer_apellido or "").strip().upper())
+
+    if job_id:
+        job_actualizar(job_id, "Resolviendo captcha...", "procesando")
+
+    for intento_captcha in range(3):
+        page.wait_for_selector('img.img-fluid[src]', timeout=15000)
+        img_src = page.get_attribute('img.img-fluid', 'src')
+        if not img_src or ',' not in img_src:
+            raise Exception("No se pudo leer la imagen del captcha del RUNT (src vacío o con formato inesperado). Intenta consultar de nuevo.")
+        imagen_base64 = img_src.split(',', 1)[1]
+
+        texto_captcha = resolver_captcha_imagen_2captcha(imagen_base64)
+        page.fill('input[formcontrolname="captcha"]', texto_captcha)
+
+        if job_id:
+            job_actualizar(job_id, "Consultando información...", "procesando")
+
+        page.click('button[type="submit"]')
+
+        try:
+            page.wait_for_selector('form.panel-content, .mat-error, .swal2-popup', timeout=20000)
+        except Exception:
+            pass
+
+        error_captcha = page.query_selector('.swal2-popup:has-text("captcha")') \
+                     or page.query_selector('.swal2-popup:has-text("Captcha")')
+        if error_captcha:
+            page.click('.swal2-confirm') if page.query_selector('.swal2-confirm') else None
+            continue
+
+        break
+
+    # Cuando la persona NO esta activa en el RUNT, el sitio ni siquiera deja
+    # ver el resultado -- muestra un mensaje de error tipo "PERSONA NO
+    # ACTIVA EN EL RUNT" y no continua. Esto NO es un error de Tramy, es un
+    # resultado valido (la persona simplemente no esta activa).
+    error_popup = page.query_selector('.swal2-popup')
+    if error_popup:
+        texto_error = error_popup.inner_text().strip()
+        if texto_error:
+            if page.query_selector('.swal2-confirm'):
+                page.click('.swal2-confirm')
+            if "NO ACTIVA" in texto_error.upper():
+                return {"activa": False, "estado_persona": "NO ACTIVA", "nombre_completo": ""}
+            # Cualquier OTRO error del RUNT (documento no encontrado,
+            # apellido no coincide, etc.) si se propaga como error real.
+            raise Exception(texto_error)
+
+    if job_id:
+        job_actualizar(job_id, "Extrayendo datos...", "procesando")
+
+    return _parsear_resultado_runt_persona(page)
+
+
 def _parsear_resultado_runt_vehiculo(page):
     tarjetas = _extraer_tarjetas_runt(page)
     resumen = _extraer_resumen_runt(page)
@@ -7435,7 +7557,46 @@ def consultar_runt_vehiculo_endpoint():
     return jsonify({"job_id": job_id})
 
 
-def guardar_mi_consulta(user_id, placa, cedula):
+@app.route("/consultar-runt-persona", methods=["GET"])
+def consultar_runt_persona_endpoint():
+    """Consulta 'Ciudadano por Documento' en el RUNT -- devuelve si la
+    persona esta registrada y si tiene multas. Tiene su propio costo de
+    2Captcha (no comparte cache con la consulta de vehiculos)."""
+    cedula = request.args.get("cedula", "").strip()
+    tipo_documento = request.args.get("tipo_documento", "CC").strip().upper() or "CC"
+    primer_apellido = request.args.get("primer_apellido", "").strip()
+
+    if not cedula or not primer_apellido:
+        return jsonify({"error": "Debes proporcionar cedula y primer apellido."}), 400
+
+    job_id = str(uuid.uuid4())[:12]
+    job_actualizar(job_id, "Iniciando consulta RUNT...", "procesando")
+
+    def ejecutar():
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True, args=[
+                    "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                    "--single-process", "--no-zygote", "--disable-setuid-sandbox"
+                ])
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+                    viewport={"width": 390, "height": 844},
+                )
+                page = context.new_page()
+                datos = consultar_runt_persona(page, cedula, tipo_documento, primer_apellido, job_id=job_id)
+                context.close(); browser.close()
+
+            job_terminar(job_id, datos)
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc(), flush=True)
+            job_error(job_id, str(e))
+
+    hilo = threading.Thread(target=ejecutar)
+    hilo.start()
+
+    return jsonify({"job_id": job_id})
     """Registra que este usuario en particular consulto esta placa (y
     cedula), para el historial personal de 'Mis vehiculos consultados'.
     La restriccion unica es solo (user_id, placa) -- si la cedula viene
