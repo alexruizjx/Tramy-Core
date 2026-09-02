@@ -3736,6 +3736,29 @@ def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido=""
                 pass
         page.wait_for_timeout(400)
 
+    # "networkidle" no siempre alcanza a esperar lo suficiente para el
+    # dato de "TIENE MULTAS O INFRACCIONES" en si (viene de un componente
+    # de Angular que hace su propia peticion por separado) -- se espera
+    # explicitamente a que la celda de VALOR junto a esa etiqueta tenga
+    # texto real, hasta 15 segundos, antes de dar por hecho que ya cargo.
+    try:
+        page.wait_for_function("""
+            () => {
+                const labels = document.querySelectorAll('form.panel-content .row label');
+                for (const l of labels) {
+                    if (l.innerText.trim().toUpperCase().startsWith('TIENE MULTAS')) {
+                        const cols = Array.from(l.closest('.row').querySelectorAll(':scope > div'));
+                        const idx = cols.findIndex(c => c.contains(l));
+                        const valorCol = cols[idx + 1];
+                        return !!(valorCol && valorCol.innerText.trim().length > 0);
+                    }
+                }
+                return false;
+            }
+        """, timeout=15000)
+    except Exception:
+        pass  # si no llega a tiempo, se sigue igual -- el dato quedara vacio (tratado como "sin multas")
+
     if job_id:
         job_actualizar(job_id, "Extrayendo datos...", "procesando")
 
