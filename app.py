@@ -4354,14 +4354,25 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
         # una celda separada. "Formulario" y "Formulario (dos
         # vendedores)" comparten las mismas celdas de valor (AE51/AE52);
         # "Formulario (dos compradores)" las tiene en AE49/AE50.
+        def _tramy_fecha_soat_rtm_legible(fecha_iso):
+            # "2026-09-29" -> "29 SEPTIEMBRE 2026"
+            if not fecha_iso:
+                return ""
+            _meses_soat_rtm = ["ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO",
+                               "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"]
+            try:
+                _anio, _mes, _dia = fecha_iso.strip()[:10].split("-")
+                return f"{int(_dia):02d} {_meses_soat_rtm[int(_mes) - 1]} {_anio}"
+            except Exception:
+                return fecha_iso  # si no viene en el formato esperado, se deja tal cual
         if nombre_hoja in ("FORMULARIO", "FORMULARIO (2)"):
             _celda_soat_form, _celda_rtm_form = "AE51", "AE52"
         else:
             _celda_soat_form, _celda_rtm_form = "AE49", "AE50"
         if datos_vehiculo.get("soat_vigente") is True:
-            _escribir_celda_segura(hoja, _celda_soat_form, "Vigente hasta " + (datos_vehiculo.get("soat_fecha_fin") or ""), color_fuente="FF000000")
+            _escribir_celda_segura(hoja, _celda_soat_form, "Vigente hasta " + _tramy_fecha_soat_rtm_legible(datos_vehiculo.get("soat_fecha_fin")), color_fuente="FF000000")
         if datos_vehiculo.get("rtm_vigente") is True:
-            _escribir_celda_segura(hoja, _celda_rtm_form, "Vigente hasta " + (datos_vehiculo.get("rtm_fecha_fin") or ""), color_fuente="FF000000")
+            _escribir_celda_segura(hoja, _celda_rtm_form, "Vigente hasta " + _tramy_fecha_soat_rtm_legible(datos_vehiculo.get("rtm_fecha_fin")), color_fuente="FF000000")
 
     # Afirmacion de Traspaso tiene una celda con la fecha de hoy
     # (=TODAY()) que LibreOffice muestra en INGLES (ej. "15-August-2026")
