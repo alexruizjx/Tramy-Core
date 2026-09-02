@@ -7678,6 +7678,9 @@ def consultar_runt_persona_endpoint():
     hilo.start()
 
     return jsonify({"job_id": job_id})
+
+
+def guardar_mi_consulta(user_id, placa, cedula):
     """Registra que este usuario en particular consulto esta placa (y
     cedula), para el historial personal de 'Mis vehiculos consultados'.
     La restriccion unica es solo (user_id, placa) -- si la cedula viene
