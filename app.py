@@ -7689,6 +7689,229 @@ def consultar_runt_vehiculo_endpoint():
     return jsonify({"job_id": job_id})
 
 
+SIMIT_URL = "https://www.fcm.org.co/simit/#/home-public"
+
+
+def _simit_extraer_resumen(page):
+    """Lee la tarjeta de resumen (#resumenEstadoCuenta). La mayoria de
+    'celdas' de esa fila traen etiqueta Y valor juntos (a diferencia del
+    RUNT, donde van en columnas separadas) -- ej.
+    <div><label>Multas:</label> <span><strong>2</strong></span></div>
+    PERO la celda del nombre enmascarado es distinta: viene como una
+    <label> SOLA, sin ningun span/strong al lado (ej. <label>GER***
+    ALE***</label>) -- ese caso se guarda aparte, bajo la clave especial
+    '_nombre_enmascarado', para no perderlo."""
+    try:
+        return page.evaluate("""
+            () => {
+                const resumen = {};
+                document.querySelectorAll('#resumenEstadoCuenta .row > div').forEach(div => {
+                    const label = div.querySelector('label');
+                    if (!label) return;
+                    const valor = div.querySelector('span strong');
+                    if (valor) {
+                        const key = label.textContent.replace(/:\\s*$/, '').trim();
+                        resumen[key] = valor.textContent.trim();
+                    } else {
+                        const texto = label.textContent.trim();
+                        if (texto && texto !== 'Resumen') {
+                            resumen['_nombre_enmascarado'] = texto;
+                        }
+                    }
+                });
+                return resumen;
+            }
+        """) or {}
+    except Exception:
+        return {}
+
+
+def _simit_extraer_filas_tabla(page):
+    """Lee cada fila de la tabla #multaTable (comparendos y multas) --
+    usa los atributos data-label de cada <td>, que ya vienen marcados en
+    el propio HTML del SIMIT, en vez de depender del orden de columnas."""
+    try:
+        return page.evaluate("""
+            () => {
+                const filas = [];
+                document.querySelectorAll('#multaTable tbody tr.page-row').forEach(tr => {
+                    const celda = (label) => tr.querySelector('td[data-label="' + label + '"]');
+                    const tdTipo = celda('Tipo');
+                    const numero = tdTipo ? tdTipo.querySelector('a .insuit-u, a span') : null;
+                    const tipoTexto = tdTipo ? tdTipo.querySelector('p.text-muted') : null;
+                    const fechaSpan = tdTipo ? tdTipo.querySelector('span.fs-13') : null;
+                    const tdNotif = celda('Notificación');
+                    const tdPlaca = celda('Placa');
+                    const tdSecretaria = celda('Secretaría');
+                    const tdInfraccion = celda('Infracción');
+                    const infraccionLabel = tdInfraccion ? tdInfraccion.querySelector('label span') : null;
+                    const infraccionPopover = tdInfraccion ? tdInfraccion.querySelector('span[data-content]') : null;
+                    const tdEstado = celda('Estado');
+                    const tdValor = celda('Valor');
+                    const tdValorPagar = celda('Valor a pagar');
+
+                    filas.push({
+                        numero: numero ? numero.textContent.trim() : '',
+                        tipo: tipoTexto ? tipoTexto.textContent.trim() : '',
+                        fecha: fechaSpan ? fechaSpan.textContent.replace(/\\s+/g, ' ').trim() : '',
+                        notificacion: tdNotif ? tdNotif.textContent.replace(/\\s+/g, ' ').trim() : '',
+                        placa: tdPlaca ? tdPlaca.textContent.replace(/\\s+/g, ' ').trim() : '',
+                        secretaria: tdSecretaria ? tdSecretaria.childNodes[0].textContent.trim() : '',
+                        infraccion_codigo: infraccionLabel ? infraccionLabel.textContent.trim() : '',
+                        infraccion_descripcion: infraccionPopover ? (infraccionPopover.getAttribute('data-content') || '') : '',
+                        estado: tdEstado ? tdEstado.childNodes[0].textContent.trim() : '',
+                        valor: tdValor ? tdValor.childNodes[0].textContent.replace(/\\s+/g, ' ').trim() : '',
+                        valor_a_pagar: tdValorPagar ? tdValorPagar.childNodes[0].textContent.replace(/\\s+/g, ' ').trim() : ''
+                    });
+                });
+                return filas;
+            }
+        """) or []
+    except Exception:
+        return []
+
+
+def consultar_simit(page, numero_documento, job_id=None):
+    """Consulta 'Estado de cuenta' en el SIMIT por numero de documento (o
+    placa). A diferencia del RUNT, el SIMIT NO pide resolver un captcha
+    de imagen -- usa una verificacion invisible que se resuelve sola con
+    JavaScript (el navegador real de Playwright la pasa automaticamente,
+    solo hay que darle tiempo)."""
+    if job_id:
+        job_actualizar(job_id, "Abriendo el SIMIT...", "procesando")
+
+    page.goto(SIMIT_URL, wait_until="load", timeout=60000)
+    page.wait_for_selector('#txtBusqueda', timeout=45000)
+
+    page.fill('#txtBusqueda', numero_documento)
+
+    if job_id:
+        job_actualizar(job_id, "Consultando información...", "procesando")
+
+    page.click('#btnNumDocPlaca')
+
+    # La verificacion invisible de seguridad muestra un modal
+    # ("¡Espera un momento! Estamos realizando algunas validaciones...")
+    # mientras corre -- si aparece, se espera a que se cierre solo antes
+    # de seguir.
+    try:
+        page.wait_for_selector('#whcModal', state="visible", timeout=3000)
+    except Exception:
+        pass
+    try:
+        page.wait_for_selector('#whcModal', state="hidden", timeout=15000)
+    except Exception:
+        pass
+
+    # Se espera a que aparezca UNO de los 3 resultados posibles: la
+    # tarjeta de resumen (tiene comparendos/multas/acuerdos), un
+    # encabezado de "No tiene multas" (esta al dia), o el modal de
+    # "varios resultados" (la cedula tiene mas de una persona asociada).
+    try:
+        page.wait_for_selector(
+            '#resumenEstadoCuenta, #modal-multiples-personas.show, h3:has-text("No tiene multas")',
+            timeout=25000
+        )
+    except Exception:
+        pass
+
+    resultado = {"encontrado": False, "al_dia": False, "multiples_personas": False,
+                 "nombre": "", "cedula": "", "comparendos": 0, "multas": 0,
+                 "acuerdos_de_pago": 0, "total_a_pagar": "", "detalle": []}
+
+    # Caso: varios resultados para el mismo numero de documento -- el
+    # SIMIT pide elegir cual persona consultar. Por ahora se reporta
+    # este caso tal cual, sin elegir automaticamente.
+    modal_multiples = page.query_selector('#modal-multiples-personas.show')
+    if modal_multiples:
+        resultado["multiples_personas"] = True
+        return resultado
+
+    resumen = _simit_extraer_resumen(page)
+    if resumen:
+        resultado["encontrado"] = True
+        resultado["nombre"] = resumen.get("_nombre_enmascarado", "")
+        resultado["cedula"] = resumen.get("Cédula", "")
+        try:
+            resultado["comparendos"] = int(resumen.get("Comparendos", "0") or "0")
+        except ValueError:
+            pass
+        try:
+            resultado["multas"] = int(resumen.get("Multas", "0") or "0")
+        except ValueError:
+            pass
+        try:
+            resultado["acuerdos_de_pago"] = int(resumen.get("Acuerdos de pago", "0") or "0")
+        except ValueError:
+            pass
+        resultado["total_a_pagar"] = resumen.get("Total", "")
+        resultado["detalle"] = _simit_extraer_filas_tabla(page)
+    else:
+        # Sin tarjeta de resumen -- puede ser "al dia" (sin multas) o que
+        # el numero de documento no exista en el SIMIT. El propio SIMIT
+        # distingue estos casos con un encabezado "No tiene multas".
+        try:
+            al_dia = page.query_selector('h3:has-text("No tiene multas")') is not None
+        except Exception:
+            al_dia = False
+        resultado["encontrado"] = True
+        resultado["al_dia"] = al_dia
+
+    if not resultado["encontrado"] or (not resumen and not resultado["al_dia"]):
+        # Diagnostico -- si el resultado no calzo en ninguno de los
+        # casos esperados, esto ayuda a ver que paso realmente.
+        print("=== DIAGNOSTICO SIMIT: resultado inesperado ===", flush=True)
+        try:
+            print(page.evaluate("() => document.body.textContent")[:3000], flush=True)
+        except Exception:
+            pass
+        print("=== FIN DIAGNOSTICO SIMIT ===", flush=True)
+
+    return resultado
+
+
+@app.route("/consultar-simit", methods=["GET"])
+def consultar_simit_endpoint():
+    """Consulta 'Estado de cuenta' en el SIMIT por cedula o placa. No
+    necesita 2Captcha (verificacion invisible, se resuelve sola)."""
+    numero_documento = request.args.get("numero_documento", "").strip()
+
+    if not numero_documento:
+        return jsonify({"error": "Debes proporcionar un numero de documento o placa."}), 400
+
+    job_id = str(uuid.uuid4())[:12]
+    job_actualizar(job_id, "Iniciando consulta SIMIT...", "procesando")
+
+    def ejecutar():
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True, args=[
+                    "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                    "--single-process", "--no-zygote", "--disable-setuid-sandbox"
+                ])
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    viewport={"width": 1366, "height": 900},
+                    is_mobile=False,
+                    has_touch=False,
+                    device_scale_factor=1,
+                )
+                page = context.new_page()
+                datos = consultar_simit(page, numero_documento, job_id=job_id)
+                context.close(); browser.close()
+
+            job_terminar(job_id, datos)
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc(), flush=True)
+            job_error(job_id, str(e))
+
+    hilo = threading.Thread(target=ejecutar)
+    hilo.start()
+
+    return jsonify({"job_id": job_id})
+
+
 @app.route("/consultar-runt-persona", methods=["GET"])
 def consultar_runt_persona_endpoint():
     """Consulta 'Ciudadano por Documento' en el RUNT -- devuelve si la
