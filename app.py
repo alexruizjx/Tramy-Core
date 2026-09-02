@@ -3589,36 +3589,33 @@ RUNT_PERSONA_URL = "https://portalpublico.runt.gov.co/#/consulta-ciudadano-docum
 def _parsear_resultado_runt_persona(page):
     """Extrae 2 datos de la pagina de resultado de 'Consulta Ciudadano por
     Documento': si la persona esta ACTIVA en el RUNT, y si TIENE MULTAS O
-    INFRACCIONES (SI/NO). Este segundo dato carga de forma asincrona
-    dentro del panel "Multas e infracciones" -- por eso consultar_runt_persona
-    espera a que la red quede en reposo antes de llamar a esta funcion.
+    INFRACCIONES (SI/NO).
 
-    Ambos datos usan EXACTAMENTE el mismo patron HTML (confirmado
-    revisando la pagina real): un <form class="panel-content"> con filas
-    ".row", cada una con pares <label>Etiqueta:</label> + <b>Valor</b> --
-    el de "Multas e infracciones" es solo OTRO <form class="panel-content">
-    mas abajo en la pagina (dentro de <cyrpublico-mr-multas-infracciones>),
-    asi que basta con UNA sola busqueda que recorra TODOS esos formularios
-    de la pagina, sin importar en que seccion esten."""
+    Usa EL MISMO patron ya probado y confiable de _extraer_resumen_runt
+    (el que se usa para leer la franja superior del RUNT de vehiculos):
+    pares <label>Etiqueta:</label> + <div class="show-grande"><b>Valor</b></div>
+    como hermanos dentro de un mismo ".row", emparejados por POSICION
+    dentro de la fila (no solo "el siguiente div", que fue el intento
+    anterior que fallaba) -- y exigiendo la clase "show-grande" en el
+    valor, igual que alla. "Multas e infracciones" usa exactamente esta
+    misma estructura mas abajo en la pagina, dentro de otro
+    <form class="panel-content"> -- por eso una sola busqueda que
+    recorra TODOS los ".row" de la pagina alcanza para los 2 datos."""
     resultado = {"activa": False, "estado_persona": "", "nombre_completo": "",
                  "tiene_multas": False, "texto_multas": ""}
 
-    # Recorre TODOS los <form class="panel-content"> de la pagina (tanto
-    # el de arriba con NOMBRE COMPLETO/ESTADO DE LA PERSONA, como el de
-    # "Multas e infracciones" mas abajo) -- son filas ".row", cada una
-    # con pares de <label>Etiqueta:</label> + <div><b>Valor</b></div>.
     try:
         datos_generales = page.evaluate("""
             () => {
                 const filas = {};
                 document.querySelectorAll('form.panel-content .row').forEach(row => {
-                    const cols = row.querySelectorAll(':scope > div');
-                    for (let i = 0; i < cols.length - 1; i += 2) {
-                        const labelEl = cols[i].querySelector('label');
-                        if (!labelEl) continue;
-                        const label = labelEl.innerText.replace(/:\\s*$/, '').trim();
-                        const value = (cols[i+1].innerText || '').trim();
-                        filas[label] = value;
+                    const labels = Array.from(row.querySelectorAll(':scope > div > label'));
+                    const valores = Array.from(row.querySelectorAll(':scope > div.show-grande > b'));
+                    if (labels.length > 0 && labels.length === valores.length) {
+                        labels.forEach((lab, i) => {
+                            const key = lab.textContent.replace(/:\\s*$/, '').trim();
+                            filas[key] = valores[i].textContent.trim();
+                        });
                     }
                 });
                 return filas;
@@ -3631,53 +3628,45 @@ def _parsear_resultado_runt_persona(page):
     resultado["estado_persona"] = datos_generales.get("ESTADO DE LA PERSONA", "")
     resultado["activa"] = resultado["estado_persona"].strip().upper() == "ACTIVA"
 
-    # El campo de multas se lee aparte, apuntando directo al componente
-    # <cyrpublico-mr-multas-infracciones> (confirmado con el HTML real) --
-    # mas preciso que buscarlo junto con los demas campos generales.
-    try:
-        texto_multas = page.evaluate("""
-            () => {
-                const comp = document.querySelector('cyrpublico-mr-multas-infracciones');
-                if (!comp) return null;
-                const labels = comp.querySelectorAll('.row label');
-                for (const l of labels) {
-                    if (l.innerText.trim().toUpperCase().startsWith('TIENE MULTAS')) {
-                        const cols = Array.from(l.closest('.row').querySelectorAll(':scope > div'));
-                        const idx = cols.findIndex(c => c.contains(l));
-                        const valorCol = cols[idx + 1];
-                        return valorCol ? valorCol.innerText.trim() : '';
-                    }
-                }
-                return null;
-            }
-        """)
-    except Exception:
-        texto_multas = None
+    resultado["texto_multas"] = datos_generales.get("TIENE MULTAS O INFRACCIONES", "")
+    resultado["tiene_multas"] = resultado["texto_multas"].strip().upper() == "SI"
 
-    # Respaldo: si la busqueda estructurada (arriba) no encontro nada --
-    # por ejemplo si la estructura exacta del componente cambio, o si por
-    # algun motivo el panel no termino de desplegarse como se esperaba --
-    # se busca el mismo texto directo en TODO lo que se ve en la pagina,
-    # sin depender de la estructura HTML especifica.
-    if not texto_multas:
+    # Respaldo: si por algun motivo no aparecio en la busqueda estructurada
+    # de arriba, se busca el mismo texto directo en TODO lo que se ve en
+    # la pagina, sin depender de la estructura HTML especifica.
+    if not resultado["texto_multas"]:
         try:
-            texto_pagina = page.inner_text("body")
+            texto_pagina = page.evaluate("() => document.body.textContent")
             m = re.search(r"TIENE MULTAS O INFRACCIONES\s*:?\s*\n?\s*(SI|NO)\b", texto_pagina, re.IGNORECASE)
             if m:
-                texto_multas = m.group(1).upper()
+                resultado["texto_multas"] = m.group(1).upper()
+                resultado["tiene_multas"] = resultado["texto_multas"] == "SI"
         except Exception:
             pass
 
-    resultado["texto_multas"] = texto_multas or ""
-    resultado["tiene_multas"] = (texto_multas or "").strip().upper() == "SI"
-
-    if not texto_multas:
+    if not resultado["texto_multas"]:
         # Diagnostico -- si esto sigue sin funcionar, este log muestra
-        # exactamente que hay en la pagina en el momento de leerla.
+        # exactamente que hay en la pagina en el momento de leerla, y
+        # dice explicitamente cual VERSION del componente aparecio (la
+        # simple/incompleta de celular, o la completa de escritorio, o
+        # ninguna de las dos).
         print("=== DIAGNOSTICO MULTAS RUNT PERSONA: no se encontro el dato ===", flush=True)
         try:
+            version = page.evaluate("""
+                () => {
+                    const txt = document.body.textContent.toUpperCase();
+                    if (txt.includes('TIENE MULTAS O INFRACCIONES')) return 'COMPLETA (la que se buscaba, pero algo mas fallo)';
+                    if (txt.includes('INFORMACIÓN DE MULTAS') || txt.includes('INFORMACION DE MULTAS')) return 'SIMPLE/INCOMPLETA (version de celular)';
+                    return 'NINGUNA -- ni el componente de multas parece estar en la pagina';
+                }
+            """)
+            print(f"Version del componente detectada: {version}", flush=True)
+            print(f"Ancho de pantalla usado: {page.viewport_size}", flush=True)
+        except Exception:
+            pass
+        try:
             print("Texto visible de la pagina (primeros 4000 caracteres):", flush=True)
-            print(page.inner_text("body")[:4000], flush=True)
+            print(page.evaluate("() => document.body.textContent")[:4000], flush=True)
         except Exception:
             pass
         print("=== FIN DIAGNOSTICO MULTAS ===", flush=True)
@@ -3763,32 +3752,21 @@ def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido=""
             # apellido no coincide, etc.) si se propaga como error real.
             raise Exception(texto_error)
 
-    # El dato de "TIENE MULTAS O INFRACCIONES" carga con una peticion
-    # propia que Angular solo dispara con un evento de expansion REAL --
-    # si el panel ya aparecia "abierto" desde que cargo la pagina, ese
-    # evento nunca se disparo, y se queda pegado en su version "de
-    # carga" (la tarjeta "Informacion de multas" con el campo vacio, en
-    # vez de la tabla con "TIENE MULTAS O INFRACCIONES"). Por eso aqui se
-    # fuerza un cierre + reapertura genuina, sin importar como estaba, y
-    # se espera a que aparezca el texto real (hasta 12 segundos).
+    # El panel de "Multas e infracciones" ya viene expandido de por si
+    # cuando el resultado carga -- NO se le hace clic (los intentos
+    # anteriores de forzar cierre/reapertura no ayudaron, y es posible
+    # que interfirieran con la carga natural del componente). Aqui solo
+    # se espera a que aparezca el texto real "TIENE MULTAS", dandole
+    # tiempo de sobra (hasta 25 segundos) a que el componente cargue por
+    # su cuenta.
     if job_id:
-        job_actualizar(job_id, "Desplegando información de multas...", "procesando")
+        job_actualizar(job_id, "Esperando información de multas...", "procesando")
     try:
-        header_multas = page.locator('mat-expansion-panel-header:has(mat-panel-title:has-text("Multas e infracciones"))').first
-        if header_multas.count() > 0:
-            header_multas.scroll_into_view_if_needed()
-            if header_multas.get_attribute("aria-expanded") == "true":
-                header_multas.click(force=True)  # cerrar
-                page.wait_for_timeout(500)
-            header_multas.click(force=True)  # abrir "de verdad" -- dispara el evento de expansion
-            try:
-                page.wait_for_function("""
-                    () => document.body.innerText.toUpperCase().includes('TIENE MULTAS')
-                """, timeout=12000)
-            except Exception:
-                pass  # si no aparece a tiempo, se sigue igual -- el respaldo por texto se encarga despues
+        page.wait_for_function("""
+            () => document.body.textContent.toUpperCase().includes('TIENE MULTAS')
+        """, timeout=25000)
     except Exception:
-        pass
+        pass  # si no aparece a tiempo, se sigue igual -- el respaldo por texto se encarga despues
 
     if job_id:
         job_actualizar(job_id, "Extrayendo datos...", "procesando")
@@ -7675,10 +7653,17 @@ def consultar_runt_persona_endpoint():
                 # que el panel de "Multas e infracciones" muestra un
                 # componente mas simple e incompleto (sin el dato real
                 # "TIENE MULTAS O INFRACCIONES") cuando el sitio detecta
-                # una pantalla angosta de celular.
+                # una pantalla de celular. Ademas del ancho de pantalla y
+                # el user_agent, se apagan explicitamente "is_mobile" y
+                # "has_touch" -- Angular puede estar revisando esas
+                # senales por separado (no solo el ancho en pixeles) para
+                # decidir que version del componente mostrar.
                 context = browser.new_context(
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                     viewport={"width": 1366, "height": 900},
+                    is_mobile=False,
+                    has_touch=False,
+                    device_scale_factor=1,
                 )
                 page = context.new_page()
                 datos = consultar_runt_persona(page, cedula, tipo_documento, primer_apellido, job_id=job_id)
