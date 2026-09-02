@@ -3738,60 +3738,22 @@ def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido=""
             # apellido no coincide, etc.) si se propaga como error real.
             raise Exception(texto_error)
 
-    # El panel de "Multas e infracciones" trae su dato con una peticion
-    # aparte, despues de que aparece el bloque principal -- si se lee el
-    # texto antes de que esa peticion termine, ese campo sale vacio aunque
-    # el panel ya este expandido. Se espera a que la red quede en reposo.
+    # El dato de "TIENE MULTAS O INFRACCIONES" ya esta listo apenas carga
+    # la pagina -- lo unico que falta es DESPLEGAR el segundo desplegable
+    # ("Multas e infracciones") para poder leerlo, ya que el acordeon usa
+    # multi="false" (Angular Material): solo un panel puede estar abierto
+    # a la vez. Se usa un locator directo (mas confiable que
+    # evaluate_handle) apuntando al encabezado que CONTIENE ese titulo.
     if job_id:
-        job_actualizar(job_id, "Esperando a que cargue la información...", "procesando")
+        job_actualizar(job_id, "Desplegando información de multas...", "procesando")
     try:
-        page.wait_for_load_state("networkidle", timeout=20000)
+        header_multas = page.locator('mat-expansion-panel-header:has(mat-panel-title:has-text("Multas e infracciones"))')
+        if header_multas.count() > 0:
+            if header_multas.first.get_attribute("aria-expanded") != "true":
+                header_multas.first.click()
+                page.wait_for_timeout(600)
     except Exception:
         pass
-
-    # IMPORTANTE: este acordeon usa multi="false" (Angular Material) --
-    # solo UN panel puede estar abierto a la vez. Desplegar varios
-    # paneles en orden (como se hace en la consulta de vehiculos) hace
-    # que cada clic CIERRE el panel que se abrio antes -- por eso el
-    # panel de "Multas e infracciones" terminaba cerrado otra vez para
-    # cuando se intentaba leer. Aqui se abre especificamente ESE panel
-    # (y solo ese), al final, para que se quede abierto.
-    try:
-        panel_multas = page.query_selector('mat-panel-title:has-text("Multas e infracciones")')
-        if panel_multas:
-            header_multas = panel_multas.evaluate_handle("el => el.closest('mat-expansion-panel-header')")
-            if header_multas:
-                aria_expanded = header_multas.get_attribute("aria-expanded")
-                if aria_expanded != "true":
-                    header_multas.as_element().click()
-                    page.wait_for_timeout(500)
-    except Exception:
-        pass
-
-    # "networkidle" no siempre alcanza a esperar lo suficiente para el
-    # dato de "TIENE MULTAS O INFRACCIONES" en si (viene de un componente
-    # de Angular que hace su propia peticion por separado) -- se espera
-    # explicitamente a que la celda de VALOR junto a esa etiqueta tenga
-    # texto real, hasta 15 segundos, antes de dar por hecho que ya cargo.
-    try:
-        page.wait_for_function("""
-            () => {
-                const comp = document.querySelector('cyrpublico-mr-multas-infracciones');
-                if (!comp) return false;
-                const labels = comp.querySelectorAll('.row label');
-                for (const l of labels) {
-                    if (l.innerText.trim().toUpperCase().startsWith('TIENE MULTAS')) {
-                        const cols = Array.from(l.closest('.row').querySelectorAll(':scope > div'));
-                        const idx = cols.findIndex(c => c.contains(l));
-                        const valorCol = cols[idx + 1];
-                        return !!(valorCol && valorCol.innerText.trim().length > 0);
-                    }
-                }
-                return false;
-            }
-        """, timeout=15000)
-    except Exception:
-        pass  # si no llega a tiempo, se sigue igual -- el dato quedara vacio (tratado como "sin multas")
 
     if job_id:
         job_actualizar(job_id, "Extrayendo datos...", "procesando")
