@@ -3753,17 +3753,29 @@ def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido=""
             raise Exception(texto_error)
 
     # El panel de "Multas e infracciones" ya viene expandido de por si
-    # cuando el resultado carga -- NO se le hace clic (los intentos
-    # anteriores de forzar cierre/reapertura no ayudaron, y es posible
-    # que interfirieran con la carga natural del componente). Aqui solo
-    # se espera a que aparezca el texto real "TIENE MULTAS", dandole
-    # tiempo de sobra (hasta 25 segundos) a que el componente cargue por
-    # su cuenta.
+    # cuando el resultado carga -- NO se le hace clic. La etiqueta
+    # "TIENE MULTAS O INFRACCIONES" aparece casi de inmediato, PERO el
+    # VALOR (SI/NO) junto a ella carga un poco despues por su cuenta --
+    # por eso la espera de antes (que solo revisaba si la etiqueta ya
+    # estaba) terminaba "demasiado pronto", antes de que el valor llegara.
+    # Aqui se espera especificamente a que la celda de VALOR (la que
+    # tiene la clase "show-grande", junto a esa etiqueta) ya tenga texto,
+    # dandole hasta 25 segundos.
     if job_id:
         job_actualizar(job_id, "Esperando información de multas...", "procesando")
     try:
         page.wait_for_function("""
-            () => document.body.textContent.toUpperCase().includes('TIENE MULTAS')
+            () => {
+                const labels = document.querySelectorAll('form.panel-content .row > div > label');
+                for (const l of labels) {
+                    if (l.textContent.trim().toUpperCase().startsWith('TIENE MULTAS')) {
+                        const row = l.closest('.row');
+                        const valor = row.querySelector(':scope > div.show-grande > b');
+                        return !!(valor && valor.textContent.trim().length > 0);
+                    }
+                }
+                return false;
+            }
         """, timeout=25000)
     except Exception:
         pass  # si no aparece a tiempo, se sigue igual -- el respaldo por texto se encarga despues
