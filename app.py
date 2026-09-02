@@ -3763,32 +3763,21 @@ def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido=""
             # apellido no coincide, etc.) si se propaga como error real.
             raise Exception(texto_error)
 
-    # El dato de "TIENE MULTAS O INFRACCIONES" carga con una peticion
-    # propia que Angular solo dispara con un evento de expansion REAL --
-    # si el panel ya aparecia "abierto" desde que cargo la pagina, ese
-    # evento nunca se disparo, y se queda pegado en su version "de
-    # carga" (la tarjeta "Informacion de multas" con el campo vacio, en
-    # vez de la tabla con "TIENE MULTAS O INFRACCIONES"). Por eso aqui se
-    # fuerza un cierre + reapertura genuina, sin importar como estaba, y
-    # se espera a que aparezca el texto real (hasta 12 segundos).
+    # El panel de "Multas e infracciones" ya viene expandido de por si
+    # cuando el resultado carga -- NO se le hace clic (los intentos
+    # anteriores de forzar cierre/reapertura no ayudaron, y es posible
+    # que interfirieran con la carga natural del componente). Aqui solo
+    # se espera a que aparezca el texto real "TIENE MULTAS", dandole
+    # tiempo de sobra (hasta 25 segundos) a que el componente cargue por
+    # su cuenta.
     if job_id:
-        job_actualizar(job_id, "Desplegando información de multas...", "procesando")
+        job_actualizar(job_id, "Esperando información de multas...", "procesando")
     try:
-        header_multas = page.locator('mat-expansion-panel-header:has(mat-panel-title:has-text("Multas e infracciones"))').first
-        if header_multas.count() > 0:
-            header_multas.scroll_into_view_if_needed()
-            if header_multas.get_attribute("aria-expanded") == "true":
-                header_multas.click(force=True)  # cerrar
-                page.wait_for_timeout(500)
-            header_multas.click(force=True)  # abrir "de verdad" -- dispara el evento de expansion
-            try:
-                page.wait_for_function("""
-                    () => document.body.innerText.toUpperCase().includes('TIENE MULTAS')
-                """, timeout=12000)
-            except Exception:
-                pass  # si no aparece a tiempo, se sigue igual -- el respaldo por texto se encarga despues
+        page.wait_for_function("""
+            () => document.body.innerText.toUpperCase().includes('TIENE MULTAS')
+        """, timeout=25000)
     except Exception:
-        pass
+        pass  # si no aparece a tiempo, se sigue igual -- el respaldo por texto se encarga despues
 
     if job_id:
         job_actualizar(job_id, "Extrayendo datos...", "procesando")
