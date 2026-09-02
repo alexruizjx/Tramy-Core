@@ -3741,23 +3741,32 @@ def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido=""
     # El panel de "Multas e infracciones" trae su dato con una peticion
     # aparte, despues de que aparece el bloque principal -- si se lee el
     # texto antes de que esa peticion termine, ese campo sale vacio aunque
-    # el panel ya este expandido. Se espera a que la red quede en reposo,
-    # y se despliegan tambien los paneles que sigan colapsados.
+    # el panel ya este expandido. Se espera a que la red quede en reposo.
     if job_id:
         job_actualizar(job_id, "Esperando a que cargue la información...", "procesando")
     try:
         page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
         pass
-    for _ in range(3):
-        headers_colapsados = page.query_selector_all('mat-expansion-panel-header[aria-expanded="false"]')
-        for header in headers_colapsados:
-            try:
-                header.click()
-                page.wait_for_timeout(300)
-            except Exception:
-                pass
-        page.wait_for_timeout(400)
+
+    # IMPORTANTE: este acordeon usa multi="false" (Angular Material) --
+    # solo UN panel puede estar abierto a la vez. Desplegar varios
+    # paneles en orden (como se hace en la consulta de vehiculos) hace
+    # que cada clic CIERRE el panel que se abrio antes -- por eso el
+    # panel de "Multas e infracciones" terminaba cerrado otra vez para
+    # cuando se intentaba leer. Aqui se abre especificamente ESE panel
+    # (y solo ese), al final, para que se quede abierto.
+    try:
+        panel_multas = page.query_selector('mat-panel-title:has-text("Multas e infracciones")')
+        if panel_multas:
+            header_multas = panel_multas.evaluate_handle("el => el.closest('mat-expansion-panel-header')")
+            if header_multas:
+                aria_expanded = header_multas.get_attribute("aria-expanded")
+                if aria_expanded != "true":
+                    header_multas.as_element().click()
+                    page.wait_for_timeout(500)
+    except Exception:
+        pass
 
     # "networkidle" no siempre alcanza a esperar lo suficiente para el
     # dato de "TIENE MULTAS O INFRACCIONES" en si (viene de un componente
