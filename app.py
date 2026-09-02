@@ -3631,8 +3631,31 @@ def _parsear_resultado_runt_persona(page):
     resultado["estado_persona"] = datos_generales.get("ESTADO DE LA PERSONA", "")
     resultado["activa"] = resultado["estado_persona"].strip().upper() == "ACTIVA"
 
-    resultado["texto_multas"] = datos_generales.get("TIENE MULTAS O INFRACCIONES", "")
-    resultado["tiene_multas"] = resultado["texto_multas"].strip().upper() == "SI"
+    # El campo de multas se lee aparte, apuntando directo al componente
+    # <cyrpublico-mr-multas-infracciones> (confirmado con el HTML real) --
+    # mas preciso que buscarlo junto con los demas campos generales.
+    try:
+        texto_multas = page.evaluate("""
+            () => {
+                const comp = document.querySelector('cyrpublico-mr-multas-infracciones');
+                if (!comp) return null;
+                const labels = comp.querySelectorAll('.row label');
+                for (const l of labels) {
+                    if (l.innerText.trim().toUpperCase().startsWith('TIENE MULTAS')) {
+                        const cols = Array.from(l.closest('.row').querySelectorAll(':scope > div'));
+                        const idx = cols.findIndex(c => c.contains(l));
+                        const valorCol = cols[idx + 1];
+                        return valorCol ? valorCol.innerText.trim() : '';
+                    }
+                }
+                return null;
+            }
+        """)
+    except Exception:
+        texto_multas = None
+
+    resultado["texto_multas"] = texto_multas or ""
+    resultado["tiene_multas"] = (texto_multas or "").strip().upper() == "SI"
 
     return resultado
 
@@ -3744,7 +3767,9 @@ def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido=""
     try:
         page.wait_for_function("""
             () => {
-                const labels = document.querySelectorAll('form.panel-content .row label');
+                const comp = document.querySelector('cyrpublico-mr-multas-infracciones');
+                if (!comp) return false;
+                const labels = comp.querySelectorAll('.row label');
                 for (const l of labels) {
                     if (l.innerText.trim().toUpperCase().startsWith('TIENE MULTAS')) {
                         const cols = Array.from(l.closest('.row').querySelectorAll(':scope > div'));
