@@ -3586,6 +3586,69 @@ def _extraer_resumen_runt(page):
 RUNT_PERSONA_URL = "https://portalpublico.runt.gov.co/#/consulta-ciudadano-documento/consulta/consulta-ciudadano-documento"
 
 
+def _runt_persona_expandir_panel(page, indice_0based, job_id=None, etiqueta_log=""):
+    """Expande el desplegable en la posicion dada (0 = el primero) si no
+    esta ya expandido, y espera a que el spinner de carga desaparezca
+    antes de seguir -- confirmado por el usuario: cada vez que se abre
+    un desplegable por primera vez, aparece un spinner girando mientras
+    carga, y cuando termina de girar ya estan los datos. Se espera
+    primero a que el spinner APAREZCA (con un margen corto, por si el
+    dato ya estaba cargado y nunca llega a aparecer) y luego a que
+    DESAPAREZCA (con mas tiempo), para no adelantarse a leer mientras
+    todavia esta cargando."""
+    headers = page.locator('mat-expansion-panel-header')
+    if headers.count() <= indice_0based:
+        return
+    header = headers.nth(indice_0based)
+    header.scroll_into_view_if_needed()
+    ya_expandido = header.get_attribute("aria-expanded") == "true"
+    if not ya_expandido:
+        if job_id and etiqueta_log:
+            job_actualizar(job_id, f"Desplegando {etiqueta_log}...", "procesando")
+        header.click()
+    selector_spinner = 'mat-spinner, mat-progress-spinner, .mat-spinner, .mat-progress-spinner'
+    try:
+        page.wait_for_selector(selector_spinner, state="visible", timeout=2500)
+    except Exception:
+        pass  # no llego a aparecer -- puede que el dato ya estuviera listo, no es un error
+    try:
+        page.wait_for_selector(selector_spinner, state="hidden", timeout=20000)
+    except Exception:
+        pass
+    page.wait_for_timeout(400)  # pequeno colchon extra despues de que el spinner se va
+
+
+def _runt_persona_extraer_tabla_panel(page, indice_0based):
+    """Lee TODAS las filas de la tabla que hay dentro del desplegable en
+    la posicion dada -- devuelve una lista de diccionarios {columna: valor},
+    una entrada por fila. Lista vacia si no hay ninguna fila."""
+    try:
+        return page.evaluate("""
+            (indice) => {
+                const panels = document.querySelectorAll('mat-expansion-panel');
+                const panel = panels[indice];
+                if (!panel) return [];
+                const table = panel.querySelector('table');
+                if (!table) return [];
+                const headers = Array.from(table.querySelectorAll('thead th')).map(th => {
+                    const contenido = th.querySelector('.mat-sort-header-content');
+                    return (contenido ? contenido.textContent : th.textContent).trim();
+                });
+                const filas = [];
+                table.querySelectorAll('tbody tr').forEach(tr => {
+                    const celdas = Array.from(tr.querySelectorAll('td')).map(td => td.textContent.trim());
+                    if (celdas.length === 0) return;
+                    const fila = {};
+                    celdas.forEach((c, i) => { fila[headers[i] || ('col' + i)] = c; });
+                    filas.push(fila);
+                });
+                return filas;
+            }
+        """, indice_0based) or []
+    except Exception:
+        return []
+
+
 def _parsear_resultado_runt_persona(page):
     """Extrae 2 datos de la pagina de resultado de 'Consulta Ciudadano por
     Documento': si la persona esta ACTIVA en el RUNT, y si TIENE MULTAS O
@@ -3677,9 +3740,11 @@ def _parsear_resultado_runt_persona(page):
 def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido="", job_id=None):
     """Consulta 'Ciudadano por Documento' en el RUNT -- a diferencia de
     consultar_runt_vehiculo (que busca por placa), esta busca directo por
-    documento de la persona. Devuelve si esta registrada en el RUNT y si
-    tiene multas. Reutiliza la misma infraestructura de captcha e
-    interaccion con mat-select que ya se uso para el RUNT de vehiculos."""
+    documento de la persona. Devuelve si esta registrada en el RUNT, si
+    tiene multas (desplegable #2, "Multas e infracciones"), y las filas
+    de "Información solicitudes" (desplegable #7). Reutiliza la misma
+    infraestructura de captcha e interaccion con mat-select que ya se
+    uso para el RUNT de vehiculos."""
     if job_id:
         job_actualizar(job_id, "Abriendo el RUNT...", "procesando")
 
@@ -3747,43 +3812,26 @@ def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido=""
                 page.click('.swal2-confirm')
             if "NO ACTIVA" in texto_error.upper():
                 return {"activa": False, "estado_persona": "NO ACTIVA", "nombre_completo": "",
-                        "tiene_multas": False, "texto_multas": ""}
+                        "tiene_multas": False, "texto_multas": "", "solicitudes": []}
             # Cualquier OTRO error del RUNT (documento no encontrado,
             # apellido no coincide, etc.) si se propaga como error real.
             raise Exception(texto_error)
 
-    # El panel de "Multas e infracciones" ya viene expandido de por si
-    # cuando el resultado carga -- NO se le hace clic. La etiqueta
-    # "TIENE MULTAS O INFRACCIONES" aparece casi de inmediato, PERO el
-    # VALOR (SI/NO) junto a ella carga un poco despues por su cuenta --
-    # por eso la espera de antes (que solo revisaba si la etiqueta ya
-    # estaba) terminaba "demasiado pronto", antes de que el valor llegara.
-    # Aqui se espera especificamente a que la celda de VALOR (la que
-    # tiene la clase "show-grande", junto a esa etiqueta) ya tenga texto,
-    # dandole hasta 25 segundos.
-    if job_id:
-        job_actualizar(job_id, "Esperando información de multas...", "procesando")
-    try:
-        page.wait_for_function("""
-            () => {
-                const labels = document.querySelectorAll('form.panel-content .row > div > label');
-                for (const l of labels) {
-                    if (l.textContent.trim().toUpperCase().startsWith('TIENE MULTAS')) {
-                        const row = l.closest('.row');
-                        const valor = row.querySelector(':scope > div.show-grande > b');
-                        return !!(valor && valor.textContent.trim().length > 0);
-                    }
-                }
-                return false;
-            }
-        """, timeout=25000)
-    except Exception:
-        pass  # si no aparece a tiempo, se sigue igual -- el respaldo por texto se encarga despues
+    # Desplegable #2 (posicion 1, contando desde 0) = "Multas e
+    # infracciones" -- se despliega (si no lo estaba ya) y se espera el
+    # spinner de carga antes de seguir.
+    _runt_persona_expandir_panel(page, 1, job_id=job_id, etiqueta_log="información de multas")
+
+    # Desplegable #7 (posicion 6) = "Información solicitudes" -- mismo
+    # trato, para poder leer sus filas mas abajo.
+    _runt_persona_expandir_panel(page, 6, job_id=job_id, etiqueta_log="información de solicitudes")
 
     if job_id:
         job_actualizar(job_id, "Extrayendo datos...", "procesando")
 
-    return _parsear_resultado_runt_persona(page)
+    resultado = _parsear_resultado_runt_persona(page)
+    resultado["solicitudes"] = _runt_persona_extraer_tabla_panel(page, 6)
+    return resultado
 
 
 def _parsear_resultado_runt_vehiculo(page):
