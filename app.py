@@ -7727,17 +7727,14 @@ def _simit_extraer_resumen(page):
 
     if not resumen:
         # Respaldo -- cuando todos los valores son 0 (persona al dia),
-        # la estructura interna de la tarjeta parece venir distinta y la
-        # busqueda de arriba no encuentra nada. Aqui se busca el mismo
-        # texto directo dentro de #resumenEstadoCuenta con expresiones
-        # regulares, sin depender de la estructura exacta del HTML.
+        # el contenedor #resumenEstadoCuenta parece no existir con ese
+        # mismo id (posiblemente Angular usa una plantilla distinta para
+        # ese caso) -- por eso buscar SOLO ahi dentro no encontraba nada,
+        # aunque el texto "Resumen Comparendos: 0 ..." si esta visible en
+        # la pagina. Se busca en TODO el texto de la pagina en vez de
+        # limitarse a ese contenedor.
         try:
-            texto = page.evaluate("""
-                () => {
-                    const el = document.querySelector('#resumenEstadoCuenta');
-                    return el ? el.textContent : '';
-                }
-            """) or ""
+            texto = page.evaluate("() => document.body.textContent") or ""
         except Exception:
             texto = ""
         if texto:
