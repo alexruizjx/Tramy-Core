@@ -8100,6 +8100,36 @@ def _policia_extraer_tabla(page):
         return []
 
 
+def _policia_extraer_medidas_tabla(page):
+    """Lee la tabla 'Medidas Correctivas' (#ctl00_ContentPlaceHolder3_gv_medida)
+    que aparece al desplegar el detalle de un expediente (clic en su
+    enlace) -- misma estructura que la tabla principal (primera fila con
+    los encabezados en <th>, sin <thead> separado). Columnas reales:
+    Medida, Atribucion, Remitido a, Direccion, Estado -- se devuelven
+    todas, aunque el frontend solo muestre Medida y Estado."""
+    try:
+        return page.evaluate("""
+            () => {
+                const tabla = document.querySelector('#ctl00_ContentPlaceHolder3_gv_medida');
+                if (!tabla) return [];
+                const filasHtml = Array.from(tabla.querySelectorAll('tr'));
+                if (filasHtml.length === 0) return [];
+                const headers = Array.from(filasHtml[0].querySelectorAll('th')).map(th => th.textContent.trim());
+                const filas = [];
+                filasHtml.slice(1).forEach(tr => {
+                    const celdas = Array.from(tr.querySelectorAll('td')).map(td => td.textContent.trim());
+                    if (celdas.length === 0) return;
+                    const fila = {};
+                    celdas.forEach((c, i) => { fila[headers[i] || ('col' + i)] = c; });
+                    filas.push(fila);
+                });
+                return filas;
+            }
+        """) or []
+    except Exception:
+        return []
+
+
 def consultar_policia(page, numero_documento, fecha_expedicion, job_id=None):
     """Consulta el Registro Nacional de Medidas Correctivas (RNMC) de la
     Policia Nacional, por cedula de ciudadania + fecha de expedicion de
@@ -8157,6 +8187,37 @@ def consultar_policia(page, numero_documento, fecha_expedicion, job_id=None):
     resultado["registros"] = _policia_extraer_tabla(page)
     if resultado["registros"]:
         resultado["encontrado"] = True
+
+        # Por cada expediente, se hace clic en su enlace (columna
+        # "Expediente") para desplegar el detalle -- ahi abajo aparece la
+        # tabla "Medidas Correctivas" con las medidas y estados reales
+        # (la tabla principal solo trae el estado general del expediente,
+        # no las medidas especificas que lo componen). Es un postback de
+        # ASP.NET (UpdatePanel) -- se espera el indicador de carga propio
+        # del sitio antes de leer la tabla.
+        if job_id:
+            job_actualizar(job_id, "Obteniendo detalle de cada expediente...", "procesando")
+        for i in range(len(resultado["registros"])):
+            try:
+                # Se vuelve a ubicar la fila cada vez (no se guarda el
+                # handle de antes) -- el panel puede haberse re-renderizado
+                # completo con el postback anterior.
+                fila_link = page.locator('#gv_expedientes tr').nth(i + 1).locator('a').first
+                fila_link.click()
+                try:
+                    page.wait_for_selector('#ctl00_ContentPlaceHolder3_UpdateProgress1', state="visible", timeout=2000)
+                except Exception:
+                    pass
+                try:
+                    page.wait_for_selector('#ctl00_ContentPlaceHolder3_UpdateProgress1', state="hidden", timeout=25000)
+                except Exception:
+                    pass
+                page.wait_for_selector('#ctl00_ContentPlaceHolder3_gv_medida', timeout=15000)
+                page.wait_for_timeout(300)
+                resultado["registros"][i]["medidas"] = _policia_extraer_medidas_tabla(page)
+            except Exception as e:
+                print(f"=== POLICIA: no se pudo obtener el detalle del expediente #{i}: {e} ===", flush=True)
+                resultado["registros"][i]["medidas"] = []
 
     if not resultado["encontrado"]:
         # Caso confirmado: la persona no tiene ninguna medida correctiva
