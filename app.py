@@ -7919,10 +7919,20 @@ def consultar_simit(page, numero_documento, job_id=None):
 
     if not resultado["encontrado"] or (not resumen and not resultado["al_dia"]):
         # Diagnostico -- si el resultado no calzo en ninguno de los
-        # casos esperados, esto ayuda a ver que paso realmente.
+        # casos esperados, esto ayuda a ver que paso realmente. Se busca
+        # el texto a partir de "Estado de cuenta" (donde empieza el
+        # contenido real de la consulta) en vez de imprimir desde el
+        # inicio de la pagina, que es puro menu de navegacion y no dice
+        # nada util.
         print("=== DIAGNOSTICO SIMIT: resultado inesperado ===", flush=True)
         try:
-            print(page.evaluate("() => document.body.textContent")[:3000], flush=True)
+            print(f"URL actual: {page.url}", flush=True)
+            texto = page.evaluate("() => document.body.textContent")
+            idx = texto.find("Estado de cuenta")
+            if idx == -1:
+                idx = texto.find("Consulta aquí")
+            print("Fragmento a partir de 'Estado de cuenta':", flush=True)
+            print(texto[idx: idx + 2500] if idx >= 0 else "(no se encontro ese texto -- posiblemente la pagina no navego al resultado)", flush=True)
         except Exception:
             pass
         print("=== FIN DIAGNOSTICO SIMIT ===", flush=True)
