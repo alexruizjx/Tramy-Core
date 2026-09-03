@@ -7786,18 +7786,29 @@ def consultar_simit(page, numero_documento, job_id=None):
     # La pagina abre SOLA una ventana promocional (#modalInformation, con
     # un carrusel de imagenes) unos 300ms despues de cargar -- tapa toda
     # la pantalla y bloquea cualquier clic, incluido el del campo de
-    # busqueda, hasta que se cierre. Tambien puede aparecer el modal de
-    # validacion de seguridad (#whcModal) desde el arranque, no solo
-    # despues de buscar. Se cierran/esperan ambos antes de seguir.
+    # busqueda. El modal de validacion de seguridad (#whcModal) puede
+    # aparecer al mismo tiempo, ENCIMA de este (tiene z-index mas alto),
+    # lo que hace que el clic al boton de cerrar del primero tambien
+    # falle. En vez de pelear con clics que pueden quedar tapados, se
+    # elimina el modal promocional DIRECTAMENTE del HTML por JavaScript
+    # -- no depende de que ningun clic tenga exito.
+    page.wait_for_timeout(600)  # darle un momento a que el modal alcance a aparecer
     try:
-        page.wait_for_selector('#modalInformation.show', state="visible", timeout=4000)
-        try:
-            page.click('#modalInformation .modal-info-close', timeout=5000)
-        except Exception:
-            page.keyboard.press("Escape")  # respaldo si el boton tambien esta tapado
-        page.wait_for_selector('#modalInformation', state="hidden", timeout=8000)
+        page.evaluate("""
+            () => {
+                const modal = document.querySelector('#modalInformation');
+                if (modal) { modal.remove(); }
+                document.querySelectorAll('.modal-backdrop').forEach(b => b.remove());
+                document.body.classList.remove('modal-open');
+                document.body.style.overflow = '';
+                document.body.style.paddingRight = '';
+            }
+        """)
     except Exception:
         pass
+    # El modal de validacion de seguridad si se deja tal cual -- no hace
+    # falta quitarlo, solo esperar (con tiempo de sobra) a que el propio
+    # sitio lo cierre solo cuando termine de validar.
     try:
         page.wait_for_selector('#whcModal', state="hidden", timeout=20000)
     except Exception:
@@ -7808,6 +7819,21 @@ def consultar_simit(page, numero_documento, job_id=None):
     # este tipo de sitio a veces necesita los eventos reales de teclado
     # para "darse cuenta" de que el campo tiene contenido y activar el
     # boton de busqueda.
+    # Segundo intento de limpieza, justo antes de interactuar con el
+    # campo -- red de seguridad extra por si el modal reaparecio o no
+    # alcanzo a eliminarse a tiempo en el primer intento.
+    try:
+        page.evaluate("""
+            () => {
+                const modal = document.querySelector('#modalInformation');
+                if (modal) { modal.remove(); }
+                document.querySelectorAll('.modal-backdrop').forEach(b => b.remove());
+                document.body.classList.remove('modal-open');
+            }
+        """)
+    except Exception:
+        pass
+
     page.click('#txtBusqueda')
     page.keyboard.type(numero_documento, delay=60)
 
@@ -7916,6 +7942,12 @@ def consultar_simit(page, numero_documento, job_id=None):
             al_dia = False
         resultado["encontrado"] = True
         resultado["al_dia"] = al_dia
+        if al_dia:
+            # Al dia -- no hay tarjeta de resumen con numeros porque no
+            # hay nada que cobrar. Se dejan los contadores en 0 (ya
+            # vienen asi por defecto) y se pone explicitamente el total
+            # a pagar en $0, para que no quede vacio.
+            resultado["total_a_pagar"] = "$ 0"
 
     if not resultado["encontrado"] or (not resumen and not resultado["al_dia"]):
         # Diagnostico -- si el resultado no calzo en ninguno de los
