@@ -8039,6 +8039,157 @@ def consultar_simit_endpoint():
     return jsonify({"job_id": job_id})
 
 
+POLICIA_URL = "https://srvcnpc.policia.gov.co/PSC/frm_cnp_consulta.aspx"
+
+
+def _policia_extraer_tabla(page):
+    """Lee la tabla de expedientes (#gv_expedientes) -- la primera fila
+    trae los encabezados en <th>, sin <thead> separado (todo dentro del
+    mismo <tbody>), asi que se toma la primera fila como encabezados y
+    el resto como datos."""
+    try:
+        return page.evaluate("""
+            () => {
+                const tabla = document.querySelector('#gv_expedientes');
+                if (!tabla) return [];
+                const filasHtml = Array.from(tabla.querySelectorAll('tr'));
+                if (filasHtml.length === 0) return [];
+                const headers = Array.from(filasHtml[0].querySelectorAll('th')).map(th => th.textContent.trim());
+                const filas = [];
+                filasHtml.slice(1).forEach(tr => {
+                    const celdas = Array.from(tr.querySelectorAll('td')).map(td => td.textContent.trim());
+                    if (celdas.length === 0) return;
+                    const fila = {};
+                    celdas.forEach((c, i) => { fila[headers[i] || ('col' + i)] = c; });
+                    filas.push(fila);
+                });
+                return filas;
+            }
+        """) or []
+    except Exception:
+        return []
+
+
+def consultar_policia(page, numero_documento, fecha_expedicion, job_id=None):
+    """Consulta el Registro Nacional de Medidas Correctivas (RNMC) de la
+    Policia Nacional, por cedula de ciudadania + fecha de expedicion de
+    la cedula (formato DD/MM/AAAA, igual que pide el formulario). Este
+    sitio es ASP.NET clasico (postbacks, UpdatePanel) -- no hace falta
+    captcha, pero SI hace falta elegir primero el tipo de documento en
+    el desplegable, ya que eso dispara un postback propio que revela el
+    campo de Fecha de Expedicion (solo aparece para Cedula de
+    Ciudadania)."""
+    if job_id:
+        job_actualizar(job_id, "Abriendo el RNMC...", "procesando")
+
+    page.goto(POLICIA_URL, wait_until="load", timeout=60000)
+    page.wait_for_selector('#ctl00_ContentPlaceHolder3_ddlTipoDoc', state="visible", timeout=45000)
+
+    # Seleccionar "CEDULA DE CIUDADANIA" (value=55) -- dispara su propio
+    # postback (onchange) que hace aparecer el campo de Fecha de
+    # Expedicion. Se espera a que ese campo aparezca antes de seguir.
+    page.select_option('#ctl00_ContentPlaceHolder3_ddlTipoDoc', '55')
+
+    if job_id:
+        job_actualizar(job_id, "Cargando formulario...", "procesando")
+
+    page.wait_for_selector('#txtFechaexp', state="visible", timeout=20000)
+
+    page.fill('#ctl00_ContentPlaceHolder3_txtExpediente', numero_documento)
+    page.fill('#txtFechaexp', fecha_expedicion)
+
+    if job_id:
+        job_actualizar(job_id, "Consultando...", "procesando")
+
+    page.click('#ctl00_ContentPlaceHolder3_btnConsultar2')
+
+    # Espera a que aparezca el resultado -- ya sea el bloque con nombre
+    # y documento (cuando SI hay registros) o que la pagina termine de
+    # responder de alguna otra forma (sin registros, error, etc).
+    try:
+        page.wait_for_selector(
+            '#ctl00_ContentPlaceHolder3_txtNameUser2, #gv_expedientes',
+            timeout=30000
+        )
+    except Exception:
+        pass
+
+    resultado = {"encontrado": False, "nombre": "", "documento": "", "registros": []}
+
+    nombre_el = page.query_selector('#ctl00_ContentPlaceHolder3_txtNameUser2')
+    doc_el = page.query_selector('#ctl00_ContentPlaceHolder3_txtIdentificacionUser2')
+    if nombre_el:
+        resultado["encontrado"] = True
+        resultado["nombre"] = nombre_el.inner_text().strip()
+    if doc_el:
+        resultado["documento"] = doc_el.inner_text().strip()
+
+    resultado["registros"] = _policia_extraer_tabla(page)
+    if resultado["registros"]:
+        resultado["encontrado"] = True
+
+    if not resultado["encontrado"]:
+        # Diagnostico -- no tenemos confirmado todavia como se ve la
+        # pagina cuando la persona NO tiene ningun registro (medida
+        # correctiva), asi que si llega aqui, esto ayuda a ver que paso.
+        print("=== DIAGNOSTICO POLICIA: resultado inesperado (posible caso 'sin registros') ===", flush=True)
+        try:
+            print(f"URL actual: {page.url}", flush=True)
+            texto = page.evaluate("() => document.body.textContent")
+            idx = texto.find("Policía Nacional de Colombia informa")
+            if idx == -1:
+                idx = texto.find("Consulta Ciudadano")
+            print(texto[max(0, idx - 100): idx + 2000] if idx >= 0 else texto[:2000], flush=True)
+        except Exception:
+            pass
+        print("=== FIN DIAGNOSTICO POLICIA ===", flush=True)
+
+    return resultado
+
+
+@app.route("/consultar-policia", methods=["GET"])
+def consultar_policia_endpoint():
+    """Consulta el RNMC de la Policia Nacional por cedula + fecha de
+    expedicion. No necesita captcha."""
+    numero_documento = request.args.get("numero_documento", "").strip()
+    fecha_expedicion = request.args.get("fecha_expedicion", "").strip()
+
+    if not numero_documento or not fecha_expedicion:
+        return jsonify({"error": "Debes proporcionar numero_documento y fecha_expedicion (DD/MM/AAAA)."}), 400
+
+    job_id = str(uuid.uuid4())[:12]
+    job_actualizar(job_id, "Iniciando consulta a la Policía...", "procesando")
+
+    def ejecutar():
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True, args=[
+                    "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                    "--single-process", "--no-zygote", "--disable-setuid-sandbox"
+                ])
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    viewport={"width": 1366, "height": 900},
+                    is_mobile=False,
+                    has_touch=False,
+                    device_scale_factor=1,
+                )
+                page = context.new_page()
+                datos = consultar_policia(page, numero_documento, fecha_expedicion, job_id=job_id)
+                context.close(); browser.close()
+
+            job_terminar(job_id, datos)
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc(), flush=True)
+            job_error(job_id, str(e))
+
+    hilo = threading.Thread(target=ejecutar)
+    hilo.start()
+
+    return jsonify({"job_id": job_id})
+
+
 @app.route("/consultar-runt-persona", methods=["GET"])
 def consultar_runt_persona_endpoint():
     """Consulta 'Ciudadano por Documento' en el RUNT -- devuelve si la
