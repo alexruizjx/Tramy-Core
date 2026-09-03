@@ -7702,7 +7702,7 @@ def _simit_extraer_resumen(page):
     ALE***</label>) -- ese caso se guarda aparte, bajo la clave especial
     '_nombre_enmascarado', para no perderlo."""
     try:
-        return page.evaluate("""
+        resumen = page.evaluate("""
             () => {
                 const resumen = {};
                 document.querySelectorAll('#resumenEstadoCuenta .row > div').forEach(div => {
@@ -7723,7 +7723,37 @@ def _simit_extraer_resumen(page):
             }
         """) or {}
     except Exception:
-        return {}
+        resumen = {}
+
+    if not resumen:
+        # Respaldo -- cuando todos los valores son 0 (persona al dia),
+        # la estructura interna de la tarjeta parece venir distinta y la
+        # busqueda de arriba no encuentra nada. Aqui se busca el mismo
+        # texto directo dentro de #resumenEstadoCuenta con expresiones
+        # regulares, sin depender de la estructura exacta del HTML.
+        try:
+            texto = page.evaluate("""
+                () => {
+                    const el = document.querySelector('#resumenEstadoCuenta');
+                    return el ? el.textContent : '';
+                }
+            """) or ""
+        except Exception:
+            texto = ""
+        if texto:
+            patrones = {
+                "Comparendos": r"Comparendos:\s*([\d.,]+)",
+                "Multas": r"Multas:\s*([\d.,]+)",
+                "Acuerdos de pago": r"Acuerdos de pago:\s*([\d.,]+)",
+                "Total": r"Total:\s*(\$?\s*[\d.,]+)",
+                "Cédula": r"C[eé]dula:\s*([\d.,]+)",
+            }
+            for clave, patron in patrones.items():
+                m = re.search(patron, texto)
+                if m:
+                    resumen[clave] = m.group(1).strip()
+
+    return resumen
 
 
 def _simit_extraer_filas_tabla(page):
@@ -7930,26 +7960,24 @@ def consultar_simit(page, numero_documento, job_id=None):
             resultado["acuerdos_de_pago"] = int(resumen.get("Acuerdos de pago", "0") or "0")
         except ValueError:
             pass
-        resultado["total_a_pagar"] = resumen.get("Total", "")
+        resultado["total_a_pagar"] = resumen.get("Total", "") or "$ 0"
+        # "Al dia" = los 3 contadores en 0 -- no hay nada pendiente. El
+        # texto exacto que el SIMIT muestra en ese caso es "No tienes
+        # comparendos ni multas registradas en Simit" (NO "No tiene
+        # multas", que fue una suposicion incorrecta) -- mas simple y
+        # confiable basarse en los numeros ya extraidos que en adivinar
+        # el texto exacto de un mensaje.
+        resultado["al_dia"] = (resultado["comparendos"] == 0 and resultado["multas"] == 0
+                                and resultado["acuerdos_de_pago"] == 0)
         resultado["detalle"] = _simit_extraer_filas_tabla(page)
     else:
-        # Sin tarjeta de resumen -- puede ser "al dia" (sin multas) o que
-        # el numero de documento no exista en el SIMIT. El propio SIMIT
-        # distingue estos casos con un encabezado "No tiene multas".
-        try:
-            al_dia = page.query_selector('h3:has-text("No tiene multas")') is not None
-        except Exception:
-            al_dia = False
-        resultado["encontrado"] = True
-        resultado["al_dia"] = al_dia
-        if al_dia:
-            # Al dia -- no hay tarjeta de resumen con numeros porque no
-            # hay nada que cobrar. Se dejan los contadores en 0 (ya
-            # vienen asi por defecto) y se pone explicitamente el total
-            # a pagar en $0, para que no quede vacio.
-            resultado["total_a_pagar"] = "$ 0"
+        # Sin tarjeta de resumen en absoluto -- esto ya no deberia pasar
+        # para el caso "al dia" (el respaldo por texto de
+        # _simit_extraer_resumen ahora lo cubre), asi que si llega aqui
+        # probablemente el numero de documento no existe en el SIMIT.
+        resultado["encontrado"] = False
 
-    if not resultado["encontrado"] or (not resumen and not resultado["al_dia"]):
+    if not resultado["encontrado"]:
         # Diagnostico -- si el resultado no calzo en ninguno de los
         # casos esperados, esto ayuda a ver que paso realmente. Se busca
         # el texto a partir de "Estado de cuenta" (donde empieza el
