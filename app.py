@@ -7783,6 +7783,26 @@ def consultar_simit(page, numero_documento, job_id=None):
     page.goto(SIMIT_URL, wait_until="load", timeout=60000)
     page.wait_for_selector('#txtBusqueda', state="visible", timeout=45000)
 
+    # La pagina abre SOLA una ventana promocional (#modalInformation, con
+    # un carrusel de imagenes) unos 300ms despues de cargar -- tapa toda
+    # la pantalla y bloquea cualquier clic, incluido el del campo de
+    # busqueda, hasta que se cierre. Tambien puede aparecer el modal de
+    # validacion de seguridad (#whcModal) desde el arranque, no solo
+    # despues de buscar. Se cierran/esperan ambos antes de seguir.
+    try:
+        page.wait_for_selector('#modalInformation.show', state="visible", timeout=4000)
+        try:
+            page.click('#modalInformation .modal-info-close', timeout=5000)
+        except Exception:
+            page.keyboard.press("Escape")  # respaldo si el boton tambien esta tapado
+        page.wait_for_selector('#modalInformation', state="hidden", timeout=8000)
+    except Exception:
+        pass
+    try:
+        page.wait_for_selector('#whcModal', state="hidden", timeout=20000)
+    except Exception:
+        pass
+
     # Se usa clic + escritura simulada (page.keyboard.type) en vez de
     # page.fill() -- igual que en las paginas de Medellin y del RUNT,
     # este tipo de sitio a veces necesita los eventos reales de teclado
