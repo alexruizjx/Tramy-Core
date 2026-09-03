@@ -7814,23 +7814,41 @@ def consultar_simit(page, numero_documento, job_id=None):
     if job_id:
         job_actualizar(job_id, "Consultando información...", "procesando")
 
+    # Se usa Enter como metodo PRINCIPAL para enviar el formulario -- no
+    # depende de encontrar ni hacer clic en el boton (que en la prueba
+    # anterior desaparecio/quedo inubicable justo al momento de intentar
+    # hacer clic). El campo sigue enfocado desde que se escribio en el,
+    # asi que Enter deberia enviar el formulario igual que si se hiciera
+    # clic en el boton.
+    page.keyboard.press("Enter")
+
+    # Respaldo: si despues de esperar un poco no aparecio ningun
+    # resultado (ni resumen, ni "no tiene multas", ni modal de multiples
+    # personas), se intenta ademas con un clic directo al boton, por si
+    # el Enter no alcanzo a enviar el formulario.
     try:
-        page.wait_for_selector('#btnNumDocPlaca', state="visible", timeout=10000)
-        page.click('#btnNumDocPlaca', timeout=10000)
+        page.wait_for_selector(
+            '#resumenEstadoCuenta, #modal-multiples-personas.show, h3:has-text("No tiene multas"), #whcModal.show',
+            timeout=6000
+        )
     except Exception:
-        # Respaldo -- si el boton sigue sin responder a un clic normal,
-        # se fuerza el clic (salta la espera de que este "listo").
         try:
-            page.click('#btnNumDocPlaca', force=True, timeout=5000)
+            page.click('#btnNumDocPlaca', timeout=8000)
         except Exception:
-            print("=== DIAGNOSTICO SIMIT: no se pudo hacer clic en el boton de busqueda ===", flush=True)
             try:
-                print(f"URL actual: {page.url}", flush=True)
-                print(page.evaluate("() => document.body.textContent")[:2000], flush=True)
+                page.click('#btnNumDocPlaca', force=True, timeout=5000)
             except Exception:
-                pass
-            print("=== FIN DIAGNOSTICO SIMIT ===", flush=True)
-            raise
+                print("=== DIAGNOSTICO SIMIT: no se pudo enviar la busqueda (ni Enter ni clic funcionaron) ===", flush=True)
+                try:
+                    print(f"URL actual: {page.url}", flush=True)
+                    texto = page.evaluate("() => document.body.textContent")
+                    idx = texto.find("Estado de cuenta")
+                    print("Fragmento alrededor de 'Estado de cuenta':", flush=True)
+                    print(texto[max(0, idx - 200): idx + 800] if idx >= 0 else "(no se encontro ese texto en la pagina)", flush=True)
+                except Exception:
+                    pass
+                print("=== FIN DIAGNOSTICO SIMIT ===", flush=True)
+                raise
 
     # La verificacion invisible de seguridad muestra un modal
     # ("¡Espera un momento! Estamos realizando algunas validaciones...")
