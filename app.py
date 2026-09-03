@@ -8717,7 +8717,7 @@ def personas_buscar_endpoint():
             patron = f"%{consulta}%"
             cur.execute("""
                 SELECT id, nombres, apellido, segundo_apellido, tipo_documento, numero_documento,
-                       telefono, direccion, barrio_info, ciudad, email
+                       telefono, direccion, barrio_info, ciudad, email, fecha_expedicion
                 FROM personas
                 WHERE numero_documento ILIKE %s OR nombres ILIKE %s OR apellido ILIKE %s
                 ORDER BY actualizado_en DESC LIMIT 20
@@ -8725,7 +8725,7 @@ def personas_buscar_endpoint():
         else:
             cur.execute("""
                 SELECT id, nombres, apellido, segundo_apellido, tipo_documento, numero_documento,
-                       telefono, direccion, barrio_info, ciudad, email
+                       telefono, direccion, barrio_info, ciudad, email, fecha_expedicion
                 FROM personas ORDER BY actualizado_en DESC LIMIT 20
             """)
         filas = cur.fetchall()
@@ -8734,6 +8734,7 @@ def personas_buscar_endpoint():
             "id": f[0], "nombres": f[1], "apellido": f[2], "segundo_apellido": f[3],
             "tipo_documento": f[4], "numero_documento": f[5], "telefono": f[6],
             "direccion": f[7], "barrio_info": f[8], "ciudad": f[9], "email": f[10],
+            "fecha_expedicion": f[11],
         } for f in filas]
         return jsonify({"ok": True, "personas": personas})
     except Exception as e:
@@ -8826,6 +8827,36 @@ def personas_listar_endpoint():
             "direccion": f[7], "barrio_info": f[8], "ciudad": f[9], "email": f[10],
         } for f in filas]
         return jsonify({"ok": True, "personas": personas, "total": total, "pagina": pagina, "por_pagina": por_pagina})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/personas-guardar-fecha-expedicion", methods=["POST"])
+def personas_guardar_fecha_expedicion_endpoint():
+    """Guarda/actualiza SOLO el campo fecha_expedicion de una persona ya
+    existente -- separado de /personas-guardar (que reemplaza varios
+    campos a la vez) porque este boton especifico de 'Revision de
+    Personas' solo debe tocar este dato, sin arriesgar sobreescribir
+    ningun otro campo de la persona por accidente."""
+    datos = request.get_json(silent=True) or {}
+    persona_id = datos.get("id")
+    fecha_expedicion = (datos.get("fecha_expedicion") or "").strip()
+
+    if not persona_id:
+        return jsonify({"ok": False, "error": "Falta el id de la persona."}), 400
+    if not re.fullmatch(r"\d{8}", fecha_expedicion):
+        return jsonify({"ok": False, "error": "La fecha de expedición debe tener 8 dígitos (DDMMAAAA)."}), 400
+
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE personas SET fecha_expedicion = %s, actualizado_en = NOW() WHERE id = %s",
+            (fecha_expedicion, persona_id)
+        )
+        conn.commit()
+        cur.close(); conn.close()
+        return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
