@@ -3608,14 +3608,17 @@ def _runt_persona_expandir_panel(page, indice_0based, job_id=None, etiqueta_log=
         header.click()
     selector_spinner = 'mat-spinner, mat-progress-spinner, .mat-spinner, .mat-progress-spinner'
     try:
-        page.wait_for_selector(selector_spinner, state="visible", timeout=1000)
+        page.wait_for_selector(selector_spinner, state="visible", timeout=2500)
     except Exception:
         pass  # no llego a aparecer -- puede que el dato ya estuviera listo, no es un error
     try:
-        page.wait_for_selector(selector_spinner, state="hidden", timeout=20000)
+        page.wait_for_selector(selector_spinner, state="hidden", timeout=25000)
     except Exception:
         pass
-    page.wait_for_timeout(150)  # pequeno colchon extra despues de que el spinner se va
+    page.wait_for_timeout(500)  # colchon extra despues de que el spinner se va -- se subio
+    # de 150ms a 500ms porque con "Consultar todo" (RUNT+SIMIT+Policia a
+    # la vez) el servidor queda mas cargado y todo corre un poco mas
+    # lento, incluida la carga de este dato.
 
 
 def _runt_persona_extraer_tabla_panel(page, indice_0based):
@@ -3747,14 +3750,14 @@ def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido=""
     if job_id:
         job_actualizar(job_id, "Abriendo el RUNT...", "procesando")
 
-    page.goto(RUNT_PERSONA_URL, wait_until="load", timeout=60000)
+    page.goto(RUNT_PERSONA_URL, wait_until="load", timeout=90000)  # margen amplio -- puede correr junto a otros navegadores con "Consultar todo"
     try:
         page.wait_for_selector('input[formcontrolname="documento"]', timeout=45000)
     except Exception as e_primer_intento:
         print(f"Timeout esperando el formulario de personas del RUNT, reintentando con recarga completa: {e_primer_intento}", flush=True)
         if job_id:
             job_actualizar(job_id, "El RUNT tardó más de lo normal, reintentando...", "procesando")
-        page.goto(RUNT_PERSONA_URL, wait_until="load", timeout=60000)
+        page.goto(RUNT_PERSONA_URL, wait_until="load", timeout=90000)  # margen amplio -- puede correr junto a otros navegadores con "Consultar todo"
         page.wait_for_selector('input[formcontrolname="documento"]', timeout=45000)
 
     if tipo_documento != "CC":
@@ -3830,6 +3833,29 @@ def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido=""
     # prueba, para confirmar si el problema era especifico de este
     # desplegable o algo mas general; ya no hace falta desplegarlo.
     _runt_persona_expandir_panel(page, 1, job_id=job_id, etiqueta_log="información de multas")
+
+    # Verificacion extra, solo para este dato en particular (el que mas
+    # problemas de tiempo nos ha dado) -- ademas de esperar el spinner,
+    # se confirma que la celda de VALOR junto a "TIENE MULTAS O
+    # INFRACCIONES" ya tenga texto real antes de seguir. Con "Consultar
+    # todo" corriendo 3 navegadores a la vez, el servidor va mas lento,
+    # asi que se le da bastante margen (hasta 15 segundos extra).
+    try:
+        page.wait_for_function("""
+            () => {
+                const labels = document.querySelectorAll('form.panel-content .row > div > label');
+                for (const l of labels) {
+                    if (l.textContent.trim().toUpperCase().startsWith('TIENE MULTAS')) {
+                        const row = l.closest('.row');
+                        const valor = row.querySelector(':scope > div.show-grande > b');
+                        return !!(valor && valor.textContent.trim().length > 0);
+                    }
+                }
+                return false;
+            }
+        """, timeout=15000)
+    except Exception:
+        pass  # si no alcanza a confirmarse, se sigue igual -- el respaldo por texto en la extraccion se encarga
 
     if job_id:
         job_actualizar(job_id, "Extrayendo datos...", "procesando")
@@ -7807,7 +7833,11 @@ def consultar_simit(page, numero_documento, job_id=None):
     if job_id:
         job_actualizar(job_id, "Abriendo el SIMIT...", "procesando")
 
-    page.goto(SIMIT_URL, wait_until="load", timeout=60000)
+    # timeout mas amplio de lo normal (90s en vez de 60s) -- con
+    # "Consultar todo" pueden estar corriendo 2-3 navegadores a la vez en
+    # el servidor, y justo la carga inicial de la pagina es el momento
+    # mas pesado de cada consulta.
+    page.goto(SIMIT_URL, wait_until="load", timeout=90000)
     page.wait_for_selector('#txtBusqueda', state="visible", timeout=45000)
 
     # La pagina abre SOLA una ventana promocional (#modalInformation, con
@@ -8082,7 +8112,7 @@ def consultar_policia(page, numero_documento, fecha_expedicion, job_id=None):
     if job_id:
         job_actualizar(job_id, "Abriendo el RNMC...", "procesando")
 
-    page.goto(POLICIA_URL, wait_until="load", timeout=60000)
+    page.goto(POLICIA_URL, wait_until="load", timeout=90000)  # margen amplio -- puede correr junto a otros navegadores con "Consultar todo"
     page.wait_for_selector('#ctl00_ContentPlaceHolder3_ddlTipoDoc', state="visible", timeout=45000)
 
     # Seleccionar "CEDULA DE CIUDADANIA" (value=55) -- dispara su propio
