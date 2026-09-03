@@ -7781,14 +7781,36 @@ def consultar_simit(page, numero_documento, job_id=None):
         job_actualizar(job_id, "Abriendo el SIMIT...", "procesando")
 
     page.goto(SIMIT_URL, wait_until="load", timeout=60000)
-    page.wait_for_selector('#txtBusqueda', timeout=45000)
+    page.wait_for_selector('#txtBusqueda', state="visible", timeout=45000)
 
-    page.fill('#txtBusqueda', numero_documento)
+    # Se usa clic + escritura simulada (page.keyboard.type) en vez de
+    # page.fill() -- igual que en las paginas de Medellin y del RUNT,
+    # este tipo de sitio a veces necesita los eventos reales de teclado
+    # para "darse cuenta" de que el campo tiene contenido y activar el
+    # boton de busqueda.
+    page.click('#txtBusqueda')
+    page.keyboard.type(numero_documento, delay=60)
 
     if job_id:
         job_actualizar(job_id, "Consultando información...", "procesando")
 
-    page.click('#btnNumDocPlaca')
+    try:
+        page.wait_for_selector('#btnNumDocPlaca', state="visible", timeout=10000)
+        page.click('#btnNumDocPlaca', timeout=10000)
+    except Exception:
+        # Respaldo -- si el boton sigue sin responder a un clic normal,
+        # se fuerza el clic (salta la espera de que este "listo").
+        try:
+            page.click('#btnNumDocPlaca', force=True, timeout=5000)
+        except Exception:
+            print("=== DIAGNOSTICO SIMIT: no se pudo hacer clic en el boton de busqueda ===", flush=True)
+            try:
+                print(f"URL actual: {page.url}", flush=True)
+                print(page.evaluate("() => document.body.textContent")[:2000], flush=True)
+            except Exception:
+                pass
+            print("=== FIN DIAGNOSTICO SIMIT ===", flush=True)
+            raise
 
     # La verificacion invisible de seguridad muestra un modal
     # ("¡Espera un momento! Estamos realizando algunas validaciones...")
