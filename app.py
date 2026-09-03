@@ -8114,7 +8114,7 @@ def consultar_policia(page, numero_documento, fecha_expedicion, job_id=None):
     except Exception:
         pass
 
-    resultado = {"encontrado": False, "nombre": "", "documento": "", "registros": []}
+    resultado = {"encontrado": False, "sin_registros": False, "nombre": "", "documento": "", "registros": []}
 
     nombre_el = page.query_selector('#ctl00_ContentPlaceHolder3_txtNameUser2')
     doc_el = page.query_selector('#ctl00_ContentPlaceHolder3_txtIdentificacionUser2')
@@ -8129,10 +8129,22 @@ def consultar_policia(page, numero_documento, fecha_expedicion, job_id=None):
         resultado["encontrado"] = True
 
     if not resultado["encontrado"]:
-        # Diagnostico -- no tenemos confirmado todavia como se ve la
-        # pagina cuando la persona NO tiene ningun registro (medida
-        # correctiva), asi que si llega aqui, esto ayuda a ver que paso.
-        print("=== DIAGNOSTICO POLICIA: resultado inesperado (posible caso 'sin registros') ===", flush=True)
+        # Caso confirmado: la persona no tiene ninguna medida correctiva
+        # pendiente -- el sitio muestra este texto exacto (sin nombre ni
+        # documento visibles en ese caso).
+        try:
+            sin_medidas = page.query_selector(':text("NO TIENE MEDIDAS CORRECTIVAS")') is not None
+        except Exception:
+            sin_medidas = False
+        if sin_medidas:
+            resultado["encontrado"] = True
+            resultado["sin_registros"] = True
+            resultado["documento"] = numero_documento
+
+    if not resultado["encontrado"]:
+        # Diagnostico -- si llega aqui, es un caso genuinamente distinto
+        # a los 2 ya confirmados (con registros / sin registros).
+        print("=== DIAGNOSTICO POLICIA: resultado inesperado ===", flush=True)
         try:
             print(f"URL actual: {page.url}", flush=True)
             texto = page.evaluate("() => document.body.textContent")
