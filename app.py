@@ -8786,8 +8786,8 @@ def personas_guardar_endpoint():
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO personas (nombres, apellido, segundo_apellido, tipo_documento, numero_documento,
-                                   telefono, direccion, barrio_info, ciudad, email, notas, actualizado_en)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                                   telefono, direccion, barrio_info, ciudad, email, notas, fecha_expedicion, actualizado_en)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             ON CONFLICT (numero_documento) DO UPDATE SET
                 nombres = EXCLUDED.nombres, apellido = EXCLUDED.apellido,
                 segundo_apellido = EXCLUDED.segundo_apellido, tipo_documento = EXCLUDED.tipo_documento,
@@ -8797,6 +8797,7 @@ def personas_guardar_endpoint():
                 ciudad = CASE WHEN EXCLUDED.ciudad <> '' THEN EXCLUDED.ciudad ELSE personas.ciudad END,
                 email = CASE WHEN EXCLUDED.email <> '' THEN EXCLUDED.email ELSE personas.email END,
                 notas = CASE WHEN EXCLUDED.notas <> '' THEN EXCLUDED.notas ELSE personas.notas END,
+                fecha_expedicion = CASE WHEN EXCLUDED.fecha_expedicion <> '' THEN EXCLUDED.fecha_expedicion ELSE personas.fecha_expedicion END,
                 actualizado_en = NOW()
             RETURNING id
         """, (
@@ -8806,6 +8807,7 @@ def personas_guardar_endpoint():
             (datos.get("telefono") or "").strip(), (datos.get("direccion") or "").strip(),
             (datos.get("barrio_info") or "").strip(), (datos.get("ciudad") or "").strip().upper(),
             (datos.get("email") or "").strip(), (datos.get("notas") or "").strip(),
+            (datos.get("fecha_expedicion") or "").strip(),
         ))
         persona_id = cur.fetchone()[0]
         conn.commit()
