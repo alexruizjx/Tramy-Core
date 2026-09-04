@@ -11176,7 +11176,10 @@ def ocr_persona():
     extrae los datos que pide el modulo de Personas. Mismo patron que
     /ocr-tarjeta (llama a Claude con el archivo), pero para documentos
     de PERSONAS en vez de tarjetas de vehiculos. Solo se usa al crear
-    una persona nueva (no modifica ninguna ya guardada)."""
+    una persona nueva (no modifica ninguna ya guardada). Puede detectar
+    MAS de una persona en el mismo documento (ej. compraventa con
+    comprador y vendedor) -- siempre devuelve una LISTA, aunque sea de
+    una sola persona."""
     try:
         data = request.get_json()
         if not data or "imagen" not in data:
@@ -11209,8 +11212,8 @@ def ocr_persona():
         response = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-opus-4-5", "max_tokens": 600, "messages": [{"role": "user", "content": archivos_content + [
-                {"type": "text", "text": "Eres un experto en leer documentos de identidad y documentos personales de Colombia (cedulas de ciudadania, cedulas de extranjeria, tarjetas de identidad, pasaportes, o cualquier otro documento que traiga datos de una persona natural). Puedes recibir UNO o DOS archivos (imagenes y/o PDFs) -- si recibes dos, normalmente son la cara frontal y la cara trasera del MISMO documento, subidas por separado. Los archivos pueden estar rotados o de lado (esto es MUY comun en fotos) -- gira mentalmente el texto para leerlo sin importar su orientacion. Extrae SOLO los datos que el documento realmente contenga -- si un dato no aparece en ninguno de los archivos, deja ese campo vacio, NUNCA lo inventes ni lo asumas. Extrae: 1. NOMBRES: los nombres de pila de la persona (sin los apellidos). 2. APELLIDO: el primer apellido. 3. SEGUNDO_APELLIDO: el segundo apellido, si el documento lo trae por separado. 4. TIPO_DOCUMENTO: uno de CC (cedula de ciudadania), CE (cedula de extranjeria), TI (tarjeta de identidad), PA (pasaporte) -- deduce cual segun el tipo de documento que estas viendo. 5. NUMERO_DOCUMENTO: el numero de identificacion, verifica TODOS los digitos uno por uno, no omitas ninguno. 6. FECHA_EXPEDICION: la fecha de expedicion del documento (normalmente aparece como 'Fecha y lugar de expedicion' o similar en las cedulas colombianas) -- responde SOLO en formato DDMMAAAA (8 digitos seguidos, sin separadores, ej. si la fecha es 5 de octubre de 2001, responde '05102001'). Si el documento no muestra una fecha de expedicion, deja este campo vacio. 7. TELEFONO: un numero de telefono o celular, si aparece en el documento (esto es raro en una cedula, pero puede aparecer en otro tipo de documento). 8. DIRECCION: una direccion de residencia, si aparece. 9. CIUDAD: una ciudad, si aparece asociada a una direccion o lugar de residencia (no la ciudad de nacimiento ni la de expedicion, a menos que sea el unico dato de ciudad disponible). 10. EMAIL: un correo electronico, si aparece. Responde SOLO en JSON sin explicaciones: {\"nombres\": \"\", \"apellido\": \"\", \"segundo_apellido\": \"\", \"tipo_documento\": \"\", \"numero_documento\": \"\", \"fecha_expedicion\": \"\", \"telefono\": \"\", \"direccion\": \"\", \"ciudad\": \"\", \"email\": \"\"}"}
+            json={"model": "claude-opus-4-5", "max_tokens": 1200, "messages": [{"role": "user", "content": archivos_content + [
+                {"type": "text", "text": "Eres un experto en leer documentos de identidad y documentos personales de Colombia (cedulas de ciudadania, cedulas de extranjeria, tarjetas de identidad, pasaportes, formularios de compraventa, o cualquier otro documento que traiga datos de una o mas personas naturales). Puedes recibir UNO o DOS archivos (imagenes y/o PDFs) -- si recibes dos, normalmente son la cara frontal y la cara trasera del MISMO documento, subidas por separado (a menos que claramente se vean personas DISTINTAS en cada uno). Los archivos pueden estar rotados o de lado (esto es MUY comun en fotos) -- gira mentalmente el texto para leerlo sin importar su orientacion. IMPORTANTE: el documento puede traer los datos de MAS DE UNA PERSONA (por ejemplo, un formulario de compraventa que trae comprador Y vendedor, o una cedula con dos titulares). Identifica CADA persona distinta que encuentres, y devuelve un elemento en la lista 'personas' POR CADA UNA -- nunca mezcles los datos de una persona con los de otra. Si solo hay una persona, la lista tiene un solo elemento. Para CADA persona, extrae SOLO los datos que el documento realmente contenga para ella -- si un dato no aparece, deja ese campo vacio, NUNCA lo inventes ni lo asumas, y NUNCA copies el dato de una persona hacia el campo de otra. Los campos por persona son: 1. NOMBRES: los nombres de pila (sin los apellidos). 2. APELLIDO: el primer apellido. 3. SEGUNDO_APELLIDO: el segundo apellido, si el documento lo trae por separado. 4. TIPO_DOCUMENTO: uno de CC (cedula de ciudadania), CE (cedula de extranjeria), TI (tarjeta de identidad), PA (pasaporte). 5. NUMERO_DOCUMENTO: el numero de identificacion, verifica TODOS los digitos uno por uno, no omitas ninguno. 6. FECHA_EXPEDICION: la fecha de expedicion del documento (normalmente aparece como 'Fecha y lugar de expedicion' o similar en las cedulas colombianas) -- responde SOLO en formato DDMMAAAA (8 digitos seguidos, sin separadores, ej. si la fecha es 5 de octubre de 2001, responde '05102001'). Si no aparece, deja vacio. 7. TELEFONO: un numero de telefono o celular, si aparece para esa persona. 8. DIRECCION: una direccion de residencia, si aparece para esa persona. 9. CIUDAD: una ciudad, si aparece asociada a una direccion o lugar de residencia de esa persona (no la ciudad de nacimiento ni la de expedicion, a menos que sea el unico dato de ciudad disponible). 10. EMAIL: un correo electronico, si aparece para esa persona. 11. ROL: si el documento indica explicitamente el papel de esa persona (ej. 'COMPRADOR', 'VENDEDOR', 'PROPIETARIO', 'TITULAR'), copialo tal cual; si no hay ningun rol indicado, deja vacio. Responde SOLO en JSON sin explicaciones: {\"personas\": [{\"nombres\": \"\", \"apellido\": \"\", \"segundo_apellido\": \"\", \"tipo_documento\": \"\", \"numero_documento\": \"\", \"fecha_expedicion\": \"\", \"telefono\": \"\", \"direccion\": \"\", \"ciudad\": \"\", \"email\": \"\", \"rol\": \"\"}]}"}
             ]}]},
             timeout=120
         )
@@ -11220,27 +11223,36 @@ def ocr_persona():
         texto = resp_data["content"][0]["text"].strip()
         import json as json_lib, re as re_module
         texto_clean = texto.replace("```json", "").replace("```", "").strip()
-        json_match = re_module.search(r'\{[^{}]*\}', texto_clean, re_module.DOTALL)
+        json_match = re_module.search(r'\{.*\}', texto_clean, re_module.DOTALL)
         if not json_match:
             return jsonify({"error": "No se pudo parsear respuesta de Claude"}), 500
         resultado = json_lib.loads(json_match.group())
+        personas_crudas = resultado.get("personas", [])
+        if not isinstance(personas_crudas, list) or not personas_crudas:
+            return jsonify({"error": "No se detectó ninguna persona en el documento"}), 400
 
-        fecha_expedicion = resultado.get("fecha_expedicion", "").strip()
-        if fecha_expedicion and not re.fullmatch(r"\d{8}", fecha_expedicion):
-            fecha_expedicion = ""  # respaldo -- si no vino en el formato esperado, se deja vacio en vez de guardar algo mal formado
+        personas = []
+        for p in personas_crudas:
+            if not isinstance(p, dict):
+                continue
+            fecha_expedicion = str(p.get("fecha_expedicion", "")).strip()
+            if fecha_expedicion and not re.fullmatch(r"\d{8}", fecha_expedicion):
+                fecha_expedicion = ""  # respaldo -- si no vino en el formato esperado, se deja vacio en vez de guardar algo mal formado
+            personas.append({
+                "nombres": str(p.get("nombres", "")).upper().strip(),
+                "apellido": str(p.get("apellido", "")).upper().strip(),
+                "segundo_apellido": str(p.get("segundo_apellido", "")).upper().strip(),
+                "tipo_documento": str(p.get("tipo_documento", "")).upper().strip(),
+                "numero_documento": str(p.get("numero_documento", "")).strip(),
+                "fecha_expedicion": fecha_expedicion,
+                "telefono": str(p.get("telefono", "")).strip(),
+                "direccion": str(p.get("direccion", "")).strip(),
+                "ciudad": str(p.get("ciudad", "")).upper().strip(),
+                "email": str(p.get("email", "")).strip(),
+                "rol": str(p.get("rol", "")).upper().strip(),
+            })
 
-        return jsonify({
-            "nombres": resultado.get("nombres", "").upper().strip(),
-            "apellido": resultado.get("apellido", "").upper().strip(),
-            "segundo_apellido": resultado.get("segundo_apellido", "").upper().strip(),
-            "tipo_documento": resultado.get("tipo_documento", "").upper().strip(),
-            "numero_documento": resultado.get("numero_documento", "").strip(),
-            "fecha_expedicion": fecha_expedicion,
-            "telefono": resultado.get("telefono", "").strip(),
-            "direccion": resultado.get("direccion", "").strip(),
-            "ciudad": resultado.get("ciudad", "").upper().strip(),
-            "email": resultado.get("email", "").strip(),
-        })
+        return jsonify({"personas": personas})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
