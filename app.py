@@ -3667,8 +3667,8 @@ def _parsear_resultado_runt_persona(page):
     misma estructura mas abajo en la pagina, dentro de otro
     <form class="panel-content"> -- por eso una sola busqueda que
     recorra TODOS los ".row" de la pagina alcanza para los 2 datos."""
-    resultado = {"activa": False, "estado_persona": "", "nombre_completo": "",
-                 "tiene_multas": False, "texto_multas": ""}
+    resultado = {"activa": False, "estado_persona": "", "nombre_completo": "", "documento": "",
+                 "fecha_inscripcion": "", "tiene_multas": False, "texto_multas": ""}
 
     try:
         datos_generales = page.evaluate("""
@@ -3691,7 +3691,9 @@ def _parsear_resultado_runt_persona(page):
         datos_generales = {}
 
     resultado["nombre_completo"] = datos_generales.get("NOMBRE COMPLETO", "")
+    resultado["documento"] = datos_generales.get("DOCUMENTO", "")
     resultado["estado_persona"] = datos_generales.get("ESTADO DE LA PERSONA", "")
+    resultado["fecha_inscripcion"] = datos_generales.get("FECHA DE INSCRIPCIÓN", "").strip()
     resultado["activa"] = resultado["estado_persona"].strip().upper() == "ACTIVA"
 
     resultado["texto_multas"] = datos_generales.get("TIENE MULTAS O INFRACCIONES", "")
@@ -3816,7 +3818,10 @@ def consultar_runt_persona(page, cedula, tipo_documento="CC", primer_apellido=""
             if ("NO ACTIVA" in texto_error_mayus or "NO REGISTRAD" in texto_error_mayus
                     or "NO SE ENCUENTRA" in texto_error_mayus or "NO ESTA REGISTRAD" in texto_error_mayus
                     or "NO ESTÁ REGISTRAD" in texto_error_mayus):
-                return {"activa": False, "estado_persona": "NO ACTIVA", "nombre_completo": "",
+                # Se guarda el texto REAL que el sitio mostro (no uno
+                # inventado) -- es el que el frontend muestra tal cual.
+                return {"activa": False, "estado_persona": texto_error.strip(), "nombre_completo": "",
+                        "documento": "", "fecha_inscripcion": "",
                         "tiene_multas": False, "texto_multas": "", "solicitudes": []}
             # Cualquier OTRO error del RUNT (documento no encontrado,
             # apellido no coincide, etc.) si se propaga como error real --
@@ -8231,6 +8236,28 @@ def consultar_policia(page, numero_documento, fecha_expedicion, job_id=None):
             resultado["encontrado"] = True
             resultado["sin_registros"] = True
             resultado["documento"] = numero_documento
+
+    # Se captura el mensaje TAL CUAL aparece en la pagina (mismos saltos
+    # de linea, mismas mayusculas/minusculas) -- usa innerText (no
+    # textContent) porque respeta los saltos de linea visuales, a
+    # diferencia de textContent que los junta todo en una sola linea.
+    # Cubre tanto el caso "con registros" ("La Policia Nacional de
+    # Colombia informa...") como "sin registros" ("NO TIENE MEDIDAS
+    # CORRECTIVAS...").
+    resultado["mensaje_completo"] = ""
+    try:
+        texto_completo = page.evaluate("() => document.body.innerText") or ""
+    except Exception:
+        texto_completo = ""
+    if texto_completo:
+        inicio_idx = texto_completo.find("La Policía Nacional de Colombia informa")
+        if inicio_idx == -1:
+            inicio_idx = texto_completo.find("NO TIENE MEDIDAS CORRECTIVAS")
+        if inicio_idx >= 0:
+            fin_idx = texto_completo.find("De conformidad con la Ley 1801", inicio_idx)
+            if fin_idx == -1:
+                fin_idx = inicio_idx + 700
+            resultado["mensaje_completo"] = texto_completo[inicio_idx:fin_idx].strip()
 
     if not resultado["encontrado"]:
         # Diagnostico -- si llega aqui, es un caso genuinamente distinto
