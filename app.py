@@ -11170,6 +11170,81 @@ def ocr_tarjeta():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/ocr-persona", methods=["POST"])
+def ocr_persona():
+    """Lee un documento de identidad (cedula u otro) -- foto o PDF -- y
+    extrae los datos que pide el modulo de Personas. Mismo patron que
+    /ocr-tarjeta (llama a Claude con el archivo), pero para documentos
+    de PERSONAS en vez de tarjetas de vehiculos. Solo se usa al crear
+    una persona nueva (no modifica ninguna ya guardada)."""
+    try:
+        data = request.get_json()
+        if not data or "imagen" not in data:
+            return jsonify({"error": "No se recibio imagen"}), 400
+
+        def preparar_archivo(img_data):
+            es_pdf = "data:application/pdf" in img_data
+            media_type = "application/pdf" if es_pdf else "image/jpeg"
+            if not es_pdf:
+                if "data:image/png" in img_data:
+                    media_type = "image/png"
+                elif "data:image/webp" in img_data:
+                    media_type = "image/webp"
+            if "," in img_data:
+                img_data = img_data.split(",")[1]
+            if es_pdf:
+                return {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": img_data}}
+            return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_data}}
+
+        # Puede venir un solo archivo, o dos (ej: cara frontal + cara
+        # trasera de la cedula, subidas por separado).
+        archivos_content = [preparar_archivo(data["imagen"])]
+        if data.get("imagen2"):
+            archivos_content.append(preparar_archivo(data["imagen2"]))
+
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not anthropic_key:
+            return jsonify({"error": "API Key de Anthropic no configurada"}), 500
+
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-opus-4-5", "max_tokens": 600, "messages": [{"role": "user", "content": archivos_content + [
+                {"type": "text", "text": "Eres un experto en leer documentos de identidad y documentos personales de Colombia (cedulas de ciudadania, cedulas de extranjeria, tarjetas de identidad, pasaportes, o cualquier otro documento que traiga datos de una persona natural). Puedes recibir UNO o DOS archivos (imagenes y/o PDFs) -- si recibes dos, normalmente son la cara frontal y la cara trasera del MISMO documento, subidas por separado. Los archivos pueden estar rotados o de lado (esto es MUY comun en fotos) -- gira mentalmente el texto para leerlo sin importar su orientacion. Extrae SOLO los datos que el documento realmente contenga -- si un dato no aparece en ninguno de los archivos, deja ese campo vacio, NUNCA lo inventes ni lo asumas. Extrae: 1. NOMBRES: los nombres de pila de la persona (sin los apellidos). 2. APELLIDO: el primer apellido. 3. SEGUNDO_APELLIDO: el segundo apellido, si el documento lo trae por separado. 4. TIPO_DOCUMENTO: uno de CC (cedula de ciudadania), CE (cedula de extranjeria), TI (tarjeta de identidad), PA (pasaporte) -- deduce cual segun el tipo de documento que estas viendo. 5. NUMERO_DOCUMENTO: el numero de identificacion, verifica TODOS los digitos uno por uno, no omitas ninguno. 6. FECHA_EXPEDICION: la fecha de expedicion del documento (normalmente aparece como 'Fecha y lugar de expedicion' o similar en las cedulas colombianas) -- responde SOLO en formato DDMMAAAA (8 digitos seguidos, sin separadores, ej. si la fecha es 5 de octubre de 2001, responde '05102001'). Si el documento no muestra una fecha de expedicion, deja este campo vacio. 7. TELEFONO: un numero de telefono o celular, si aparece en el documento (esto es raro en una cedula, pero puede aparecer en otro tipo de documento). 8. DIRECCION: una direccion de residencia, si aparece. 9. CIUDAD: una ciudad, si aparece asociada a una direccion o lugar de residencia (no la ciudad de nacimiento ni la de expedicion, a menos que sea el unico dato de ciudad disponible). 10. EMAIL: un correo electronico, si aparece. Responde SOLO en JSON sin explicaciones: {\"nombres\": \"\", \"apellido\": \"\", \"segundo_apellido\": \"\", \"tipo_documento\": \"\", \"numero_documento\": \"\", \"fecha_expedicion\": \"\", \"telefono\": \"\", \"direccion\": \"\", \"ciudad\": \"\", \"email\": \"\"}"}
+            ]}]},
+            timeout=120
+        )
+        if response.status_code != 200:
+            return jsonify({"error": f"Error Claude API: {response.status_code}"}), 500
+        resp_data = response.json()
+        texto = resp_data["content"][0]["text"].strip()
+        import json as json_lib, re as re_module
+        texto_clean = texto.replace("```json", "").replace("```", "").strip()
+        json_match = re_module.search(r'\{[^{}]*\}', texto_clean, re_module.DOTALL)
+        if not json_match:
+            return jsonify({"error": "No se pudo parsear respuesta de Claude"}), 500
+        resultado = json_lib.loads(json_match.group())
+
+        fecha_expedicion = resultado.get("fecha_expedicion", "").strip()
+        if fecha_expedicion and not re.fullmatch(r"\d{8}", fecha_expedicion):
+            fecha_expedicion = ""  # respaldo -- si no vino en el formato esperado, se deja vacio en vez de guardar algo mal formado
+
+        return jsonify({
+            "nombres": resultado.get("nombres", "").upper().strip(),
+            "apellido": resultado.get("apellido", "").upper().strip(),
+            "segundo_apellido": resultado.get("segundo_apellido", "").upper().strip(),
+            "tipo_documento": resultado.get("tipo_documento", "").upper().strip(),
+            "numero_documento": resultado.get("numero_documento", "").strip(),
+            "fecha_expedicion": fecha_expedicion,
+            "telefono": resultado.get("telefono", "").strip(),
+            "direccion": resultado.get("direccion", "").strip(),
+            "ciudad": resultado.get("ciudad", "").upper().strip(),
+            "email": resultado.get("email", "").strip(),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/ocr-runt-texto", methods=["POST"])
 def ocr_runt_texto():
     try:
