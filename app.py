@@ -33,44 +33,48 @@ from flask_cors import CORS
 app = Flask(__name__)  # v54.1
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# --- SEGURIDAD: verificacion de sesion (Fase 1 -- "solo avisar") -------
-# Objetivo final: que el backend rechace peticiones sin sesion valida,
-# en vez de confiar solo en que el frontend ya reviso el rol antes de
-# mostrar cada boton (eso es facil de saltarse llamando a los endpoints
-# directo). Por ahora, esta primera fase NO BLOQUEA nada -- solo revisa
-# si cada peticion trae un token de sesion de Supabase valido, y lo deja
-# anotado en los logs de Railway. Sirve para confirmar, sin ningun
-# riesgo de romper nada, que tan lista esta cada parte del frontend
-# antes de pasar a la fase donde si se empieza a exigir el token.
+# --- SEGURIDAD: verificacion de sesion (Fase 2 -- BLOQUEO REAL) --------
+# Ya no es solo un aviso en los logs -- ahora el backend EXIGE una sesion
+# valida de Supabase para cualquier peticion (salvo el preflight OPTIONS
+# de CORS). Antes, el frontend revisaba el rol antes de mostrar cada
+# boton, pero cualquiera podia saltarse eso llamando a los endpoints
+# directo (con curl, Postman, etc.) sin pasar por la pagina -- eso ya no
+# es posible: sin un token valido, el backend responde 401 antes de
+# ejecutar nada.
 SUPABASE_URL_AUTH = "https://ddndoxtmffoaklhwbmkq.supabase.co"
 SUPABASE_ANON_KEY_AUTH = "sb_publishable_x3cjuv1b2Uxq_-55-PsBqw_gCTto337"
 
 
 @app.before_request
-def _tramy_registrar_token_fase1():
+def _tramy_exigir_sesion_valida():
     if request.method == "OPTIONS":
         return  # peticiones de "pre-vuelo" CORS, nunca llevan token -- se ignoran
     auth_header = request.headers.get("Authorization", "")
     ruta = request.path
     if not auth_header or not auth_header.startswith("Bearer "):
-        print(f"[AUTH-FASE1] SIN TOKEN -- {request.method} {ruta}")
-        return
+        print(f"[AUTH] RECHAZADO (sin token) -- {request.method} {ruta}")
+        return jsonify({"error": "No autorizado. Debes iniciar sesión."}), 401
     token = auth_header[len("Bearer "):]
     try:
         resp = requests.get(
             f"{SUPABASE_URL_AUTH}/auth/v1/user",
             headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_ANON_KEY_AUTH},
-            timeout=3,
+            timeout=5,
         )
         if resp.status_code == 200:
             usuario = resp.json()
-            print(f"[AUTH-FASE1] TOKEN VALIDO ({usuario.get('email', '?')}) -- {request.method} {ruta}")
+            print(f"[AUTH] OK ({usuario.get('email', '?')}) -- {request.method} {ruta}")
+            return  # token valido -- la peticion sigue su curso normal
         else:
-            print(f"[AUTH-FASE1] TOKEN INVALIDO (status {resp.status_code}) -- {request.method} {ruta}")
+            print(f"[AUTH] RECHAZADO (token invalido, status {resp.status_code}) -- {request.method} {ruta}")
+            return jsonify({"error": "Sesión inválida o expirada. Vuelve a iniciar sesión."}), 401
     except Exception as _e:
-        print(f"[AUTH-FASE1] ERROR VERIFICANDO TOKEN ({_e}) -- {request.method} {ruta}")
-    # IMPORTANTE: no se hace "return" con error ni codigo de rechazo --
-    # la peticion sigue su curso normal, pase lo que pase con el token.
+        # Si Supabase no responde (caido, timeout, etc.) se rechaza por
+        # seguridad -- es preferible un error temporal de "intenta de
+        # nuevo" a dejar pasar peticiones sin poder confirmar quien las
+        # esta haciendo.
+        print(f"[AUTH] RECHAZADO (error verificando token: {_e}) -- {request.method} {ruta}")
+        return jsonify({"error": "No se pudo verificar la sesión. Intenta de nuevo."}), 401
 
 TIMEOUT = 10000
 MSG_NO_MATRICULADO = "El vehiculo no se encuentra matriculado en la Secretaria de Movilidad"
@@ -4579,6 +4583,21 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
             _propietario_copia["apellido"] = ""
             _propietario_copia["segundo_apellido"] = ""
             datos_vehiculo["propietario"] = _propietario_copia
+
+    # Excepcion "A favor del interesado" (checkbox junto a Traspaso de
+    # Propiedad, en Liquidacion y Preparacion) -- como el propietario
+    # real es indeterminado/desconocido, quien realmente otorga el
+    # Mandato y quien aparece como comprador en el Formulario es la
+    # persona cargada en el rol "Otros" (el interesado real), NO el
+    # propietario/comprador normales. Si no hay nadie cargado en
+    # "Otros", el campo queda vacio (nunca se rellena con el
+    # propietario/comprador real por error, ni con datos falsos).
+    if datos_vehiculo.get("favor_interesado"):
+        _persona_otro_favor = datos_vehiculo.get("otro") or {}
+        if nombre_hoja.startswith("MANDATO"):
+            datos_vehiculo["propietario"] = _persona_otro_favor
+        if nombre_hoja == "FORMULARIO":
+            datos_vehiculo["comprador"] = _persona_otro_favor
 
     wb = _openpyxl.load_workbook(FUN_PLANTILLA, data_only=False, keep_vba=True)
     hoja = wb[nombre_hoja]
