@@ -4745,6 +4745,16 @@ def generar_documento_vehiculo_appjx(clave_documento, datos_vehiculo, ruta_salid
     # se eligen en Preparacion/Liquidacion), asi que se usan tal cual,
     # sin necesidad de normalizarlos de nuevo.
     _tramites_mandato = (datos_vehiculo.get("tramites_seleccionados") or [])[:3]
+    if datos_vehiculo.get("favor_interesado"):
+        # Si el tramite es Traspaso de Propiedad y se marco "A favor del
+        # interesado" (checkbox en Preparacion, junto al Precio de
+        # venta), esa linea especifica del Mandato se escribe con el
+        # sufijo -- las demas lineas (si hay otros tramites) quedan tal
+        # cual.
+        _tramites_mandato = [
+            (t + " A FAVOR DEL INTERESADO") if t.strip().upper() == "TRASPASO DE PROPIEDAD" else t
+            for t in _tramites_mandato
+        ]
     _lineas_mandato = list(_tramites_mandato)
     exportar["D47"] = _lineas_mandato[0] if len(_lineas_mandato) > 0 else ""
     exportar["D48"] = _lineas_mandato[1] if len(_lineas_mandato) > 1 else ""
