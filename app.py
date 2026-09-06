@@ -88,18 +88,26 @@ def _tramy_verificar_token_con_cache(token):
 
     role = None
     _ultimo_error_db = None
-    for _intento_db in range(2):  # 1 reintento -- una conexion a la base
-        # de datos puede fallar por un corte momentaneo (igual que 2Captcha
-        # o cualquier servicio externo), y eso NO significa que el token
-        # sea invalido -- solo que no se pudo confirmar el rol esta vez.
+    for _intento_db in range(2):  # 1 reintento -- esta consulta puede
+        # fallar por un corte momentaneo (igual que 2Captcha o cualquier
+        # servicio externo), y eso NO significa que el token sea
+        # invalido -- solo que no se pudo confirmar el rol esta vez.
+        # IMPORTANTE: "profiles" vive en la base de datos de Supabase
+        # (la misma que usa el frontend via supabaseClient.from('profiles')),
+        # NO en la base de datos de Railway (get_db_conn(), usada para
+        # vehiculos/personas/tramites) -- por eso se consulta por la API
+        # REST de Supabase (PostgREST), igual que hace el frontend.
         try:
-            conn = get_db_conn()
-            cur = conn.cursor()
-            cur.execute("SELECT role FROM profiles WHERE id = %s", (user_id,))
-            fila = cur.fetchone()
-            cur.close(); conn.close()
-            if fila:
-                role = fila[0]
+            resp_perfil = requests.get(
+                f"{SUPABASE_URL_AUTH}/rest/v1/profiles",
+                params={"id": f"eq.{user_id}", "select": "role"},
+                headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_ANON_KEY_AUTH},
+                timeout=5,
+            )
+            resp_perfil.raise_for_status()
+            filas_perfil = resp_perfil.json()
+            if filas_perfil:
+                role = filas_perfil[0].get("role")
             _ultimo_error_db = None
             break
         except Exception as _e_role:
