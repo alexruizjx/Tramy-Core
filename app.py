@@ -33,16 +33,81 @@ from flask_cors import CORS
 app = Flask(__name__)  # v54.1
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# --- SEGURIDAD: verificacion de sesion (Fase 2 -- BLOQUEO REAL) --------
-# Ya no es solo un aviso en los logs -- ahora el backend EXIGE una sesion
-# valida de Supabase para cualquier peticion (salvo el preflight OPTIONS
-# de CORS). Antes, el frontend revisaba el rol antes de mostrar cada
-# boton, pero cualquiera podia saltarse eso llamando a los endpoints
-# directo (con curl, Postman, etc.) sin pasar por la pagina -- eso ya no
-# es posible: sin un token valido, el backend responde 401 antes de
-# ejecutar nada.
+# --- SEGURIDAD: verificacion de sesion y rol (Fase 2 -- BLOQUEO REAL) --
+# El backend EXIGE una sesion valida de Supabase para cualquier peticion
+# (salvo el preflight OPTIONS de CORS), Y ADEMAS revisa que el usuario
+# tenga rol 'pro' o 'admin' (Tramy es solo para usuarios de pago -- un
+# usuario free, si llega a existir, no puede usar ningun endpoint).
+# Unas pocas rutas puntuales (Borrador, Estado de Cuenta, Liquidaciones
+# Manuales) son EXCLUSIVAS de 'admin' -- 'pro' no puede usarlas.
+#
+# Para no golpear a Supabase (y a la base de datos, para el rol) en
+# CADA peticion -- incluidas las que se repiten cada 2.5s mientras se
+# espera una consulta larga -- el resultado de la verificacion se
+# cachea por unos segundos por token.
 SUPABASE_URL_AUTH = "https://ddndoxtmffoaklhwbmkq.supabase.co"
 SUPABASE_ANON_KEY_AUTH = "sb_publishable_x3cjuv1b2Uxq_-55-PsBqw_gCTto337"
+
+# Rutas exclusivas de 'admin' -- 'pro' recibe 403 en estas, aunque su
+# sesion sea valida. El resto de rutas acepta 'pro' o 'admin' por igual.
+_RUTAS_SOLO_ADMIN = {
+    "/medellin-crear-usuario",
+    "/medellin-citas-proxy-resetear-aviso",
+    "/medellin-citas-proxy-ultimo-hallazgo",
+    "/monitoreo-config",
+    "/generar-declaracion-manual",   # Liquidaciones Manuales
+    "/generar-estado-cuenta",        # Estado de Cuenta
+}
+
+_CACHE_TOKENS = {}  # token -> {"email":..., "role":..., "vence": epoch_segundos}
+_CACHE_TOKENS_TTL_SEGUNDOS = 45
+_CACHE_TOKENS_LOCK = threading.Lock()
+
+
+def _tramy_verificar_token_con_cache(token):
+    """Devuelve {"email":..., "role":...} si el token es valido, o None
+    si no lo es -- consultando Supabase + la tabla profiles SOLO la
+    primera vez por token dentro de la ventana de cache; las siguientes
+    veces (dentro de esos segundos) se responde con lo ya guardado."""
+    ahora = time.time()
+    with _CACHE_TOKENS_LOCK:
+        _entrada = _CACHE_TOKENS.get(token)
+        if _entrada and _entrada["vence"] > ahora:
+            return _entrada
+
+    resp = requests.get(
+        f"{SUPABASE_URL_AUTH}/auth/v1/user",
+        headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_ANON_KEY_AUTH},
+        timeout=5,
+    )
+    if resp.status_code != 200:
+        return None
+    usuario = resp.json()
+    user_id = usuario.get("id")
+    email = usuario.get("email", "?")
+
+    role = None
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT role FROM profiles WHERE id = %s", (user_id,))
+        fila = cur.fetchone()
+        cur.close(); conn.close()
+        if fila:
+            role = fila[0]
+    except Exception as _e_role:
+        print(f"[AUTH] Error consultando el rol del perfil: {_e_role}", flush=True)
+        return None
+
+    _entrada = {"email": email, "role": role, "vence": ahora + _CACHE_TOKENS_TTL_SEGUNDOS}
+    with _CACHE_TOKENS_LOCK:
+        _CACHE_TOKENS[token] = _entrada
+        # Limpieza simple para que el diccionario no crezca sin limite --
+        # se descartan las entradas ya vencidas cada vez que se agrega una
+        # nueva (barato, y solo pasa una vez por token cada 45s).
+        for _tok_viejo in [t for t, e in _CACHE_TOKENS.items() if e["vence"] <= ahora]:
+            del _CACHE_TOKENS[_tok_viejo]
+    return _entrada
 
 
 @app.before_request
@@ -56,25 +121,30 @@ def _tramy_exigir_sesion_valida():
         return jsonify({"error": "No autorizado. Debes iniciar sesión."}), 401
     token = auth_header[len("Bearer "):]
     try:
-        resp = requests.get(
-            f"{SUPABASE_URL_AUTH}/auth/v1/user",
-            headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_ANON_KEY_AUTH},
-            timeout=5,
-        )
-        if resp.status_code == 200:
-            usuario = resp.json()
-            print(f"[AUTH] OK ({usuario.get('email', '?')}) -- {request.method} {ruta}")
-            return  # token valido -- la peticion sigue su curso normal
-        else:
-            print(f"[AUTH] RECHAZADO (token invalido, status {resp.status_code}) -- {request.method} {ruta}")
-            return jsonify({"error": "Sesión inválida o expirada. Vuelve a iniciar sesión."}), 401
+        _info = _tramy_verificar_token_con_cache(token)
     except Exception as _e:
-        # Si Supabase no responde (caido, timeout, etc.) se rechaza por
-        # seguridad -- es preferible un error temporal de "intenta de
-        # nuevo" a dejar pasar peticiones sin poder confirmar quien las
-        # esta haciendo.
+        # Si Supabase/la base de datos no responden (caidos, timeout,
+        # etc.) se rechaza por seguridad -- es preferible un error
+        # temporal de "intenta de nuevo" a dejar pasar peticiones sin
+        # poder confirmar quien las esta haciendo.
         print(f"[AUTH] RECHAZADO (error verificando token: {_e}) -- {request.method} {ruta}")
         return jsonify({"error": "No se pudo verificar la sesión. Intenta de nuevo."}), 401
+
+    if not _info:
+        print(f"[AUTH] RECHAZADO (token invalido) -- {request.method} {ruta}")
+        return jsonify({"error": "Sesión inválida o expirada. Vuelve a iniciar sesión."}), 401
+
+    role = _info.get("role")
+    if role not in ("pro", "admin"):
+        print(f"[AUTH] RECHAZADO (rol '{role}' sin acceso, {_info.get('email')}) -- {request.method} {ruta}")
+        return jsonify({"error": "Tu cuenta no tiene acceso a Tramy."}), 403
+
+    if ruta in _RUTAS_SOLO_ADMIN and role != "admin":
+        print(f"[AUTH] RECHAZADO (rol '{role}' -- ruta exclusiva de admin, {_info.get('email')}) -- {request.method} {ruta}")
+        return jsonify({"error": "Esta función es exclusiva para administradores."}), 403
+
+    print(f"[AUTH] OK ({_info.get('email')}, {role}) -- {request.method} {ruta}")
+    # token valido, con rol permitido -- la peticion sigue su curso normal
 
 TIMEOUT = 10000
 MSG_NO_MATRICULADO = "El vehiculo no se encuentra matriculado en la Secretaria de Movilidad"
@@ -3344,10 +3414,20 @@ def resolver_captcha_imagen_2captcha(imagen_base64, intentos=3):
 
             for _ in range(24):  # hasta 2 minutos (24 x 5s)
                 time.sleep(5)
-                resp2 = requests.get("https://2captcha.com/res.php", params={
-                    "key": TWOCAPTCHA_API_KEY, "action": "get", "id": captcha_id, "json": 1,
-                }, timeout=15)
-                data2 = resp2.json()
+                try:
+                    resp2 = requests.get("https://2captcha.com/res.php", params={
+                        "key": TWOCAPTCHA_API_KEY, "action": "get", "id": captcha_id, "json": 1,
+                    }, timeout=15)
+                    data2 = resp2.json()
+                except Exception as _e_sondeo:
+                    # Un solo sondeo que falla por un corte momentaneo de
+                    # red (timeout, conexion reiniciada, etc.) NO debe
+                    # tirar todo el intento a la basura -- ya se pago por
+                    # este captcha_id, asi que simplemente se sigue
+                    # sondeando el mismo en la siguiente vuelta, en vez
+                    # de abandonarlo y pedir uno nuevo desde cero.
+                    print(f"  → Sondeo de captcha fallo por red ({_e_sondeo}), reintentando el mismo captcha_id...")
+                    continue
                 if data2.get("status") == 1:
                     return data2["request"]
                 if data2.get("request") != "CAPCHA_NOT_READY":
