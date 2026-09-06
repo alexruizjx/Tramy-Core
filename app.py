@@ -81,23 +81,36 @@ def _tramy_verificar_token_con_cache(token):
         timeout=5,
     )
     if resp.status_code != 200:
-        return None
+        return None  # esto SI es un token genuinamente invalido/vencido de Supabase
     usuario = resp.json()
     user_id = usuario.get("id")
     email = usuario.get("email", "?")
 
     role = None
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT role FROM profiles WHERE id = %s", (user_id,))
-        fila = cur.fetchone()
-        cur.close(); conn.close()
-        if fila:
-            role = fila[0]
-    except Exception as _e_role:
-        print(f"[AUTH] Error consultando el rol del perfil: {_e_role}", flush=True)
-        return None
+    _ultimo_error_db = None
+    for _intento_db in range(2):  # 1 reintento -- una conexion a la base
+        # de datos puede fallar por un corte momentaneo (igual que 2Captcha
+        # o cualquier servicio externo), y eso NO significa que el token
+        # sea invalido -- solo que no se pudo confirmar el rol esta vez.
+        try:
+            conn = get_db_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT role FROM profiles WHERE id = %s", (user_id,))
+            fila = cur.fetchone()
+            cur.close(); conn.close()
+            if fila:
+                role = fila[0]
+            _ultimo_error_db = None
+            break
+        except Exception as _e_role:
+            _ultimo_error_db = _e_role
+            print(f"[AUTH] Error consultando el rol del perfil (intento {_intento_db+1}): {_e_role}", flush=True)
+    if _ultimo_error_db is not None:
+        # Los 2 intentos fallaron -- esto es un problema de conexion, NO
+        # un token invalido. Se distingue con una excepcion (en vez de
+        # devolver None) para que el mensaje al usuario diga "intenta de
+        # nuevo" en vez del enganoso "tu sesion expiro".
+        raise _ultimo_error_db
 
     _entrada = {"email": email, "role": role, "vence": ahora + _CACHE_TOKENS_TTL_SEGUNDOS}
     with _CACHE_TOKENS_LOCK:
