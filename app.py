@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, date, timezone
 # Un desfase fijo no depende de nada externo y para Colombia siempre es
 # correcto (nunca cambia por horario de verano).
 TZ_COLOMBIA = timezone(timedelta(hours=-5))
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, g
 from playwright.sync_api import sync_playwright
 from pypdf import PdfWriter
 from flask_cors import CORS
@@ -120,7 +120,7 @@ def _tramy_verificar_token_con_cache(token):
         # nuevo" en vez del enganoso "tu sesion expiro".
         raise _ultimo_error_db
 
-    _entrada = {"email": email, "role": role, "vence": ahora + _CACHE_TOKENS_TTL_SEGUNDOS}
+    _entrada = {"email": email, "role": role, "user_id": user_id, "vence": ahora + _CACHE_TOKENS_TTL_SEGUNDOS}
     with _CACHE_TOKENS_LOCK:
         _CACHE_TOKENS[token] = _entrada
         # Limpieza simple para que el diccionario no crezca sin limite --
@@ -163,6 +163,15 @@ def _tramy_exigir_sesion_valida():
     if ruta in _RUTAS_SOLO_ADMIN and role != "admin":
         print(f"[AUTH] RECHAZADO (rol '{role}' -- ruta exclusiva de admin, {_info.get('email')}) -- {request.method} {ruta}")
         return jsonify({"error": "Esta función es exclusiva para administradores."}), 403
+
+    # g es un objeto que Flask reinicia en cada peticion -- se usa aqui
+    # para que los endpoints (mas abajo en el archivo) sepan quien esta
+    # haciendo la peticion, sin tener que volver a leer el header
+    # Authorization ni a llamar a Supabase de nuevo. Los endpoints de
+    # personas/vehiculos lo usan para que cada cuenta solo vea y guarde
+    # SUS PROPIOS datos.
+    g.tramy_user_id = _info.get("user_id")
+    g.tramy_role = role
 
     print(f"[AUTH] OK ({_info.get('email')}, {role}) -- {request.method} {ruta}")
     # token valido, con rol permitido -- la peticion sigue su curso normal
@@ -4129,7 +4138,10 @@ def _convertir_fecha_ddmmyyyy(fecha_str):
 def guardar_vehiculo_runt(datos):
     """Guarda (o actualiza) los datos de un vehiculo consultado en el RUNT.
     El RUNT siempre marca fuente='RUNT' y sobrescribe cualquier dato previo
-    que hubiera venido solo de una lectura por OCR."""
+    que hubiera venido solo de una lectura por OCR. Esta tabla es una CACHE
+    COMPARTIDA entre todas las cuentas -- si otra cuenta ya consulto esta
+    misma placa, se reutiliza ese dato (asi se ahorra tiempo y costo de
+    2Captcha), en vez de duplicarlo por cuenta."""
     try:
         conn = get_db_conn()
         cur = conn.cursor()
@@ -7779,14 +7791,17 @@ def consultar_runt_vehiculo_endpoint():
     placa  = request.args.get("placa", "").upper().strip()
     cedula = request.args.get("cedula", "").strip()
     tipo_documento = request.args.get("tipo_documento", "CC").strip().upper() or "CC"
-    user_id = request.args.get("user_id", "").strip()  # id del usuario en Supabase (opcional)
+    user_id = request.args.get("user_id", "").strip()  # id del usuario en Supabase (opcional) -- para "Mis Consultas"
 
     if not placa or not cedula:
         return jsonify({"error": "Debes proporcionar placa y cedula."}), 400
 
     # Limite: no se puede forzar una nueva consulta al RUNT para la misma
     # placa si ya se hizo una en los ultimos 3 dias -- en ese caso hay que
-    # usar el dato ya guardado en cache (vehiculo-runt-guardado).
+    # usar el dato ya guardado en cache (vehiculo-runt-guardado). Este
+    # limite es GLOBAL (la tabla 'vehiculos' es una cache compartida entre
+    # todas las cuentas, para ahorrar tiempo y costo de 2Captcha) -- si
+    # otra cuenta ya la consulto hace poco, se reutiliza ese mismo dato.
     try:
         conn = get_db_conn()
         cur = conn.cursor()
@@ -8956,7 +8971,8 @@ def generar_fun_endpoint():
 def personas_buscar_endpoint():
     """Busca personas por nombre o numero de documento (coincidencia
     parcial) -- para el selector de Asesor/Propietario/Comprador al
-    generar un documento. Sin parametro 'q', devuelve las mas recientes."""
+    generar un documento. Sin parametro 'q', devuelve las mas recientes.
+    Solo dentro de las personas de la cuenta que hace la peticion."""
     consulta = request.args.get("q", "").strip()
     try:
         conn = get_db_conn()
@@ -8967,15 +8983,15 @@ def personas_buscar_endpoint():
                 SELECT id, nombres, apellido, segundo_apellido, tipo_documento, numero_documento,
                        telefono, direccion, barrio_info, ciudad, email, fecha_expedicion
                 FROM personas
-                WHERE numero_documento ILIKE %s OR nombres ILIKE %s OR apellido ILIKE %s
+                WHERE owner_id = %s AND (numero_documento ILIKE %s OR nombres ILIKE %s OR apellido ILIKE %s)
                 ORDER BY actualizado_en DESC LIMIT 20
-            """, (patron, patron, patron))
+            """, (g.tramy_user_id, patron, patron, patron))
         else:
             cur.execute("""
                 SELECT id, nombres, apellido, segundo_apellido, tipo_documento, numero_documento,
                        telefono, direccion, barrio_info, ciudad, email, fecha_expedicion
-                FROM personas ORDER BY actualizado_en DESC LIMIT 20
-            """)
+                FROM personas WHERE owner_id = %s ORDER BY actualizado_en DESC LIMIT 20
+            """, (g.tramy_user_id,))
         filas = cur.fetchall()
         cur.close(); conn.close()
         personas = [{
@@ -9004,9 +9020,9 @@ def personas_guardar_endpoint():
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO personas (nombres, apellido, segundo_apellido, tipo_documento, numero_documento,
-                                   telefono, direccion, barrio_info, ciudad, email, notas, fecha_expedicion, actualizado_en)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (numero_documento) DO UPDATE SET
+                                   telefono, direccion, barrio_info, ciudad, email, notas, fecha_expedicion, owner_id, actualizado_en)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (numero_documento, owner_id) DO UPDATE SET
                 nombres = EXCLUDED.nombres, apellido = EXCLUDED.apellido,
                 segundo_apellido = EXCLUDED.segundo_apellido, tipo_documento = EXCLUDED.tipo_documento,
                 telefono = CASE WHEN EXCLUDED.telefono <> '' THEN EXCLUDED.telefono ELSE personas.telefono END,
@@ -9025,7 +9041,7 @@ def personas_guardar_endpoint():
             (datos.get("telefono") or "").strip(), (datos.get("direccion") or "").strip(),
             (datos.get("barrio_info") or "").strip(), (datos.get("ciudad") or "").strip().upper(),
             (datos.get("email") or "").strip(), (datos.get("notas") or "").strip(),
-            (datos.get("fecha_expedicion") or "").strip(),
+            (datos.get("fecha_expedicion") or "").strip(), g.tramy_user_id,
         ))
         persona_id = cur.fetchone()[0]
         conn.commit()
@@ -9038,7 +9054,8 @@ def personas_guardar_endpoint():
 @app.route("/personas-listar", methods=["GET"])
 def personas_listar_endpoint():
     """Lista personas paginadas, con busqueda opcional -- para la tabla
-    de gestion (ver/eliminar) en el panel de configuracion."""
+    de gestion (ver/eliminar) en el panel de configuracion. Solo dentro
+    de las personas de la cuenta que hace la peticion."""
     consulta = request.args.get("q", "").strip()
     pagina = max(int(request.args.get("pagina", 1) or 1), 1)
     por_pagina = 30
@@ -9052,23 +9069,23 @@ def personas_listar_endpoint():
                 SELECT id, nombres, apellido, segundo_apellido, tipo_documento, numero_documento,
                        telefono, direccion, barrio_info, ciudad, email
                 FROM personas
-                WHERE numero_documento ILIKE %s OR nombres ILIKE %s OR apellido ILIKE %s
+                WHERE owner_id = %s AND (numero_documento ILIKE %s OR nombres ILIKE %s OR apellido ILIKE %s)
                 ORDER BY nombres ASC LIMIT %s OFFSET %s
-            """, (patron, patron, patron, por_pagina, offset))
+            """, (g.tramy_user_id, patron, patron, patron, por_pagina, offset))
             filas = cur.fetchall()
             cur.execute("""
                 SELECT COUNT(*) FROM personas
-                WHERE numero_documento ILIKE %s OR nombres ILIKE %s OR apellido ILIKE %s
-            """, (patron, patron, patron))
+                WHERE owner_id = %s AND (numero_documento ILIKE %s OR nombres ILIKE %s OR apellido ILIKE %s)
+            """, (g.tramy_user_id, patron, patron, patron))
             total = cur.fetchone()[0]
         else:
             cur.execute("""
                 SELECT id, nombres, apellido, segundo_apellido, tipo_documento, numero_documento,
                        telefono, direccion, barrio_info, ciudad, email
-                FROM personas ORDER BY nombres ASC LIMIT %s OFFSET %s
-            """, (por_pagina, offset))
+                FROM personas WHERE owner_id = %s ORDER BY nombres ASC LIMIT %s OFFSET %s
+            """, (g.tramy_user_id, por_pagina, offset))
             filas = cur.fetchall()
-            cur.execute("SELECT COUNT(*) FROM personas")
+            cur.execute("SELECT COUNT(*) FROM personas WHERE owner_id = %s", (g.tramy_user_id,))
             total = cur.fetchone()[0]
         cur.close(); conn.close()
         personas = [{
@@ -9101,11 +9118,14 @@ def personas_guardar_fecha_expedicion_endpoint():
         conn = get_db_conn()
         cur = conn.cursor()
         cur.execute(
-            "UPDATE personas SET fecha_expedicion = %s, actualizado_en = NOW() WHERE id = %s",
-            (fecha_expedicion, persona_id)
+            "UPDATE personas SET fecha_expedicion = %s, actualizado_en = NOW() WHERE id = %s AND owner_id = %s",
+            (fecha_expedicion, persona_id, g.tramy_user_id)
         )
+        actualizada = cur.rowcount > 0
         conn.commit()
         cur.close(); conn.close()
+        if not actualizada:
+            return jsonify({"ok": False, "error": "No se encontró esa persona."}), 404
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -9113,7 +9133,8 @@ def personas_guardar_fecha_expedicion_endpoint():
 
 @app.route("/personas-eliminar", methods=["POST"])
 def personas_eliminar_endpoint():
-    """Elimina una persona por su id."""
+    """Elimina una persona por su id -- solo si pertenece a la cuenta
+    que hace la peticion."""
     datos = request.get_json(silent=True) or {}
     persona_id = datos.get("id")
     if not persona_id:
@@ -9121,7 +9142,7 @@ def personas_eliminar_endpoint():
     try:
         conn = get_db_conn()
         cur = conn.cursor()
-        cur.execute("DELETE FROM personas WHERE id = %s", (persona_id,))
+        cur.execute("DELETE FROM personas WHERE id = %s AND owner_id = %s", (persona_id, g.tramy_user_id))
         eliminada = cur.rowcount > 0
         conn.commit()
         cur.close(); conn.close()
